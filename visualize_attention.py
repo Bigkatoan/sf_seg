@@ -56,7 +56,7 @@ def get_attention_maps(model: sf_seg, img_t: torch.Tensor, device: torch.device)
         score.view(B, N, H * W), float(ab.focus_k)
     ).view(B, N, H, W)                             # (1, C, H, W), mỗi pixel ∈ [0,1]
 
-    pred, _ = model(x)
+    pred, _, _ = model(x)
     pred = pred.squeeze()                          # (H, W)
 
     return attn.squeeze(0).cpu(), pred.cpu()       # (C, H, W), (H, W)

@@ -82,9 +82,9 @@ bench("sf_seg.forward (no grad)",
 
 with torch.enable_grad():
     x_g = x.requires_grad_(True)
-    out = model(x_g)
-    loss = out.mean()
+    masks, _, _ = model(x_g)
+    loss = masks.mean()
     bench("sf_seg.backward",
-          lambda: (model(x_g).mean()).backward())
+          lambda: model(x_g)[0].mean().backward())
 
 print()

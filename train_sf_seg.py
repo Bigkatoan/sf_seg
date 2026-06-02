@@ -19,7 +19,7 @@ import numpy as np
 from tqdm import tqdm
 
 from sf_seg import sf_seg
-from losses import iou_loss, combine_losses, mse_loss
+from losses import iou_loss, combine_losses, mse_loss, diversity_loss
 import torch.nn.functional as F
 
 
@@ -258,7 +258,7 @@ def train(args):
             masks = masks.to(device, non_blocking=pin_memory)
 
             with autocast('cuda', enabled=use_amp):
-                preds, attn_guide = model(images)
+                preds, attn_guide, attn = model(images)
                 if args.loss_type == "iou":
                     loss = iou_loss(preds, masks)
                 elif args.loss_type == "bce":
@@ -272,6 +272,8 @@ def train(args):
                 if args.attn_guide_weight > 0:
                     attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
                     loss = loss + args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                if args.diversity_weight > 0:
+                    loss = loss + args.diversity_weight * diversity_loss(attn)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -299,7 +301,7 @@ def train(args):
                 masks = masks.to(device, non_blocking=pin_memory)
 
                 with autocast('cuda', enabled=use_amp):
-                    preds, attn_guide = model(images)
+                    preds, attn_guide, attn = model(images)
                     if args.loss_type == "iou":
                         loss = iou_loss(preds, masks)
                     elif args.loss_type == "bce":
@@ -313,6 +315,8 @@ def train(args):
                     if args.attn_guide_weight > 0:
                         attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
                         loss = loss + args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                    if args.diversity_weight > 0:
+                        loss = loss + args.diversity_weight * diversity_loss(attn)
 
                 b = images.size(0)
                 batch_acc = pixel_accuracy(preds, masks)
@@ -369,6 +373,7 @@ def parse_args():
     p.add_argument("--kernel-size", type=int, default=None, help="conv kernel size in attention block (default 7)")
     p.add_argument("--focus-size", type=int, default=None, help="attention budget = focus_size^2 pixels per channel (default 16)")
     p.add_argument("--attn-guide-weight", type=float, default=None, help="weight for attention guidance loss (default 0.3, 0 = disabled)")
+    p.add_argument("--diversity-weight", type=float, default=None, help="weight for attention diversity loss (default 0.1, 0 = disabled)")
     p.add_argument("--attn-blur-sigma",  type=float, default=None, help="Gaussian blur sigma cho soft attention target (default 7.0)")
     p.add_argument("--attn-blur-kernel", type=int,   default=None, help="kernel size blur (lẻ, default 31)")
     p.add_argument("--cpu", action="store_true", help="force CPU")
@@ -405,6 +410,7 @@ def merge_config(args):
         "attn_guide_weight": 0.3,
         "attn_blur_sigma": 7.0,
         "attn_blur_kernel": 31,
+        "diversity_weight": 0.1,
         "log_dir": "logs",
         "output_dir": "outputs",
         "checkpoint_dir": "checkpoints",

@@ -3,6 +3,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 
 def iou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3, reduction: str = "mean") -> torch.Tensor:
@@ -69,15 +70,36 @@ def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.1,
     mse = mse_loss(pred, target, reduction=reduction)
     return alpha * iou + (1 - alpha) * mse
 
+
+def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Penalize cosine similarity between attention channels (Gram matrix off-diagonal).
+
+    attn: (B, C, H, W) raw attention maps from clamped softmax.
+
+    For each sample, compute the C×C Gram matrix of L2-normalised channel vectors.
+    Off-diagonal entries are cosine similarities in [-1, 1]; we minimise their
+    squared values so every pair of channels attends to different regions.
+
+    Loss = 0  when all channels are perfectly orthogonal.
+    Loss = 1  when all channels are identical.
+    """
+    B, C, H, W = attn.shape
+    a = attn.view(B, C, H * W).float()                        # (B, C, L)
+    a = F.normalize(a, dim=-1, eps=eps)                        # unit norm per channel
+    gram = torch.bmm(a, a.transpose(1, 2))                     # (B, C, C) cosine sims
+    # zero out diagonal (self-similarity = 1, not penalised)
+    eye = torch.eye(C, device=attn.device, dtype=gram.dtype)
+    off_diag = gram * (1.0 - eye)
+    # normalise by number of off-diagonal pairs: C*(C-1)
+    return (off_diag ** 2).sum(dim=[1, 2]).mean() / (C * (C - 1))
+
+
 if __name__ == "__main__":
     # quick smoke test
-    import torch
-    from models import UNet
-
-    net = UNet(final_sigmoid=True)
-    x = torch.randn(1, 3, 128, 128)
-    y = (torch.rand(1, 1, 128, 128) > 0.5).float()
-    p = net(x)
-    print("pred shape", p.shape)
-    print("loss", iou_loss(p, y).item())
-    print("combined loss", combine_losses(p, y).item())
+    x = torch.randn(2, 3, 128, 128)
+    y = (torch.rand(2, 1, 128, 128) > 0.5).float()
+    p = torch.sigmoid(torch.randn(2, 1, 128, 128))
+    print("iou_loss:     ", iou_loss(p, y).item())
+    print("combine_losses:", combine_losses(p, y).item())
+    attn = torch.rand(2, 64, 128, 128)
+    print("diversity_loss:", diversity_loss(attn).item())

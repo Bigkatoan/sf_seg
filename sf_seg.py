@@ -70,7 +70,7 @@ class sf_seg(nn.Module):
         # → pixel nào được tất cả channel attend (weight=1) sẽ đạt 1.0
         N = attn.shape[1]
         attn_guide = attn.sum(dim=1, keepdim=True) / N      # (B, 1, H, W) ∈ [0,1]
-        return masks, attn_guide
+        return masks, attn_guide, attn
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -79,9 +79,10 @@ def main():
     model = sf_seg(num_channels=128)
     print(f"Number of parameters: {model.get_num_parameters():,}")
     x = torch.randn(1, 3, 128, 128)
-    masks, attn_guide = model(x)
+    masks, attn_guide, attn = model(x)
     print(f"Mask shape:      {masks.shape}")
     print(f"Attn guide shape:{attn_guide.shape}")
+    print(f"Attn shape:      {attn.shape}")
 
 if __name__ == "__main__":
     main()
