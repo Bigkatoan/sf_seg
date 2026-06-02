@@ -200,7 +200,11 @@ def train(args):
     )
     csv_file = open(log_dir / 'train_sf_seg_log.csv', 'w', newline='')
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['epoch', 'train_loss', 'train_acc', 'val_loss', 'val_acc'])
+    csv_writer.writerow([
+        'epoch',
+        'train_loss', 'train_seg', 'train_attn', 'train_div', 'train_acc',
+        'val_loss',   'val_seg',   'val_attn',   'val_div',   'val_acc',
+    ])
 
     out_samples = Path(args.output_dir)
     out_samples.mkdir(parents=True, exist_ok=True)
@@ -249,8 +253,7 @@ def train(args):
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        running_loss = 0.0
-        running_acc = 0.0
+        running = dict(loss=0., seg=0., attn=0., div=0., acc=0.)
         seen = 0
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for images, masks in train_iter:
@@ -260,20 +263,26 @@ def train(args):
             with autocast('cuda', enabled=use_amp):
                 preds, attn_guide, attn = model(images)
                 if args.loss_type == "iou":
-                    loss = iou_loss(preds, masks)
+                    seg = iou_loss(preds, masks)
                 elif args.loss_type == "bce":
-                    loss = criterion(preds, masks)
+                    seg = criterion(preds, masks)
                 elif args.loss_type == "combine":
-                    loss = combine_losses(preds, masks)
+                    seg = combine_losses(preds, masks)
                 elif args.loss_type == "mse":
-                    loss = mse_loss(preds, masks)
+                    seg = mse_loss(preds, masks)
                 else:  # bce_iou
-                    loss = criterion(preds, masks) + iou_loss(preds, masks)
+                    seg = criterion(preds, masks) + iou_loss(preds, masks)
+
+                attn_l = torch.tensor(0., device=device)
                 if args.attn_guide_weight > 0:
                     attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
-                    loss = loss + args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                    attn_l = args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+
+                div_l = torch.tensor(0., device=device)
                 if args.diversity_weight > 0:
-                    loss = loss + args.diversity_weight * diversity_loss(attn)
+                    div_l = args.diversity_weight * diversity_loss(attn)
+
+                loss = seg + attn_l + div_l
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -282,20 +291,31 @@ def train(args):
 
             b = images.size(0)
             batch_acc = pixel_accuracy(preds, masks)
-            running_loss += loss.item() * b
-            running_acc += batch_acc * b
+            running['loss'] += loss.item() * b
+            running['seg']  += seg.item()  * b
+            running['attn'] += attn_l.item() * b
+            running['div']  += div_l.item()  * b
+            running['acc']  += batch_acc * b
             seen += b
-            train_iter.set_postfix(loss=f"{loss.item():.4f}", acc=f"{batch_acc:.4f}")
+            train_iter.set_postfix(
+                total=f"{loss.item():.4f}",
+                seg=f"{seg.item():.4f}",
+                attn=f"{attn_l.item():.4f}",
+                div=f"{div_l.item():.4f}",
+                acc=f"{batch_acc:.4f}",
+            )
 
-        train_loss = running_loss / seen
-        train_acc = running_acc / seen
+        train_loss = running['loss'] / seen
+        train_seg  = running['seg']  / seen
+        train_attn = running['attn'] / seen
+        train_div  = running['div']  / seen
+        train_acc  = running['acc']  / seen
 
         model.eval()
-        v_loss = 0.0
-        v_acc = 0.0
+        vrun = dict(loss=0., seg=0., attn=0., div=0., acc=0.)
         v_seen = 0
         with torch.inference_mode():
-            val_iter = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False)
+            val_iter = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]  ", leave=False)
             for images, masks in val_iter:
                 images = images.to(device, non_blocking=pin_memory)
                 masks = masks.to(device, non_blocking=pin_memory)
@@ -303,36 +323,59 @@ def train(args):
                 with autocast('cuda', enabled=use_amp):
                     preds, attn_guide, attn = model(images)
                     if args.loss_type == "iou":
-                        loss = iou_loss(preds, masks)
+                        seg = iou_loss(preds, masks)
                     elif args.loss_type == "bce":
-                        loss = criterion(preds, masks)
+                        seg = criterion(preds, masks)
                     elif args.loss_type == "combine":
-                        loss = combine_losses(preds, masks)
+                        seg = combine_losses(preds, masks)
                     elif args.loss_type == "mse":
-                        loss = mse_loss(preds, masks)
+                        seg = mse_loss(preds, masks)
                     else:  # bce_iou
-                        loss = criterion(preds, masks) + iou_loss(preds, masks)
+                        seg = criterion(preds, masks) + iou_loss(preds, masks)
+
+                    attn_l = torch.tensor(0., device=device)
                     if args.attn_guide_weight > 0:
                         attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
-                        loss = loss + args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                        attn_l = args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+
+                    div_l = torch.tensor(0., device=device)
                     if args.diversity_weight > 0:
-                        loss = loss + args.diversity_weight * diversity_loss(attn)
+                        div_l = args.diversity_weight * diversity_loss(attn)
+
+                    loss = seg + attn_l + div_l
 
                 b = images.size(0)
                 batch_acc = pixel_accuracy(preds, masks)
-                v_loss += loss.item() * b
-                v_acc += batch_acc * b
+                vrun['loss'] += loss.item() * b
+                vrun['seg']  += seg.item()  * b
+                vrun['attn'] += attn_l.item() * b
+                vrun['div']  += div_l.item()  * b
+                vrun['acc']  += batch_acc * b
                 v_seen += b
-                val_iter.set_postfix(loss=f"{loss.item():.4f}", acc=f"{batch_acc:.4f}")
+                val_iter.set_postfix(
+                    total=f"{loss.item():.4f}",
+                    seg=f"{seg.item():.4f}",
+                    attn=f"{attn_l.item():.4f}",
+                    div=f"{div_l.item():.4f}",
+                    acc=f"{batch_acc:.4f}",
+                )
 
-        val_loss = v_loss / v_seen if v_seen else 0.0
-        val_acc = v_acc / v_seen if v_seen else 0.0
+        val_loss = vrun['loss'] / v_seen if v_seen else 0.
+        val_seg  = vrun['seg']  / v_seen if v_seen else 0.
+        val_attn = vrun['attn'] / v_seen if v_seen else 0.
+        val_div  = vrun['div']  / v_seen if v_seen else 0.
+        val_acc  = vrun['acc']  / v_seen if v_seen else 0.
 
         logging.info(
-            f"Epoch {epoch}/{args.epochs}  train_loss={train_loss:.6f}  train_acc={train_acc:.4f}"
-            f"  val_loss={val_loss:.6f}  val_acc={val_acc:.4f}"
+            f"Epoch {epoch}/{args.epochs} | "
+            f"train  total={train_loss:.4f}  seg={train_seg:.4f}  attn={train_attn:.4f}  div={train_div:.4f}  acc={train_acc:.4f} | "
+            f"val    total={val_loss:.4f}  seg={val_seg:.4f}  attn={val_attn:.4f}  div={val_div:.4f}  acc={val_acc:.4f}"
         )
-        csv_writer.writerow([epoch, train_loss, train_acc, val_loss, val_acc])
+        csv_writer.writerow([
+            epoch,
+            train_loss, train_seg, train_attn, train_div, train_acc,
+            val_loss,   val_seg,   val_attn,   val_div,   val_acc,
+        ])
         csv_file.flush()
 
         try:
