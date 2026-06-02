@@ -10,6 +10,5 @@
   "batch_accumulate": 1, 
   "loss_type": "combine",
   "image_size": 224,
-  "num_channels": 64,
-  "extra_channels": [16, 16]
+  "num_channels": 32
 }

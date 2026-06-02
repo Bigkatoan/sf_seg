@@ -170,17 +170,6 @@ python download.py --root data --prepare        # requires aria2c for speed
 python train_sf_seg.py --epochs 100 --loss-type combine
 ```
 
-### Stacked attention blocks
-```bash
-# 3 blocks: RGB→64→16→16 (adds ~25k params, +2 refinement stages)
-python train_sf_seg.py --extra-channels 16 16
-
-# 2 blocks: RGB→64→32
-python train_sf_seg.py --extra-channels 32
-```
-
-Each extra block receives the attended features of the previous block as input, allowing successive refinement of the attention focus.
-
 ### Resume training
 ```bash
 python train_sf_seg.py --resume last
@@ -192,9 +181,8 @@ python train_sf_seg.py --resume last
 
 | Argument | Default | Description |
 |---|---|---|
-| `--num-channels` | 64 | Feature channels C for the first block (takes RGB) |
-| `--extra-channels` | *(none)* | Channel sizes for additional stacked blocks, e.g. `16 16` |
-| `--focus-size` | 16 | Budget k = focus_size² pixels / channel (all blocks) |
+| `--num-channels` | 64 | Feature channels C |
+| `--focus-size` | 16 | Budget k = focus_size² pixels / channel |
 | `--loss-type` | combine | `iou` / `bce` / `mse` / `combine` / `bce_iou` |
 | `--attn-guide-weight` | 0.3 | Weight of attention guidance auxiliary loss (0 = off) |
 | `--attn-blur-sigma` | 7.0 | Gaussian blur sigma for soft attention target |
@@ -237,7 +225,6 @@ Channels passing the threshold are sorted by range descending (sharpest first). 
 
 Adjust `--min-range` (default `0.05`): raise to `0.1–0.2` for only the sharpest channels, lower to `0.01` to see all.
 
-For stacked-block models, attention maps from **all blocks** are shown together (e.g. 96 channels total for a 64→16→16 model), giving a view of both coarse (block 0) and refined (block 1, 2) focus patterns.
 
 ---
 

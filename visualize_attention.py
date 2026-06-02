@@ -18,31 +18,15 @@ def load_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
 
-    # Detect architecture từ state dict keys
-    if any(k.startswith("blocks.") for k in state):
-        # New format: blocks.0, blocks.1, ...
-        block_indices = sorted({int(k.split(".")[1]) for k in state if k.startswith("blocks.")})
-        channel_list = []
-        for i in block_indices:
-            w = state.get(f"blocks.{i}.encoder.4.weight")  # Conv(C→2C): shape (2C, C, 3, 3)
-            if w is not None:
-                channel_list.append(w.shape[0] // 2)
-        num_channels   = channel_list[0] if channel_list else 64
-        extra_channels = channel_list[1:]
-    else:
-        # Old format: single attention_block (backward compat)
-        num_channels   = 64
-        w = state.get("attention_block.encoder.4.weight")
-        if w is not None:
-            num_channels = w.shape[0] // 2
-        extra_channels = []
+    num_channels = 64
+    w = state.get("attention_block.encoder.4.weight")  # Conv(C→2C): shape (2C, C, 3, 3)
+    if w is not None:
+        num_channels = w.shape[0] // 2
 
-    model = sf_seg(num_channels=num_channels, extra_channels=extra_channels)
+    model = sf_seg(num_channels=num_channels)
     model.load_state_dict(state)
     model.to(device).eval()
-
-    blocks_desc = f"[{num_channels}]" + (f" → {extra_channels}" if extra_channels else "")
-    print(f"Loaded model: blocks={blocks_desc}, params={model.get_num_parameters():,}")
+    print(f"Loaded model: num_channels={num_channels}, params={model.get_num_parameters():,}")
     return model
 
 
