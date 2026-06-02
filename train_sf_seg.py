@@ -93,7 +93,7 @@ def save_validation_sample(model, dataset: Dataset, device: torch.device, out_di
     img_t, mask_t = dataset[idx]
     model.eval()
     with torch.no_grad():
-        pred, _ = model(img_t.unsqueeze(0).to(device))
+        pred, _, _ = model(img_t.unsqueeze(0).to(device))
         pred = pred.cpu().squeeze(0)
     pred_mask = (pred > 0.5).float()
     img_pil = TF.to_pil_image(img_t)
