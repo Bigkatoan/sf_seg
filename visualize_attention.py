@@ -11,41 +11,46 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import torchvision.transforms.functional as TF
 
-from sf_seg import sf_seg, AttentionBlock
+from sf_seg import sf_seg
 
 
 def load_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state = ckpt["model_state_dict"]
+    state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+    # Detect architecture từ state dict keys
+    if any(k.startswith("blocks.") for k in state):
+        # New format: blocks.0, blocks.1, ...
+        block_indices = sorted({int(k.split(".")[1]) for k in state if k.startswith("blocks.")})
+        channel_list = []
+        for i in block_indices:
+            w = state.get(f"blocks.{i}.encoder.4.weight")  # Conv(C→2C): shape (2C, C, 3, 3)
+            if w is not None:
+                channel_list.append(w.shape[0] // 2)
+        num_channels   = channel_list[0] if channel_list else 64
+        extra_channels = channel_list[1:]
     else:
-        state = ckpt
+        # Old format: single attention_block (backward compat)
+        num_channels   = 64
+        w = state.get("attention_block.encoder.4.weight")
+        if w is not None:
+            num_channels = w.shape[0] // 2
+        extra_channels = []
 
-    num_channels = 64
-    for k, v in state.items():
-        if "encoder.4.weight" in k:   # Conv(C → 2C), shape (2C, C, 3, 3)
-            num_channels = v.shape[0] // 2
-            break
-
-    model = sf_seg(num_channels=num_channels)
+    model = sf_seg(num_channels=num_channels, extra_channels=extra_channels)
     model.load_state_dict(state)
     model.to(device).eval()
-    print(f"Loaded model: num_channels={num_channels}, params={model.get_num_parameters():,}")
+
+    blocks_desc = f"[{num_channels}]" + (f" → {extra_channels}" if extra_channels else "")
+    print(f"Loaded model: blocks={blocks_desc}, params={model.get_num_parameters():,}")
     return model
 
 
 @torch.no_grad()
 def get_attention_maps(model: sf_seg, img_t: torch.Tensor, device: torch.device):
-    """Trả về attention maps (C, H, W) và predicted mask (H, W)."""
+    """Trả về attention maps (total_C, H, W) và predicted mask (H, W)."""
     x = img_t.unsqueeze(0).to(device)
-    ab = model.attention_block
-    out = ab.encoder(x)
-    score, _ = out.chunk(2, dim=1)
-    B, N, H, W = score.shape
-    attn = AttentionBlock._clamped_softmax(
-        score.view(B, N, H * W), float(ab.focus_k)
-    ).view(B, N, H, W)
-    pred, _, _ = model(x)
+    pred, _, attn = model(x)          # attn: (1, total_C, H, W) — tất cả blocks
     return attn.squeeze(0).cpu(), pred.squeeze().cpu()
 
 
@@ -156,7 +161,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint",    default="checkpoints/sf_seg_last.pt")
     p.add_argument("--data-root",     default="data")
-    p.add_argument("--image-size",    type=int,   default=128)
+    p.add_argument("--image-size",    type=int,   default=224)
     p.add_argument("--num-images",    type=int,   default=4)
     p.add_argument("--show-channels", type=int,   default=8,
                    help="Số channel hiển thị tối đa (chọn top range)")

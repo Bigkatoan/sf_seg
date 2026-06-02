@@ -167,7 +167,8 @@ def train(args):
         prefetch_factor=prefetch_factor, persistent_workers=persistent,
     )
 
-    model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size)
+    model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
+                   extra_channels=args.extra_channels or [])
     print(f"Model parameters: {model.get_num_parameters():,}")
     model.to(device)
     if device.type == 'cuda':
@@ -388,6 +389,7 @@ def train(args):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "num_channels": args.num_channels,
+                "extra_channels": args.extra_channels or [],
             }
             torch.save(ckpt, last_model_path)
             if improved:
@@ -426,6 +428,8 @@ def parse_args():
     p.add_argument("--loss-type", default=None, choices=["iou", "bce", "bce_iou", "combine", "mse"])
     p.add_argument("--resume", default=None, help="checkpoint path or 'last'")
     p.add_argument("--image-size", type=int, default=None)
+    p.add_argument("--extra-channels", type=int, nargs="*", default=None,
+                   help="channel sizes cho các attention block bổ sung, e.g. --extra-channels 16 16")
     return p.parse_args()
 
 
@@ -460,6 +464,7 @@ def merge_config(args):
         "loss_type": "iou",
         "resume": None,
         "image_size": 128,
+        "extra_channels": [],
     }
 
     for key, default_val in defaults.items():

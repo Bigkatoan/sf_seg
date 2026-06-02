@@ -3,13 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class AttentionBlock(nn.Module):
-    def __init__(self, num_channels=32, focus_size=16):
+    def __init__(self, in_channels=3, num_channels=32, focus_size=16):
         super(AttentionBlock, self).__init__()
         self.focus_k = focus_size * focus_size
         # Encoder: width C trong suốt, chỉ expand → 2C ở layer cuối
         # Layer giữa tốn C² thay vì (2C)²=4C² → tiết kiệm ~2× compute
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, num_channels, kernel_size=3, padding='same'),
+            nn.Conv2d(in_channels, num_channels, kernel_size=3, padding='same'),
             nn.ReLU(),
             nn.Conv2d(num_channels, num_channels, kernel_size=3, padding='same'),
             nn.ReLU(),
@@ -58,31 +58,58 @@ class AttentionBlock(nn.Module):
 
 
 class sf_seg(nn.Module):
-    def __init__(self, num_channels=32, focus_size=16):
+    def __init__(self, num_channels=32, focus_size=16, extra_channels=None):
+        """
+        num_channels:   số channels của block đầu (nhận RGB)
+        focus_size:     budget k = focus_size² cho tất cả các block
+        extra_channels: list channels cho các block tiếp theo, ví dụ [16, 16]
+                        mỗi block nhận attended_features của block trước làm input
+        """
         super(sf_seg, self).__init__()
-        self.attention_block = AttentionBlock(num_channels=num_channels, focus_size=focus_size)
-        self.masks = nn.Conv2d(in_channels=num_channels, out_channels=1, kernel_size=3, padding='same')
+        extra_channels = list(extra_channels) if extra_channels else []
+
+        channel_list = [num_channels] + extra_channels   # [64, 16, 16]
+        in_ch_list   = [3] + channel_list[:-1]           # [3, 64, 16]
+
+        self.blocks = nn.ModuleList([
+            AttentionBlock(in_ch, out_ch, focus_size)
+            for in_ch, out_ch in zip(in_ch_list, channel_list)
+        ])
+        self.masks = nn.Conv2d(channel_list[-1], 1, kernel_size=3, padding='same')
 
     def forward(self, x: torch.Tensor):
-        attended_features, attn = self.attention_block(x)   # attn: (B, N, H, W)
-        masks = torch.sigmoid(self.masks(attended_features))
-        # attn_guide: normalize về [0,1] bằng cách chia N channels
-        # → pixel nào được tất cả channel attend (weight=1) sẽ đạt 1.0
-        N = attn.shape[1]
-        attn_guide = attn.sum(dim=1, keepdim=True) / N      # (B, 1, H, W) ∈ [0,1]
-        return masks, attn_guide, attn
+        feat = x
+        all_attn = []
+        for block in self.blocks:
+            feat, attn = block(feat)
+            all_attn.append(attn)
+
+        masks = torch.sigmoid(self.masks(feat))
+
+        # Gộp attn của tất cả block: (B, sum_C, H, W)
+        all_attn_cat = torch.cat(all_attn, dim=1)
+        N = all_attn_cat.shape[1]
+        attn_guide = all_attn_cat.sum(dim=1, keepdim=True) / N   # (B, 1, H, W) ∈ [0,1]
+
+        return masks, attn_guide, all_attn_cat
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-    
+
+
 def main():
-    model = sf_seg(num_channels=128)
-    print(f"Number of parameters: {model.get_num_parameters():,}")
-    x = torch.randn(1, 3, 128, 128)
-    masks, attn_guide, attn = model(x)
-    print(f"Mask shape:      {masks.shape}")
-    print(f"Attn guide shape:{attn_guide.shape}")
-    print(f"Attn shape:      {attn.shape}")
+    print("=== 1 block (baseline) ===")
+    m1 = sf_seg(num_channels=64)
+    print(f"  params: {m1.get_num_parameters():,}")
+
+    print("=== 3 blocks: 64 → 16 → 16 ===")
+    m3 = sf_seg(num_channels=64, extra_channels=[16, 16])
+    print(f"  params: {m3.get_num_parameters():,}")
+
+    x = torch.randn(2, 3, 128, 128)
+    for name, model in [("1-block", m1), ("3-block", m3)]:
+        masks, attn_guide, attn = model(x)
+        print(f"  [{name}] masks={masks.shape}  attn_guide={attn_guide.shape}  attn={attn.shape}")
 
 if __name__ == "__main__":
     main()
