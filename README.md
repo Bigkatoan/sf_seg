@@ -170,6 +170,17 @@ python download.py --root data --prepare        # requires aria2c for speed
 python train_sf_seg.py --epochs 100 --loss-type combine
 ```
 
+### Stacked attention blocks
+```bash
+# 3 blocks: RGB→64→16→16 (adds ~25k params, +2 refinement stages)
+python train_sf_seg.py --extra-channels 16 16
+
+# 2 blocks: RGB→64→32
+python train_sf_seg.py --extra-channels 32
+```
+
+Each extra block receives the attended features of the previous block as input, allowing successive refinement of the attention focus.
+
 ### Resume training
 ```bash
 python train_sf_seg.py --resume last
@@ -181,8 +192,9 @@ python train_sf_seg.py --resume last
 
 | Argument | Default | Description |
 |---|---|---|
-| `--num-channels` | 64 | Feature channels C |
-| `--focus-size` | 16 | Budget k = focus_size² pixels / channel |
+| `--num-channels` | 64 | Feature channels C for the first block (takes RGB) |
+| `--extra-channels` | *(none)* | Channel sizes for additional stacked blocks, e.g. `16 16` |
+| `--focus-size` | 16 | Budget k = focus_size² pixels / channel (all blocks) |
 | `--loss-type` | combine | `iou` / `bce` / `mse` / `combine` / `bce_iou` |
 | `--attn-guide-weight` | 0.3 | Weight of attention guidance auxiliary loss (0 = off) |
 | `--attn-blur-sigma` | 7.0 | Gaussian blur sigma for soft attention target |
@@ -195,6 +207,11 @@ python train_sf_seg.py --resume last
 
 All defaults can be set in `config.json`.
 
+The tqdm progress bar and log file show each loss component separately:
+```
+total | seg | attn | div | acc
+```
+
 ---
 
 ## Visualize Attention
@@ -204,7 +221,7 @@ python visualize_attention.py \
     --checkpoint checkpoints/sf_seg_best.pt \
     --num-images 6 \
     --show-channels 8 \
-    --min-range 0.05       # only show channels that found their pattern in this image
+    --min-range 0.05
 ```
 
 Each output image shows 4 + N panels:
@@ -213,12 +230,14 @@ Each output image shows 4 + N panels:
 ```
 
 Channels are filtered by **min-max range** (`max − min` over spatial dims):
-- **Range low** → the pattern this channel learned does not appear in this image; attention spreads uniformly with no peak — nothing useful to show
-- **Range high** → the channel found its pattern; there is a clear bright spot
+- **Range low** → the pattern this channel learned does not appear in this image; attention spreads uniformly with no peak — skipped
+- **Range high** → the channel found its pattern in this image; clear bright spot present
 
-Channels passing the threshold are sorted by range (sharpest focus first). The title of each panel shows `rng` and `max` for quick comparison.
+Channels passing the threshold are sorted by range descending (sharpest first). Each panel title shows `rng` and `max`.
 
-Adjust `--min-range` (default `0.05`) to control strictness: raise to `0.1–0.2` for only the clearest channels, lower to `0.01` to see everything.
+Adjust `--min-range` (default `0.05`): raise to `0.1–0.2` for only the sharpest channels, lower to `0.01` to see all.
+
+For stacked-block models, attention maps from **all blocks** are shown together (e.g. 96 channels total for a 64→16→16 model), giving a view of both coarse (block 0) and refined (block 1, 2) focus patterns.
 
 ---
 
