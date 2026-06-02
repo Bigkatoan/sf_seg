@@ -10,7 +10,7 @@ data/
 checkpoints/
 
 # Training logs and outputs
-logs/
+logs/*.log
 outputs/
 
 # Python cache
