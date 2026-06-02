@@ -62,8 +62,10 @@ def select_channels(attn_maps: torch.Tensor, min_range: float, max_show: int):
     Chọn channels có min-max range >= min_range, sort theo range giảm dần.
 
     Range = max - min trên spatial dims:
-    - Channel "chết" (spread đều): tất cả pixels ≈ k/L ≈ 0.016 → range ≈ 0
-    - Channel "focus" rõ: có điểm sáng gần 1.0, background gần 0 → range lớn
+    - Range thấp: pattern mà channel này học không xuất hiện trong ảnh →
+      attention phân tán đều, tất cả pixels ≈ k/L ≈ 0.016, không có gì để show
+    - Range cao: channel tìm thấy pattern của nó trong ảnh →
+      có điểm sáng gần 1.0, phần còn lại gần 0
 
     Trả về: (indices, ranges, maxvals) của các channel được chọn.
     """
@@ -106,12 +108,13 @@ def visualize(args):
         indices, ranges, maxvals = select_channels(attn_maps, args.min_range, args.show_channels)
 
         if not indices:
-            print(f"  Skip {img_path.name}: 0/{C} channels with range >= {args.min_range}")
+            print(f"  Skip {img_path.name}: không có channel nào tìm thấy pattern "
+                  f"trong ảnh này (range < {args.min_range} với mọi channel)")
             skipped += 1
             continue
 
-        print(f"  {img_path.name}: {len(indices)}/{C} active channels "
-              f"(range >= {args.min_range}), showing top {len(indices)}")
+        print(f"  {img_path.name}: {len(indices)}/{C} channels có pattern xuất hiện "
+              f"trong ảnh (range >= {args.min_range}), showing top {len(indices)}")
 
         # Layout: 4 cột cố định + các channel active
         ncols = 4 + len(indices)
@@ -144,8 +147,9 @@ def visualize(args):
         print(f"  Saved: {out_path}")
 
     if skipped:
-        print(f"\n{skipped}/{len(samples)} images skipped (no active channels). "
-              f"Lower --min-range (current={args.min_range}) to see more.")
+        print(f"\n{skipped}/{len(samples)} ảnh bị skip vì không có channel nào "
+              f"tìm thấy pattern phù hợp. Giảm --min-range (hiện tại={args.min_range}) "
+              f"để hiển thị thêm.")
 
 
 if __name__ == "__main__":
@@ -157,7 +161,8 @@ if __name__ == "__main__":
     p.add_argument("--show-channels", type=int,   default=8,
                    help="Số channel hiển thị tối đa (chọn top range)")
     p.add_argument("--min-range",     type=float, default=0.05,
-                   help="Ngưỡng min-max range để giữ channel (0=tất cả, khuyến nghị 0.05-0.2)")
+                   help="Ngưỡng min-max range: chỉ hiển thị channel tìm thấy pattern trong ảnh "
+                        "(0=tất cả, khuyến nghị 0.05-0.2)")
     p.add_argument("--output-dir",    default="outputs/attention_vis")
     p.add_argument("--seed",          type=int,   default=42)
     args = p.parse_args()
