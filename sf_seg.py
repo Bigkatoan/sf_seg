@@ -59,13 +59,13 @@ class AttentionBlock(nn.Module):
 class sf_seg(nn.Module):
     def __init__(self, num_channels=32, focus_size=16, encoder_stride=1):
         """
-        encoder_stride=2: encoder works at H/2 × W/2, masks/attn_guide are
-        bilinearly upsampled back to input resolution. attn returned at native
-        feature resolution (H/2 × W/2) for diversity_loss and visualization.
+        encoder_stride=2: encoder works at H/2 × W/2, logits upsampled to input
+        resolution BEFORE sigmoid — gradient flows through unbounded logits, not
+        through the saturating sigmoid nonlinearity at low resolution.
 
-        Khi dùng encoder_stride=2, đặt focus_size=8 để giữ density k/L≈1.56%:
-          stride=1: k=256, L=128²=16384, k/L=1.56%
-          stride=2: k=64,  L=64²=4096,   k/L=1.56%  ← focus_size=8 → k=8²=64
+        focus_size=16 recommended with encoder_stride=2:
+          k = 16² = 256 pixel coverage per channel (same as stride=1)
+          k/L = 256/4096 = 6.25%  (denser than stride=1, but absolute k preserved)
         """
         super(sf_seg, self).__init__()
         self.encoder_stride = encoder_stride
@@ -78,35 +78,36 @@ class sf_seg(nn.Module):
 
     def forward(self, x: torch.Tensor):
         H, W = x.shape[2], x.shape[3]
-        attended_features, attn = self.attention_block(x)   # attn: (B, N, H', W')
+        attended_features, attn = self.attention_block(x)   # (B, N, H', W')
 
-        masks = torch.sigmoid(self.masks(attended_features))
+        logits = self.masks(attended_features)               # (B, 1, H', W') — raw, unbounded
 
-        # Upsample masks và attn_guide về input resolution nếu encoder downsample
+        # Upsample logits trước sigmoid: gradient qua logit (unbounded) mượt hơn
+        # qua sigmoid value (bounded [0,1]) đã bị squash ở resolution thấp
         if self.encoder_stride > 1:
-            masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
+            logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+
+        masks = torch.sigmoid(logits)                        # sigmoid ở full resolution
 
         N = attn.shape[1]
-        attn_guide = attn.sum(dim=1, keepdim=True) / N      # (B, 1, H', W')
+        attn_guide = attn.sum(dim=1, keepdim=True) / N
         if self.encoder_stride > 1:
             attn_guide = F.interpolate(attn_guide, size=(H, W), mode='bilinear', align_corners=False)
 
-        # attn trả về ở native feature resolution (H' × W')
-        # diversity_loss và visualize tự handle resolution bất kỳ
         return masks, attn_guide, attn
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 def main():
-    for stride, fs in [(1, 16), (2, 8)]:
+    for stride, fs in [(1, 16), (2, 16)]:
         model = sf_seg(num_channels=64, focus_size=fs, encoder_stride=stride)
         x = torch.randn(2, 3, 128, 128)
         masks, attn_guide, attn = model(x)
         L = attn.shape[2] * attn.shape[3]
         k = fs * fs
         print(f"stride={stride} focus_size={fs}: params={model.get_num_parameters():,} "
-              f"attn={attn.shape} masks={masks.shape} k/L={k/L:.2%}")
+              f"attn={attn.shape} masks={masks.shape} k={k} k/L={k/L:.2%}")
 
 if __name__ == "__main__":
     main()
