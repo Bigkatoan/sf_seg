@@ -23,35 +23,6 @@ from losses import iou_loss, combine_losses, mse_loss, diversity_loss
 import torch.nn.functional as F
 
 
-def build_attn_target(masks: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
-    """
-    Tạo soft guide target cho attention bằng cách blur GT mask.
-
-    GT mask cứng (binary) → Gaussian blur → soft heatmap:
-      - Tâm object: giá trị cao (~1)
-      - Vùng biên: giá trị trung bình (gradient)
-      - Background xa: gần 0
-
-    Attention chỉ cần focus "gần đúng vùng người", không cần follow pixel-perfect.
-    """
-    # Gaussian 1D kernel
-    coords = torch.arange(kernel_size, dtype=masks.dtype, device=masks.device) - kernel_size // 2
-    g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
-    g = g / g.sum()
-
-    # Separable 2D conv: blur theo H rồi W
-    kernel_h = g.view(1, 1, kernel_size, 1)   # (1, 1, k, 1)
-    kernel_w = g.view(1, 1, 1, kernel_size)   # (1, 1, 1, k)
-    pad = kernel_size // 2
-
-    blurred = F.conv2d(masks, kernel_h, padding=(pad, 0))
-    blurred = F.conv2d(blurred, kernel_w, padding=(0, pad))
-
-    # Normalize per-sample: tâm object luôn = 1, background → 0
-    # Tránh trường hợp mask toàn 0 (không có foreground)
-    peak = blurred.amax(dim=[2, 3], keepdim=True).clamp(min=1e-6)
-    return (blurred / peak).clamp(0.0, 1.0)
-
 
 class SegmentationDataset(Dataset):
     def __init__(self, images_dir: Path, masks_dir: Path, image_size: int = 128):
@@ -74,6 +45,9 @@ class SegmentationDataset(Dataset):
         mask = Image.open(mask_p).convert('L')
         img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
         mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
+        if random.random() > 0.5:
+            img = TF.hflip(img)
+            mask = TF.hflip(mask)
         img_t = TF.to_tensor(img)
         mask_t = TF.to_tensor(mask)
         mask_t = (mask_t > 0.5).float()
@@ -178,6 +152,9 @@ def train(args):
 
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+    )
     use_amp = device.type == 'cuda'
     scaler = GradScaler('cuda', enabled=use_amp)
 
@@ -239,6 +216,11 @@ def train(args):
                             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                         except Exception:
                             logging.warning("Couldn't load optimizer state; optimizer reinitialized")
+                    if "scheduler_state_dict" in ckpt:
+                        try:
+                            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                        except Exception:
+                            pass
                     if "epoch" in ckpt:
                         start_epoch = int(ckpt.get("epoch", 0)) + 1
                     if "best_val_loss" in ckpt:
@@ -276,8 +258,11 @@ def train(args):
 
                 attn_l = torch.tensor(0., device=device)
                 if args.attn_guide_weight > 0:
-                    attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
-                    attn_l = args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                    _, _, H_a, W_a = attn.shape
+                    masks_a = F.interpolate(masks.float(), size=(H_a, W_a), mode='nearest')
+                    fg = (attn * masks_a).sum(dim=[2, 3])
+                    tot = attn.sum(dim=[2, 3]).clamp(min=1e-8)
+                    attn_l = args.attn_guide_weight * (1.0 - (fg / tot).mean())
 
                 div_l = torch.tensor(0., device=device)
                 if args.diversity_weight > 0:
@@ -336,8 +321,11 @@ def train(args):
 
                     attn_l = torch.tensor(0., device=device)
                     if args.attn_guide_weight > 0:
-                        attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
-                        attn_l = args.attn_guide_weight * iou_loss(attn_guide, attn_target)
+                        _, _, H_a, W_a = attn.shape
+                        masks_a = F.interpolate(masks.float(), size=(H_a, W_a), mode='nearest')
+                        fg = (attn * masks_a).sum(dim=[2, 3])
+                        tot = attn.sum(dim=[2, 3]).clamp(min=1e-8)
+                        attn_l = args.attn_guide_weight * (1.0 - (fg / tot).mean())
 
                     # diversity_loss is a train-only regulariser — skip on val
                     loss = seg + attn_l
@@ -362,8 +350,10 @@ def train(args):
         val_div  = vrun['div']  / v_seen if v_seen else 0.
         val_acc  = vrun['acc']  / v_seen if v_seen else 0.
 
+        current_lr = scheduler.get_last_lr()[0]
+        scheduler.step()
         logging.info(
-            f"Epoch {epoch}/{args.epochs} | "
+            f"Epoch {epoch}/{args.epochs} | lr={current_lr:.2e} | "
             f"train  total={train_loss:.4f}  seg={train_seg:.4f}  attn={train_attn:.4f}  div={train_div:.4f}  acc={train_acc:.4f} | "
             f"val    total={val_loss:.4f}  seg={val_seg:.4f}  attn={val_attn:.4f}  div={val_div:.4f}  acc={val_acc:.4f}"
         )
@@ -382,6 +372,7 @@ def train(args):
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "best_val_loss": best_val_loss,
                 "num_channels": args.num_channels,
                 "focus_size": args.focus_size,
@@ -417,8 +408,6 @@ def parse_args():
                    help="stride of first encoder conv (1=full res, 2=half res ~3x faster)")
     p.add_argument("--attn-guide-weight", type=float, default=None, help="weight for attention guidance loss (default 0.3, 0 = disabled)")
     p.add_argument("--diversity-weight", type=float, default=None, help="weight for attention diversity loss (default 0.1, 0 = disabled)")
-    p.add_argument("--attn-blur-sigma",  type=float, default=None, help="Gaussian blur sigma cho soft attention target (default 7.0)")
-    p.add_argument("--attn-blur-kernel", type=int,   default=None, help="kernel size blur (lẻ, default 31)")
     p.add_argument("--cpu", action="store_true", help="force CPU")
     p.add_argument("--log-dir", default=None)
     p.add_argument("--output-dir", default=None)
@@ -452,8 +441,6 @@ def merge_config(args):
         "focus_size": 16,
         "encoder_stride": 1,
         "attn_guide_weight": 0.3,
-        "attn_blur_sigma": 7.0,
-        "attn_blur_kernel": 31,
         "diversity_weight": 0.1,
         "log_dir": "logs",
         "output_dir": "outputs",

@@ -64,7 +64,7 @@ def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") 
         return loss.sum()
     return loss
 
-def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.9, reduction: str = "mean") -> torch.Tensor:
+def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.1, reduction: str = "mean") -> torch.Tensor:
     """Combined loss: alpha * IoU + (1-alpha) * MSE."""
     iou = iou_loss(pred, target, reduction=reduction)
     mse = mse_loss(pred, target, reduction=reduction)

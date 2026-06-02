@@ -89,8 +89,7 @@ class sf_seg(nn.Module):
 
         masks = torch.sigmoid(logits)                        # sigmoid ở full resolution
 
-        N = attn.shape[1]
-        attn_guide = attn.sum(dim=1, keepdim=True) / N
+        attn_guide = attn.amax(dim=1, keepdim=True)
         if self.encoder_stride > 1:
             attn_guide = F.interpolate(attn_guide, size=(H, W), mode='bilinear', align_corners=False)
 
