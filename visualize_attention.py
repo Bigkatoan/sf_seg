@@ -18,15 +18,22 @@ def load_model(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device)
     state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
 
-    num_channels = 64
-    w = state.get("attention_block.encoder.4.weight")  # Conv(C→2C): shape (2C, C, 3, 3)
+    num_channels   = ckpt.get("num_channels", 64)   if isinstance(ckpt, dict) else 64
+    focus_size     = ckpt.get("focus_size", 16)      if isinstance(ckpt, dict) else 16
+    encoder_stride = ckpt.get("encoder_stride", 1)   if isinstance(ckpt, dict) else 1
+
+    # Fallback: đọc num_channels từ weight shape nếu không có trong checkpoint
+    w = state.get("attention_block.encoder.4.weight")
     if w is not None:
         num_channels = w.shape[0] // 2
 
-    model = sf_seg(num_channels=num_channels)
+    model = sf_seg(num_channels=num_channels, focus_size=focus_size, encoder_stride=encoder_stride)
     model.load_state_dict(state)
     model.to(device).eval()
-    print(f"Loaded model: num_channels={num_channels}, params={model.get_num_parameters():,}")
+    feat_res = f"{128 // encoder_stride}×{128 // encoder_stride}" if encoder_stride > 1 else "128×128"
+    print(f"Loaded: num_channels={num_channels} focus_size={focus_size} "
+          f"encoder_stride={encoder_stride} feat_res={feat_res} "
+          f"params={model.get_num_parameters():,}")
     return model
 
 

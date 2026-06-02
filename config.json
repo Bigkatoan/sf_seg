@@ -10,5 +10,6 @@
   "loss_type": "combine",
   "image_size": 128,
   "num_channels": 64,
-  "focus_size": 16
+  "focus_size": 8,
+  "encoder_stride": 2
 }

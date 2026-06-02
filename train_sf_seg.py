@@ -167,7 +167,8 @@ def train(args):
         prefetch_factor=prefetch_factor, persistent_workers=persistent,
     )
 
-    model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size)
+    model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
+                   encoder_stride=args.encoder_stride)
     print(f"Model parameters: {model.get_num_parameters():,}")
     model.to(device)
     if device.type == 'cuda':
@@ -383,6 +384,8 @@ def train(args):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_val_loss": best_val_loss,
                 "num_channels": args.num_channels,
+                "focus_size": args.focus_size,
+                "encoder_stride": args.encoder_stride,
             }
             torch.save(ckpt, last_model_path)
             if improved:
@@ -410,6 +413,8 @@ def parse_args():
     p.add_argument("--num-channels", type=int, default=None, help="number of channels in sf_seg attention block")
     p.add_argument("--kernel-size", type=int, default=None, help="conv kernel size in attention block (default 7)")
     p.add_argument("--focus-size", type=int, default=None, help="attention budget = focus_size^2 pixels per channel (default 16)")
+    p.add_argument("--encoder-stride", type=int, default=None, choices=[1, 2],
+                   help="stride of first encoder conv (1=full res, 2=half res ~3x faster)")
     p.add_argument("--attn-guide-weight", type=float, default=None, help="weight for attention guidance loss (default 0.3, 0 = disabled)")
     p.add_argument("--diversity-weight", type=float, default=None, help="weight for attention diversity loss (default 0.1, 0 = disabled)")
     p.add_argument("--attn-blur-sigma",  type=float, default=None, help="Gaussian blur sigma cho soft attention target (default 7.0)")
@@ -445,6 +450,7 @@ def merge_config(args):
         "num_channels": 128,
         "kernel_size": 7,
         "focus_size": 16,
+        "encoder_stride": 1,
         "attn_guide_weight": 0.3,
         "attn_blur_sigma": 7.0,
         "attn_blur_kernel": 31,
