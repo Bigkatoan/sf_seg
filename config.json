@@ -2,13 +2,13 @@
   "data_root": "data",
   "epochs": 100,
   "batch_size": 64,
-  "lr": 0.001,
+  "lr": 0.0001,
   "num_workers": 8,
   "log_dir": "logs",
   "output_dir": "outputs",
   "checkpoint_dir": "checkpoints",
-  "batch_accumulate": 1, 
   "loss_type": "combine",
-  "image_size": 224,
-  "num_channels": 32
+  "image_size": 128,
+  "num_channels": 64,
+  "focus_size": 16
 }
