@@ -203,14 +203,22 @@ All defaults can be set in `config.json`.
 python visualize_attention.py \
     --checkpoint checkpoints/sf_seg_best.pt \
     --num-images 6 \
-    --show-channels 8          # show top-8 channels by attention variance
+    --show-channels 8 \
+    --min-range 0.05       # only show channels that found their pattern in this image
 ```
 
 Each output image shows 4 + N panels:
 ```
 [Input RGB] [GT Mask] [Predicted Mask] [Attention Sum] [Ch_i × N]
 ```
-Channels are ranked by spatial variance — high variance = more localized focus.
+
+Channels are filtered by **min-max range** (`max − min` over spatial dims):
+- **Range low** → the pattern this channel learned does not appear in this image; attention spreads uniformly with no peak — nothing useful to show
+- **Range high** → the channel found its pattern; there is a clear bright spot
+
+Channels passing the threshold are sorted by range (sharpest focus first). The title of each panel shows `rng` and `max` for quick comparison.
+
+Adjust `--min-range` (default `0.05`) to control strictness: raise to `0.1–0.2` for only the clearest channels, lower to `0.01` to see everything.
 
 ---
 
