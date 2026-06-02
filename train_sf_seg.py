@@ -338,25 +338,20 @@ def train(args):
                         attn_target = build_attn_target(masks, args.attn_blur_kernel, args.attn_blur_sigma)
                         attn_l = args.attn_guide_weight * iou_loss(attn_guide, attn_target)
 
-                    div_l = torch.tensor(0., device=device)
-                    if args.diversity_weight > 0:
-                        div_l = args.diversity_weight * diversity_loss(attn)
-
-                    loss = seg + attn_l + div_l
+                    # diversity_loss is a train-only regulariser — skip on val
+                    loss = seg + attn_l
 
                 b = images.size(0)
                 batch_acc = pixel_accuracy(preds, masks)
                 vrun['loss'] += loss.item() * b
                 vrun['seg']  += seg.item()  * b
                 vrun['attn'] += attn_l.item() * b
-                vrun['div']  += div_l.item()  * b
                 vrun['acc']  += batch_acc * b
                 v_seen += b
                 val_iter.set_postfix(
                     total=f"{loss.item():.4f}",
                     seg=f"{seg.item():.4f}",
                     attn=f"{attn_l.item():.4f}",
-                    div=f"{div_l.item():.4f}",
                     acc=f"{batch_acc:.4f}",
                 )
 

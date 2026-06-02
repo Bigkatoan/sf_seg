@@ -64,7 +64,7 @@ def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") 
         return loss.sum()
     return loss
 
-def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.1, reduction: str = "mean") -> torch.Tensor:
+def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.9, reduction: str = "mean") -> torch.Tensor:
     """Combined loss: alpha * IoU + (1-alpha) * MSE."""
     iou = iou_loss(pred, target, reduction=reduction)
     mse = mse_loss(pred, target, reduction=reduction)
@@ -84,13 +84,19 @@ def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     Loss = 1  when all channels are identical.
     """
     B, C, H, W = attn.shape
-    a = attn.view(B, C, H * W).float()                        # (B, C, L)
-    a = F.normalize(a, dim=-1, eps=eps)                        # unit norm per channel
+    a = attn.view(B, C, H * W)
+
+    # Subsample spatial locations: Gram matrix gradient signal không đổi
+    # khi dùng random subset — tiết kiệm O(L) → O(max_pixels) cho bmm
+    L = a.shape[-1]
+    if L > 2048:
+        idx = torch.randperm(L, device=a.device)[:2048]
+        a = a[:, :, idx]
+
+    a = F.normalize(a.float(), dim=-1, eps=eps)                # unit norm per channel
     gram = torch.bmm(a, a.transpose(1, 2))                     # (B, C, C) cosine sims
-    # zero out diagonal (self-similarity = 1, not penalised)
     eye = torch.eye(C, device=attn.device, dtype=gram.dtype)
     off_diag = gram * (1.0 - eye)
-    # normalise by number of off-diagonal pairs: C*(C-1)
     return (off_diag ** 2).sum(dim=[1, 2]).mean() / (C * (C - 1))
 
 
