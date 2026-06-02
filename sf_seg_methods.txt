@@ -1,0 +1,323 @@
+================================================================
+TỔNG HỢP CÁC PHƯƠNG PHÁP VÀ KỸ THUẬT DÙNG TRONG TRAIN MODEL sf_seg
+================================================================
+Ngày: 2026-06-02
+Dự án: UNET / Person Segmentation
+Model: sf_seg (Soft-Focus Segmentation)
+================================================================
+
+
+════════════════════════════════════════════════════════════════
+1. KIẾN TRÚC MODEL (sf_seg.py)
+════════════════════════════════════════════════════════════════
+
+1.1 Tổng quan
+─────────────
+sf_seg là một mô hình segmentation nhẹ, không dùng kiến trúc
+encoder-decoder đầy đủ như U-Net mà thay vào đó dùng một
+AttentionBlock đơn giản + đầu convolution phân loại mask.
+
+Luồng forward:
+  Input (B,3,H,W)
+    → AttentionBlock
+      → Encoder CNN
+      → Clamped Softmax (Budget Attention)
+      → attended_features = attn * features
+    → masks = Conv2d(1×1) + Sigmoid    → (B,1,H,W)
+    → attn_guide = sum(attn)/N         → (B,1,H,W) ∈ [0,1]
+
+1.2 Encoder CNN trong AttentionBlock
+──────────────────────────────────────
+Cấu trúc: 3 lớp Conv2d với padding='same' (giữ nguyên H×W)
+  - Conv2d(3,   C,   3×3) + ReLU
+  - Conv2d(C,   C,   3×3) + ReLU
+  - Conv2d(C,   2C,  3×3)          ← không activation, expand ở đây
+
+Tại sao expand muộn:
+  - Các lớp giữa tốn C² tham số thay vì (2C)²=4C²
+  - Tiết kiệm ~2× compute ở phần trung gian
+
+Output 2C channel được tách (chunk) thành:
+  - score:    (B, C, H, W) — dùng để tính attention map
+  - features: (B, C, H, W) — dùng để tính output
+
+1.3 Clamped Softmax — Budget Attention (kỹ thuật trọng tâm)
+──────────────────────────────────────────────────────────────
+Mục tiêu: buộc attention phân bổ đúng k = focus_size² "đơn vị
+focus" trên L = H×W pixel, mỗi pixel ∈ [0,1], tổng = k.
+
+Thuật toán:
+  Bước 1: p = softmax(score, dim=-1) × k     → tổng = k
+  Bước 2: Tìm λ* (ngưỡng bão hoà) bằng topk:
+    - Chỉ lấy top-k giá trị (j* ≤ k nên chỉ cần duyệt k)
+    - Sort k phần tử (k << L → hiệu quả hơn sort toàn bộ L)
+    - cumsum để tìm điểm j pixel bão hoà (= 1.0)
+    - λ* = (j - cumsum) / (L - j) tại ngưỡng j_sat
+  Bước 3: attn = clamp(p - λ*, 0, 1)
+
+Tại sao dùng clamped softmax thay vì softmax thường:
+  - Softmax thông thường: tổng = 1 nhưng mỗi giá trị có thể
+    rất nhỏ → model không học được "tập trung"
+  - Clamped softmax: tổng = k (budget), giá trị bão hoà = 1
+    → model buộc phải focus vào đúng k pixel, các pixel còn
+    lại nhận attention gần 0
+
+Kết quả: attended_features = attn × features
+  → Chỉ vùng được focus mới đóng góp vào prediction
+
+1.4 Segmentation Head
+──────────────────────
+  - Conv2d(C, 1, 3×3, padding='same') trên attended_features
+  - Sigmoid → xác suất mask ∈ [0,1]
+  - Threshold 0.5 khi inference để tạo binary mask
+
+1.5 Attention Guide Output
+───────────────────────────
+  attn_guide = sum(attn, dim=channels) / N   ∈ [0,1]
+  - Pixel nào được tất cả N channel attend (weight=1) → 1.0
+  - Dùng làm auxiliary supervision (xem phần loss)
+
+
+════════════════════════════════════════════════════════════════
+2. HÀM LOSS (losses.py + train_sf_seg.py)
+════════════════════════════════════════════════════════════════
+
+2.1 IoU Loss (mặc định)
+────────────────────────
+  Công thức:
+    inter = Σ(pred × target)
+    union = Σ(pred) + Σ(target) - inter
+    IoU   = (inter + ε) / (union + ε)
+    loss  = 1 - IoU
+
+  Ưu điểm:
+  - Trực tiếp tối ưu chỉ số đánh giá (Intersection over Union)
+  - Không bị ảnh hưởng bởi class imbalance nặng (foreground nhỏ)
+  - Soft IoU: pred là xác suất liên tục (không threshold)
+  - ε=1e-3 tránh chia zero
+
+2.2 BCE Loss (Binary Cross-Entropy)
+─────────────────────────────────────
+  - nn.BCELoss() — yêu cầu pred đã qua sigmoid ∈ [0,1]
+  - Tính per-pixel log likelihood
+  - Nhạy hơn với từng pixel so với IoU
+
+2.3 MSE Loss
+─────────────
+  loss = mean((pred - target)²)
+  - Phù hợp khi muốn output "mềm" hơn, xử phạt nhẹ lỗi nhỏ
+
+2.4 Combined Loss (dùng trong config.json)
+────────────────────────────────────────────
+  loss = α × IoU_loss + (1-α) × MSE_loss,   α = 0.1
+
+  Kết hợp:
+  - IoU (α=0.1): đảm bảo model học hình dạng/overlap tổng thể
+  - MSE (1-α=0.9): đảm bảo từng pixel gần đúng, tạo gradient mịn
+
+2.5 BCE + IoU Loss
+───────────────────
+  loss = BCE(pred, target) + IoU_loss(pred, target)
+  - Kết hợp cả pixel-level và region-level supervision
+
+2.6 Attention Guidance Loss (Auxiliary Loss)
+─────────────────────────────────────────────
+  Mục tiêu: hướng dẫn attention map focus đúng vùng người.
+
+  Tạo soft target từ GT mask:
+  1. Gaussian blur 2D (separable): kernel kích thước 31, σ=7.0
+     - Blur theo H rồi W riêng (tiết kiệm compute: 2×k vs k²)
+     - Tâm object: giá trị cao (~1)
+     - Vùng biên: gradient mượt
+     - Background xa: gần 0
+  2. Normalize per-sample: peak/sample = 1.0
+     - Tránh ảnh hưởng của kích thước object
+
+  Sau đó:
+    attn_loss = IoU_loss(attn_guide, attn_target)
+    total_loss = main_loss + w × attn_loss,   w = 0.3
+
+  Tại sao dùng Gaussian blur thay vì GT cứng:
+  - Attention không cần pixel-perfect, chỉ cần focus "gần đúng"
+  - Gradient từ binary target quá sparse, khó học
+  - Blur tạo vùng học rộng hơn, stable hơn
+
+
+════════════════════════════════════════════════════════════════
+3. TRAINING PIPELINE (train_sf_seg.py)
+════════════════════════════════════════════════════════════════
+
+3.1 Optimizer
+──────────────
+  - Adam, lr=1e-4 (weight_decay=0 mặc định)
+  - zero_grad(set_to_none=True): giải phóng bộ nhớ thực sự
+    thay vì chỉ zero-fill gradient buffer
+
+3.2 Mixed Precision Training (AMP)
+────────────────────────────────────
+  - torch.amp.autocast('cuda'): tự động cast sang float16
+    trong forward/loss để tăng tốc và giảm VRAM
+  - torch.amp.GradScaler: scale loss trước backward để tránh
+    gradient underflow do float16
+  - Quy trình:
+      scaler.scale(loss).backward()
+      scaler.step(optimizer)
+      scaler.update()
+  - Chỉ bật khi device = CUDA (CPU dùng float32 thường)
+
+3.3 DataLoader Optimization
+────────────────────────────
+  - pin_memory=True (CUDA): lock bộ nhớ CPU để transfer
+    GPU nhanh hơn (DMA trực tiếp)
+  - non_blocking=True: upload batch lên GPU bất đồng bộ
+    trong khi GPU còn xử lý batch trước
+  - prefetch_factor=2: prefetch 2 batch song song
+  - persistent_workers=True: giữ worker process sống
+    giữa các epoch (tránh spawn/kill lặp lại)
+  - num_workers=8 (config): đa tiến trình load dữ liệu
+
+3.4 Dataset & Augmentation
+────────────────────────────
+  - Resize image: BILINEAR (chất lượng cao cho RGB)
+  - Resize mask: NEAREST (tránh tạo giá trị trung gian
+    không có nghĩa cho binary mask)
+  - Binarize mask: (mask_t > 0.5).float()
+  - Shuffle train, không shuffle val
+
+3.5 Checkpoint Strategy
+────────────────────────
+  Lưu 2 loại checkpoint:
+  - sf_seg_last.pt: cuối mỗi epoch (resume an toàn)
+  - sf_seg_best.pt: epoch có val_loss thấp nhất
+
+  Nội dung checkpoint:
+  {
+    "epoch": int,
+    "model_state_dict": ...,
+    "optimizer_state_dict": ...,     ← resume optimizer state
+    "best_val_loss": float,
+    "num_channels": int
+  }
+
+  Resume:
+  - --resume last: tải sf_seg_last.pt
+  - --resume <path>: tải checkpoint cụ thể
+  - Khôi phục epoch, optimizer state, best_val_loss
+
+3.6 Validation & Evaluation
+─────────────────────────────
+  Metrics:
+  - Pixel Accuracy = (pred==target).mean()
+    → % pixel phân loại đúng (ngưỡng 0.5)
+
+  Visualization (mỗi epoch):
+  - Lấy ngẫu nhiên 1 sample từ val set
+  - Tạo ảnh gộp 3 panel: [RGB | GT (đỏ) | PRED (đỏ)]
+  - Scale về chiều cao 480px
+  - Lưu: outputs/epoch_{N}_sample_{idx}_combined.png
+
+  Logging:
+  - logs/train_sf_seg.log: text log (StreamHandler + FileHandler)
+  - logs/train_sf_seg_log.csv: epoch,train_loss,train_acc,val_loss,val_acc
+  - tqdm progress bar với live loss/acc
+
+3.7 Vòng lặp Train
+────────────────────
+  for epoch in range(epochs):
+    ┌── model.train()
+    │   for batch in train_loader:
+    │     autocast → forward → loss → backward → step
+    │     accumulate loss, acc
+    │
+    ├── model.eval()
+    │   with torch.inference_mode():  ← không tính grad, nhanh hơn no_grad
+    │     for batch in val_loader:
+    │       autocast → forward → loss (không backward)
+    │
+    ├── log metrics
+    ├── save checkpoint (last + best nếu cải thiện)
+    └── save validation visualization
+
+
+════════════════════════════════════════════════════════════════
+4. HYPERPARAMETERS MẶC ĐỊNH
+════════════════════════════════════════════════════════════════
+
+  epochs:            100
+  batch_size:        64
+  lr:                1e-4
+  num_workers:       8
+  image_size:        128 × 128
+  num_channels:      64 (config.json) / 128 (script default)
+  focus_size:        16  → budget k = 16² = 256 pixel/channel
+  attn_guide_weight: 0.3
+  attn_blur_sigma:   7.0
+  attn_blur_kernel:  31 (lẻ)
+  loss_type:         combine (config.json) / iou (script default)
+
+  Combined loss alpha: 0.1 (IoU) + 0.9 (MSE)
+
+
+════════════════════════════════════════════════════════════════
+5. SO SÁNH VỚI U-NET (models.py)
+════════════════════════════════════════════════════════════════
+
+  U-Net (models.py):                 sf_seg (sf_seg.py):
+  ─────────────────────────────────  ──────────────────────────────
+  Encoder-decoder, skip connections  Flat encoder + attention head
+  MaxPool2d downsampling             Giữ nguyên resolution
+  ConvTranspose2d upsampling         Không cần upsample
+  ~250k params (default channels)    ~100-200k params (tùy C)
+  Học đặc trưng đa scale             Học "chỗ nào quan trọng" (budget)
+  Nhiều lớp, sâu hơn                 Nông hơn, nhanh hơn
+  Dùng hàm loss bình thường          + Auxiliary attention guidance
+
+
+════════════════════════════════════════════════════════════════
+6. DATA PIPELINE
+════════════════════════════════════════════════════════════════
+
+  Dataset: COCO 2017 (person instances)
+  Format thư mục:
+    data/
+      images/train/   *.jpg/*.png
+      images/val/     *.jpg/*.png
+      masks/train/    *.png (binary, grayscale)
+      masks/val/      *.png
+
+  Preprocessing:
+  1. Load RGB image → resize BILINEAR → to_tensor [0,1]
+  2. Load grayscale mask → resize NEAREST → to_tensor → binarize >0.5
+
+
+════════════════════════════════════════════════════════════════
+7. CÁC LỰA CHỌN KỸ THUẬT ĐÁNG CHÚ Ý
+════════════════════════════════════════════════════════════════
+
+  (a) Clamped Softmax thay vì Softmax thường:
+      → Enforce sparsity + budget, không cần regularization thêm
+
+  (b) Separable Gaussian Blur (H rồi W):
+      → O(2k) thay vì O(k²) cho mỗi pixel, tiết kiệm khi k=31
+
+  (c) topk thay vì sort toàn bộ để tìm λ*:
+      → k log k << L log L, L=128²=16384, k=256
+
+  (d) torch.inference_mode() thay vì torch.no_grad():
+      → Nhanh hơn, ít overhead hơn khi không cần tính grad
+
+  (e) optimizer.zero_grad(set_to_none=True):
+      → Giải phóng bộ nhớ thật sự, tốt hơn zero-fill
+
+  (f) Expand channel ở lớp cuối encoder (C → 2C):
+      → Tiết kiệm ~2× tham số ở lớp giữa
+
+  (g) Normalize attn_target per-sample:
+      → Không bị ảnh hưởng bởi kích thước object trong ảnh
+
+  (h) Lưu optimizer_state_dict trong checkpoint:
+      → Adam có momentum (m1, m2) cần khôi phục để resume chính xác
+
+================================================================
+END OF DOCUMENT
+================================================================

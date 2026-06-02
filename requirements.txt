@@ -1,0 +1,7 @@
+torch
+torchvision
+pycocotools
+Pillow
+numpy
+requests
+tqdm
