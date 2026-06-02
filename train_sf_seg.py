@@ -25,10 +25,11 @@ import torch.nn.functional as F
 
 
 class SegmentationDataset(Dataset):
-    def __init__(self, images_dir: Path, masks_dir: Path, image_size: int = 128):
+    def __init__(self, images_dir: Path, masks_dir: Path, image_size: int = 128, augment: bool = False):
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
         self.image_size = int(image_size)
+        self.augment = augment
         self.images = sorted([p for p in self.images_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')])
         self.pairs = []
         for p in self.images:
@@ -45,9 +46,28 @@ class SegmentationDataset(Dataset):
         mask = Image.open(mask_p).convert('L')
         img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
         mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
-        if random.random() > 0.5:
-            img = TF.hflip(img)
-            mask = TF.hflip(mask)
+        if self.augment:
+            if random.random() > 0.5:
+                img = TF.hflip(img)
+                mask = TF.hflip(mask)
+            if random.random() > 0.5:
+                angle = random.uniform(-15.0, 15.0)
+                img  = TF.rotate(img,  angle, interpolation=TF.InterpolationMode.BILINEAR, fill=0)
+                mask = TF.rotate(mask, angle, interpolation=TF.InterpolationMode.NEAREST,  fill=0)
+            if random.random() > 0.5:
+                max_shift = int(self.image_size * 0.1)
+                tx = random.randint(-max_shift, max_shift)
+                ty = random.randint(-max_shift, max_shift)
+                img  = TF.affine(img,  angle=0, translate=[tx, ty], scale=1.0, shear=0,
+                                 interpolation=TF.InterpolationMode.BILINEAR, fill=0)
+                mask = TF.affine(mask, angle=0, translate=[tx, ty], scale=1.0, shear=0,
+                                 interpolation=TF.InterpolationMode.NEAREST,  fill=0)
+            if random.random() > 0.5:
+                img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
+            if random.random() > 0.5:
+                img = TF.adjust_contrast(img, random.uniform(0.7, 1.3))
+            if random.random() > 0.5:
+                img = TF.adjust_saturation(img, random.uniform(0.8, 1.2))
         img_t = TF.to_tensor(img)
         mask_t = TF.to_tensor(mask)
         mask_t = (mask_t > 0.5).float()
@@ -69,25 +89,13 @@ def save_validation_sample(model, dataset: Dataset, device: torch.device, out_di
     with torch.no_grad():
         pred, _, _ = model(img_t.unsqueeze(0).to(device))
         pred = pred.cpu().squeeze(0)
-    pred_mask = (pred > 0.5).float()
-    img_pil = TF.to_pil_image(img_t)
-    gt_pil = TF.to_pil_image(mask_t.squeeze(0))
-    pred_pil = TF.to_pil_image(pred_mask.squeeze(0))
+    img_pil  = TF.to_pil_image(img_t)
+    gt_pil   = TF.to_pil_image(mask_t.squeeze(0))
+    pred_pil = TF.to_pil_image(pred.squeeze(0))   # raw probability [0,1] grayscale
 
-    def mask_to_rgb(mask_pil: Image.Image, color=(255, 0, 0)) -> Image.Image:
-        m = np.array(mask_pil)
-        if m.max() <= 1:
-            m = (m * 255).astype(np.uint8)
-        mask_bool = m > 127
-        rgb = np.zeros((m.shape[0], m.shape[1], 3), dtype=np.uint8)
-        rgb[mask_bool] = color
-        return Image.fromarray(rgb)
-
-    gt_rgb = mask_to_rgb(gt_pil)
-    pred_rgb = mask_to_rgb(pred_pil)
     w, h = img_pil.size
-    gt_rgb = gt_rgb.resize((w, h), Image.NEAREST)
-    pred_rgb = pred_rgb.resize((w, h), Image.NEAREST)
+    gt_rgb = gt_pil.resize((w, h), Image.NEAREST).convert('RGB')
+    pred_rgb = pred_pil.resize((w, h), Image.BILINEAR).convert('RGB')
 
     combined = Image.new('RGB', (w * 3, h))
     combined.paste(img_pil, (0, 0))
@@ -118,8 +126,8 @@ def train(args):
     val_images = data_root / 'images' / 'val'
     val_masks = data_root / 'masks' / 'val'
 
-    train_ds = SegmentationDataset(train_images, train_masks, image_size=args.image_size)
-    val_ds = SegmentationDataset(val_images, val_masks, image_size=args.image_size)
+    train_ds = SegmentationDataset(train_images, train_masks, image_size=args.image_size, augment=True)
+    val_ds = SegmentationDataset(val_images, val_masks, image_size=args.image_size, augment=False)
 
     if len(train_ds) == 0:
         raise RuntimeError(f"No training samples found in {train_images}")
@@ -202,7 +210,7 @@ def train(args):
     start_epoch = 1
     resume_arg = getattr(args, "resume", None)
     if resume_arg:
-        if str(resume_arg).lower() in ("last", "auto"):
+        if resume_arg is True or str(resume_arg).lower() in ("last", "auto", "true"):
             resume_fp = checkpoints / "sf_seg_last.pt"
         else:
             resume_fp = Path(resume_arg)
@@ -244,7 +252,7 @@ def train(args):
             masks = masks.to(device, non_blocking=pin_memory)
 
             with autocast('cuda', enabled=use_amp):
-                preds, attn_guide, attn = model(images)
+                preds, _, attn = model(images)
                 if args.loss_type == "iou":
                     seg = iou_loss(preds, masks)
                 elif args.loss_type == "bce":
@@ -307,7 +315,7 @@ def train(args):
                 masks = masks.to(device, non_blocking=pin_memory)
 
                 with autocast('cuda', enabled=use_amp):
-                    preds, attn_guide, attn = model(images)
+                    preds, _, attn = model(images)
                     if args.loss_type == "iou":
                         seg = iou_loss(preds, masks)
                     elif args.loss_type == "bce":

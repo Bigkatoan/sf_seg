@@ -13,5 +13,6 @@
   "focus_size": 32,
   "encoder_stride": 2,
   "attn_guide_weight": 0.4,
-  "diversity_weight": 0.1
+  "diversity_weight": 0.1,
+  "resume": true
 }
