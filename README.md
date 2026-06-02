@@ -108,6 +108,22 @@ total_loss = main_loss + 0.3 × IoU_loss(attn_guide, attn_target)
 ```
 The GT mask is blurred (not used binary) so attention only needs to focus "approximately" on the person, not pixel-perfectly. This avoids sparse gradients and makes attention training stable.
 
+**Attention Diversity Loss** (auxiliary):
+```
+A  = attn.view(B, C, L)                    # (B, C, L), L = H×W
+A  = normalize(A, dim=-1)                   # unit-norm per channel
+G  = A @ Aᵀ                                # (B, C, C) cosine-similarity Gram matrix
+loss_div = mean(off_diag(G)²) / C(C-1)
+
+total_loss = main_loss + 0.1 × loss_div
+```
+Without this loss, channels tend to attend to the same regions (all variance ~0.007). The Gram matrix penalty directly minimises the cosine similarity between every pair of channels, pushing them to specialise on different spatial regions.
+
+- **loss_div = 0** → all C channels are perfectly orthogonal (ideal)
+- **loss_div = 1** → all channels are identical (worst case)
+
+`sf_seg.forward()` returns `(masks, attn_guide, attn)` — the raw `attn` tensor `(B, C, H, W)` is needed to compute this loss.
+
 ---
 
 ### 5. Training Pipeline
@@ -171,6 +187,7 @@ python train_sf_seg.py --resume last
 | `--attn-guide-weight` | 0.3 | Weight of attention guidance auxiliary loss (0 = off) |
 | `--attn-blur-sigma` | 7.0 | Gaussian blur sigma for soft attention target |
 | `--attn-blur-kernel` | 31 | Gaussian blur kernel size (must be odd) |
+| `--diversity-weight` | 0.1 | Weight of attention diversity loss / Gram penalty (0 = off) |
 | `--image-size` | 128 | Square input resolution |
 | `--lr` | 1e-4 | Adam learning rate |
 | `--batch-size` | 64 | Batch size |
