@@ -45,7 +45,7 @@ def process_split(
         try:
             mask = Image.open(mask_path).convert("L")
             mask_r = mask.resize((image_size, image_size), Image.NEAREST)
-            if (np.array(mask_r) > 127).sum() < min_pixels:
+            if (np.array(mask_r) > 0).sum() < min_pixels:
                 return "too_small"
             img = Image.open(img_path).convert("RGB")
             img.resize((image_size, image_size), Image.BILINEAR).save(dst_img / img_path.name)
@@ -71,7 +71,7 @@ def main():
     p.add_argument("--root", default="data")
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--min-person-pixels", type=int, default=24 * 24,
-                   help="Minimum foreground pixels in resized mask (default 576 = 24x24)")
+                   help="Minimum foreground pixels (>0) in resized mask (default 576 = 24x24)")
     p.add_argument("--workers", type=int, default=8)
     args = p.parse_args()
 

@@ -1,18 +1,19 @@
 {
   "data_root": "data",
-  "epochs": 100,
-  "batch_size": 32,
-  "lr": 0.0001,
+  "epochs": 200,
+  "batch_size": 16,
+  "lr": 0.001,
   "num_workers": 8,
   "log_dir": "logs",
   "output_dir": "outputs",
   "checkpoint_dir": "checkpoints",
-  "loss_type": "combine",
+  "loss_type": "ce_iou",
   "image_size": 224,
   "num_channels": 64,
   "focus_size": 32,
   "encoder_stride": 2,
-  "attn_guide_weight": 0.4,
   "diversity_weight": 0.1,
-  "resume": true
+  "num_classes": 81,
+  "no_obj_weight": 0.01,
+  "resume": false
 }

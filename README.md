@@ -1,152 +1,144 @@
-# sf_seg — Soft-Focus Segmentation
+# sf_seg — Multi-scale Sparse-Focus Segmentation
 
-A lightweight person segmentation model built around a single novel mechanism: **budget attention via clamped softmax**. Instead of a full encoder-decoder (U-Net style), sf_seg uses a shallow CNN whose attention head is mathematically constrained to focus on at most `k = focus_size²` pixels per channel.
-
----
-
-## How It Works
-
-### 1. Encoder
-
-```
-Input  (B, 3, H, W)
-  Conv2d(3  → C, 3×3, stride=encoder_stride) + ReLU
-  Conv2d(C  → C, 3×3) + ReLU
-  Conv2d(C  → 2C, 3×3)          ← no activation; channel expand only at the end
-```
-
-The encoder widens to `2C` only at the last layer. This keeps intermediate layers at cost `C²` instead of `(2C)² = 4C²`, saving ~2× compute compared to expanding early.
-
-With `encoder_stride=2` (default), the encoder operates at half resolution `(H/2 × W/2)`, giving a **~2.9× speedup** with the same parameter count. Logits are upsampled back to full resolution before sigmoid — gradient flows through unbounded logits, not through a saturated sigmoid at low resolution.
-
-The output is split into two tensors of shape `(B, C, H', W')`:
-- **score** — used to compute where to attend
-- **features** — the actual content that gets weighted
+Lightweight semantic segmentation for COCO 80 classes, built around one core idea: **budget-constrained spatial attention via clamped softmax**. Three independent attention heads operate at different image scales; their outputs are fused bottom-up in a UNet-style decoder with learned blending at every transition.
 
 ---
 
-### 2. Clamped Softmax (Budget Attention)
+## Architecture
 
-This is the core contribution. Standard softmax distributes attention uniformly across all pixels, making it hard to learn spatial focus. Clamped softmax enforces:
-
-> Each channel attends to **exactly k pixels** in total, with each pixel weight in **[0, 1]**.
-
-**Algorithm** (closed-form, no Python loops, pure CUDA ops):
+### Overview
 
 ```
-k = focus_size²                           # e.g. 32² = 1024 "focus units"
-L = H' × W'                              # total pixels at encoder resolution
+Input x (B, 3, H, W)
+  ├─ resize H/16 → head_small  → a_small  (B, C, H/32, W/32)   global context
+  ├─ resize H/4  → head_medium → a_medium (B, C, H/8,  W/8 )   mid-range
+  └─ full res    → head_large  → a_large  (B, C, H/2,  W/2 )   fine detail
 
-p = softmax(score, dim=pixels) × k        # shape (B, C, L), sum = k per channel
-
-# Find saturation threshold λ* in O(k log k) instead of O(L log L):
-top_vals  = topk(p, k=k)                  # only top-k can possibly saturate
-top_sorted = sort(top_vals, descending)
-cumsum    = cumsum(top_sorted)
-lam_j     = (j - cumsum) / (L - j)        # λ if exactly j pixels saturate at 1.0
-j_sat     = count(top_sorted - 1 >= lam_j)  # actual number of saturated pixels
-λ*        = lam_j[j_sat - 1]
-
-attn = clamp(p - λ*, 0, 1)               # ∈ [0,1], sum = k exactly
+Decoder (bottom-up):
+  a_small
+    ↓ upsample ×4 → blend_up_sm (3×3 conv)
+    cat[↑, a_medium]  → fuse_sm_med (2× 3×3 conv)  →  d_med
+    ↓ upsample ×4 → blend_up_med (3×3 conv)
+    cat[↑, a_large]   → fuse_med_lg (2× 3×3 conv)  →  d_lg
+    ↓ upsample ×2 → pre_masks (3×3 conv)
+    → masks (1×1 conv) → logits (B, num_classes, H, W)
 ```
 
-**Why this works:**
-- `p` from softmax×k already sums to `k`
-- Any pixel with `p_i > 1` gets clamped to `1` (saturated), its excess redistributed via `λ*` to the remaining pixels
-- The threshold `λ*` is the unique value that makes the redistribution exact
-- **Proof that j\* ≤ k:** if j\* > k, then sum ≥ j\* > k, contradicting sum = k
+### Attention Head
 
-**Result:** attended_features = attn × features — only the `k` focused pixels contribute meaningfully.
+Each head receives the image at its assigned scale and runs the full attention pipeline independently:
+
+```
+x_scale  (B, 3, H_s, W_s)
+  Conv(3→C, 3×3, stride=2) + ReLU          → (B, C,   H_s/2, W_s/2)
+  Conv(C→2C, 3×3)                           → (B, 2C,  H_s/2, W_s/2)
+  split → score (B, C, L),  features (B, C, L),  L = H_s/2 × W_s/2
+
+  attn     = clamped_softmax(score, k)      → ∈ [0,1], sum=k per channel
+  attended = attn × features
+  channel_mix: Conv(C→C, 1×1) + ReLU       → cross-channel blend
+```
+
+`channel_mix` is a 1×1 conv applied after the element-wise attention weighting. Because `attn × features` weights each channel independently, it never mixes information across channels — `channel_mix` closes that gap before features enter the decoder.
+
+### Clamped Softmax (Budget Attention)
+
+The core constraint: each channel attends to **exactly k pixels**, with each weight in **[0, 1]**.
+
+```
+k = min(focus_size², L − 1)         # budget (clamped per-forward for small scales)
+L = H' × W'                         # spatial size at attention resolution
+
+p = softmax(score) × k              # sum = k, but values may exceed 1
+# Find λ* in O(k log k) via topk:
+attn = clamp(p − λ*, 0, 1)          # exactly k total weight, each ≤ 1
+```
+
+Proof that the solution is valid: any j\* saturating pixels must satisfy j\* ≤ k (otherwise sum ≥ j\* > k, contradiction). So only topk(k) candidates can saturate — the full sort over L pixels is unnecessary.
+
+### Scale / Coverage Table (default: image_size=224, focus_size=32)
+
+| Head         | Input     | Attn space  |   k  |    L  | Coverage |
+|:-------------|:---------:|:-----------:|:----:|------:|:--------:|
+| `head_small` |  14 × 14  |   7 ×  7    |  16  |    49 |   33 %   |
+| `head_medium`|  56 × 56  |  28 × 28    | 256  |   784 |   33 %   |
+| `head_large` | 224 × 224 | 112 × 112   | 1024 | 12544 |    8 %   |
+
+Dense coverage at small scales (global context) + sparse at large scale (local selection).
+
+### Blending Strategy
+
+Three explicit blending points prevent information from passing through the decoder in a raw, unprocessed state:
+
+| Location | Layer | Purpose |
+|---|---|---|
+| After `attn × features` | `channel_mix` (1×1) | Cross-channel mixing after independent attention weighting |
+| After each upsample | `blend_up_sm`, `blend_up_med` (3×3) | Adapt bilinearly-stretched features to the new resolution before concat |
+| After final upsample | `pre_masks` (3×3) | Blend multi-scale features before 1×1 class prediction |
 
 ---
 
-### 3. Segmentation Head
+## Loss Functions
 
-```
-attended_features  (B, C, H', W')
-  → Conv2d(C → 1, 3×3, padding='same')
-  → interpolate to (H, W)  [if encoder_stride > 1]
-  → Sigmoid
-  → mask  (B, 1, H, W)  ∈ [0, 1]
-```
+### Segmentation loss (`--loss-type`)
 
-The model also returns an **attention guide** for visualization:
-```
-attn_guide = max(attn, dim=channels)   ∈ [0, 1]
-```
-A pixel reaching `1.0` means at least one channel attended to it with maximum weight. Using max instead of mean preserves sparsity: with diverse channels, the mean collapses to a uniform constant (~1/L × k), while max retains the actual coverage pattern.
-
----
-
-### 4. Loss Functions
-
-**Segmentation Loss** (main objective, `--loss-type`):
+**Multi-class** (num_classes > 1):
 
 | Type | Formula |
 |---|---|
-| `iou` | `1 - (Σ pred·target + ε) / (Σ pred + Σ target - inter + ε)` |
-| `mse` | `mean((pred - target)²)` |
-| `combine` | `0.1 × IoU + 0.9 × MSE` |
-| `bce` | binary cross-entropy |
-| `bce_iou` | `BCE + IoU` |
+| `ce` | Cross-entropy with per-class frequency weights |
+| `iou` | Soft mean-IoU with `no_obj_weight` for absent classes |
+| `ce_iou` *(default)* | `0.5 × CE + 0.5 × soft-IoU` |
 
-**Foreground Attention Loss** (auxiliary, cooperative with diversity):
+**`no_obj_weight`** (default 0.01): weight applied to classes absent from a sample's GT mask. Without it, the model is strongly penalised for predicting any probability for a class that simply isn't in the image — distorting gradients. Setting it to 0 ignores absent classes entirely; 1.0 treats them the same as present classes.
+
+**Class frequency weights** (median-frequency balancing, computed from training masks):
+
 ```
-# Resize GT mask to attention resolution (H', W')
-masks_a = interpolate(GT_mask, size=(H', W'), mode='nearest')
-
-# Per-channel fraction of attention budget spent on foreground
-fg_ratio[b, c] = Σ(attn[b,c] × masks_a[b]) / Σ(attn[b,c])   # ∈ [0, 1]
-
-loss_attn = 1 - mean(fg_ratio)   # → 0 when every channel focuses on the person
-total_loss = main_loss + attn_guide_weight × loss_attn
+w_c = median_freq / freq_c,   clipped to [0.05, 20]
 ```
-This loss directly measures what fraction of each channel's focus budget falls on the foreground object. It **cooperates** with the diversity loss: diverse channels can cover different parts of the person simultaneously, each contributing to a high fg_ratio.
 
-**Attention Diversity Loss** (auxiliary, regulariser):
+Prevents dominant classes (background, person) from dominating the CE gradient.
+
+**Binary** (num_classes = 1): `iou`, `bce`, `bce_iou`, `combine`, `mse`.
+
+### Attention Diversity Loss
+
 ```
-A  = attn.view(B, C, L)                    # (B, C, L), L = H'×W'
-A  = normalize(A, dim=-1)                   # unit-norm per channel
-G  = A @ Aᵀ                                # (B, C, C) cosine-similarity Gram matrix
-loss_div = mean(off_diag(G)²) / C(C-1)
-
-total_loss = main_loss + diversity_weight × loss_div
+A = normalize(attn.view(B, C, L), dim=-1)    # unit-norm per channel
+G = A @ Aᵀ                                    # (B, C, C) cosine-similarity Gram matrix
+loss_div = mean(off_diag(G)²) / (C × (C-1))
 ```
-Penalises cosine similarity between every pair of channels, pushing them to specialise on different spatial regions.
 
-- **loss_div = 0** → all C channels are perfectly orthogonal (ideal)
-- **loss_div = 1** → all channels are identical (worst case)
-
-**Why the two auxiliary losses work together:**
-The foreground loss wants each channel to attend to the person. The diversity loss wants channels to attend to different regions. Combined: different channels cover different parts of the person — exactly what we want for rich multi-channel attention.
-
-`sf_seg.forward()` returns `(masks, attn_guide, attn)` — the raw `attn` tensor `(B, C, H', W')` is needed to compute both auxiliary losses.
+Pushes attention channels to cover different spatial regions. No foreground guidance loss — in multi-class segmentation the model learns spatial focus naturally from the CE signal.
 
 ---
 
-### 5. Training Pipeline
+## Training Pipeline
 
 | Component | Choice | Reason |
 |---|---|---|
-| Optimizer | Adam, lr=1e-4 | Adaptive LR, fast convergence |
-| LR schedule | CosineAnnealingLR (eta_min = lr × 0.01) | Avoids plateau; smooth decay to near-zero |
-| Augmentation | Random horizontal flip (p=0.5) | Doubles effective dataset, improves generalization |
-| Mixed precision | AMP (autocast + GradScaler) | 2× speed, ~half VRAM on CUDA |
-| DataLoader | pin_memory, non_blocking, prefetch_factor=2 | CPU→GPU transfer overlap |
-| Mask resize | NEAREST neighbor | Avoids interpolated non-binary values |
-| Image resize | BILINEAR | Better visual quality for RGB |
-| Gradient zero | set_to_none=True | Frees memory instead of zero-fill |
-| Validation metric | Pixel accuracy + loss | Simple, interpretable |
-| Checkpointing | best (val_loss) + last | Safe resume; preserves optimizer + scheduler state |
+| Optimizer | Adam | Adaptive LR, fast convergence |
+| LR schedule | CosineAnnealingLR (→ lr × 0.01) | Smooth decay, avoids plateau |
+| Augmentation | Flip, rotate ±15°, translate 10%, colour jitter | Regularisation |
+| Mixed precision | AMP (autocast + GradScaler) | ~2× speed, ~½ VRAM on CUDA |
+| DataLoader | pin_memory, non_blocking, prefetch=2 | CPU→GPU overlap |
+| Confusion matrix | GPU bincount per batch | Efficient mIoU, no CPU sync |
+| Checkpointing | best (val_loss) + last | Safe resume with optimizer + scheduler state |
 
 ---
 
 ## Model Size
 
-With current config (`num_channels=64`, `image_size=224`, `encoder_stride=2`, `focus_size=32`):
-- **Parameters:** ~113k
-- **Attention resolution:** 112×112 (half of input)
-- **Budget k:** 1024 pixels per channel (= 32²), covering ~8.2% of the attention map
+With `num_channels=64`, `focus_size=32`, `num_classes=81`:
+
+| Component | Params |
+|---|---|
+| 3 × attention head (enc1 + enc2 + channel_mix) | ~300 K |
+| Decoder (blend_up × 2, fuse × 2, pre_masks, masks) | ~180 K |
+| **Total** | **~480 K** |
+
+Adjust `num_channels` to trade capacity for speed: 32→~100 K, 48→~220 K, 64→~480 K, 96→~1.1 M.
 
 ---
 
@@ -154,15 +146,16 @@ With current config (`num_channels=64`, `image_size=224`, `encoder_stride=2`, `f
 
 ```bash
 pip install -r requirements.txt
+
+# Prepare COCO masks for all 80 classes (run once)
+python rebuild_masks.py
+
+# Train
+python train_sf_seg.py          # reads config.json
+./train.sh                      # same, convenience wrapper
 ```
 
-### COCO 2017 (full dataset)
-```bash
-python download.py --root data --prepare        # requires aria2c for speed
-./train.sh
-```
-
-### Resume training
+### Resume
 ```bash
 python train_sf_seg.py --resume last
 ```
@@ -173,58 +166,52 @@ python train_sf_seg.py --resume last
 
 | Argument | Default | Description |
 |---|---|---|
-| `--num-channels` | 64 | Feature channels C |
-| `--focus-size` | 32 | Budget k = focus_size² pixels / channel |
-| `--encoder-stride` | 2 | First conv stride (1 = full res, 2 = half res ~3× faster) |
-| `--loss-type` | combine | `iou` / `bce` / `mse` / `combine` / `bce_iou` |
-| `--attn-guide-weight` | 0.4 | Weight of foreground attention loss (0 = off) |
-| `--diversity-weight` | 0.1 | Weight of attention diversity / Gram penalty (0 = off) |
+| `--num-channels` | 64 | Feature channels C per attention head |
+| `--focus-size` | 32 | Budget k = focus_size² for the large head; scaled for smaller heads |
+| `--encoder-stride` | 2 | Stride inside each attention head (always 2 in multi-scale mode) |
+| `--num-classes` | 81 | Total classes including background (1 = binary) |
+| `--loss-type` | `ce_iou` | `ce` / `iou` / `ce_iou` (multi-class); `bce` / `iou` / `combine` (binary) |
+| `--no-obj-weight` | 0.01 | Soft-IoU weight for absent classes (0 = ignore, 1 = full penalty) |
+| `--diversity-weight` | 0.1 | Attention diversity / Gram penalty |
 | `--image-size` | 224 | Square input resolution |
 | `--lr` | 1e-4 | Adam learning rate (cosine decay to lr × 0.01) |
 | `--batch-size` | 32 | Batch size |
-| `--epochs` | 100 | Training epochs |
+| `--epochs` | 200 | Training epochs |
 
 All defaults can be set in `config.json`.
 
-The tqdm progress bar and log file show each loss component and current LR:
+---
+
+## Metrics & Logging
+
+Each epoch logs to console, `logs/train.log`, and `logs/train_log.csv`:
+
 ```
-lr | total | seg | attn | div | acc
+Epoch N | lr | train loss seg div acc mIoU | val loss seg acc mIoU
+         top10_cls_iou: person=0.72  car=0.61  bicycle=0.54 ...
 ```
+
+Validation sample images are saved to `outputs/` each epoch:
+- Left: RGB input
+- Center: GT mask (colour-coded by class)
+- Right: Predicted mask (same palette) with predicted class names in footer
 
 ---
 
-## Visualize Attention
+## Comparison: New vs Old Architecture
 
-```bash
-python visualize_attention.py \
-    --checkpoint checkpoints/sf_seg_best.pt \
-    --num-images 6 \
-    --show-channels 8 \
-    --min-range 0.05
-```
+| Property | Old (single-scale) | New (multi-scale) |
+|---|---|---|
+| Attention heads | 1 (at H/2) | 3 (H/32, H/8, H/2) |
+| Object size handling | Single scale only | Small + medium + large simultaneously |
+| Decoder | 1 conv → upsample → sigmoid | 4 blend layers + 2 fusion blocks |
+| Skip connections | Single (circular, enc→skip→dec) | Clean bottom-up with independent paths |
+| Attention guidance loss | ✓ (conflicting with multi-class) | ✗ removed |
+| Class imbalance | ✗ unweighted CE | ✓ median-frequency weighting |
+| Task | Binary (person only) | 80-class COCO semantic segmentation |
+| Params (~C=64) | ~340 K | ~350 K |
 
-Each output image shows 4 + N panels:
-```
-[Input RGB] [GT Mask] [Predicted Mask] [Attention Max] [Ch_i × N]
-```
-
-Channels are filtered by **min-max range** (`max − min` over spatial dims):
-- **Range low** → the pattern this channel learned does not appear in this image; attention spreads uniformly with no peak — skipped
-- **Range high** → the channel found its pattern in this image; clear bright spot present
-
-Channels passing the threshold are sorted by range descending (sharpest first). Each panel title shows `rng` and `max`.
-
-Adjust `--min-range` (default `0.05`): raise to `0.1–0.2` for only the sharpest channels, lower to `0.01` to see all.
-
----
-
-## Benchmark
-
-```bash
-python benchmark.py   # requires CUDA
-```
-
-Measures latency of each sub-operation in clamped softmax and the full forward/backward pass.
+The new architecture is strictly better for multi-class segmentation. At the same parameter count it handles multi-scale objects, has properly independent skip connections, and uses principled class weighting. For binary segmentation the old architecture was sufficient — the new one still works and is more principled.
 
 ---
 
@@ -232,12 +219,14 @@ Measures latency of each sub-operation in clamped softmax and the full forward/b
 
 ```
 sf_seg/
-├── sf_seg.py              # Model: AttentionBlock + clamped softmax
-├── train_sf_seg.py        # Training script with AMP, checkpointing, logging
-├── losses.py              # IoU / BCE / MSE / combined / diversity loss functions
+├── sf_seg.py              # Model: attention_head, sf_seg (multi-scale)
+├── train_sf_seg.py        # Training script: AMP, mIoU, class weights, logging
+├── losses.py              # CE+IoU, soft-IoU (no_obj_weight), diversity loss
+├── rebuild_masks.py       # Rebuild COCO multi-class masks from annotations
+├── download.py            # Download COCO 2017 + prepare masks
+├── prepare_data.py        # Resize / filter existing processed images
 ├── visualize_attention.py # Attention map visualization
 ├── benchmark.py           # Per-op latency benchmark
-├── download.py            # COCO 2017 download + mask preparation
 ├── config.json            # Default hyperparameters
 ├── requirements.txt       # Python dependencies
 └── train.sh               # Convenience wrapper: ./train.sh [extra args]

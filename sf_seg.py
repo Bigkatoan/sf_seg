@@ -2,111 +2,220 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class AttentionBlock(nn.Module):
-    def __init__(self, num_channels=32, focus_size=16, encoder_stride=1):
-        super(AttentionBlock, self).__init__()
-        self.focus_k = focus_size * focus_size
-        # encoder_stride=2: first conv halves H×W, subsequent convs work on smaller maps
-        # padding='same' không hỗ trợ stride>1 → dùng padding=1 tường minh (equiv cho 3×3, stride=1)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, num_channels, kernel_size=3, padding=1, stride=encoder_stride),
-            nn.ReLU(),
-            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(num_channels, num_channels * 2, kernel_size=3, padding=1),
+
+# ── Sparse attention (clamped softmax) ───────────────────────────────────────
+
+def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
+    """
+    Budget-constrained softmax: each value in [0,1], sum = k per channel.
+
+    Closed-form solution via Lagrangian duality.
+    Only topk(k) needed instead of full sort: O(k log k) vs O(L log L).
+    All CUDA ops, no Python loop.
+    """
+    L     = score.shape[-1]
+    int_k = int(k)
+    p     = F.softmax(score, dim=-1) * k
+
+    top_vals   = torch.topk(p, k=int_k, dim=-1).values
+    top_sorted = torch.sort(top_vals, dim=-1, descending=True).values
+    cumsum     = top_sorted.cumsum(dim=-1)
+
+    j     = torch.arange(1, int_k + 1, device=score.device, dtype=p.dtype)
+    lam_j = (j - cumsum) / (L - j).clamp(min=1e-9)
+
+    valid    = top_sorted - 1.0 >= lam_j
+    j_sat    = valid.long().sum(dim=-1, keepdim=True)
+    lam_star = torch.gather(lam_j, dim=-1, index=(j_sat - 1).clamp(min=0))
+    lam_star = lam_star * (j_sat > 0).to(p.dtype)
+
+    return (p - lam_star).clamp(0.0, 1.0)
+
+
+# ── Single-scale attention head ───────────────────────────────────────────────
+
+class attention_head(nn.Module):
+    """
+    One attention head operating at a fixed spatial scale.
+
+    Input  : x (B, 3, H, W) — already resized to target scale by sf_seg.
+    Encoder: Conv(3→C, stride=2) → Conv(C→2C) → split score | features.
+    Attention: clamped_softmax, budget k = min(focus_size², H'×W'-1).
+               k is clamped per-forward so the same focus_size is safe across
+               all three scales without overflow.
+    Blend  : 1×1 conv after attn×features — mixes channels that were
+             independently weighted by attention, enabling cross-channel
+             interaction before entering the decoder.
+    Output : attended (B, C, H/2, W/2),  attn (B, C, H/2, W/2).
+    """
+
+    def __init__(self, num_channels: int, focus_size: int):
+        super().__init__()
+        C = num_channels
+        self.focus_size = focus_size
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(3, C, 3, padding=1, stride=2),
+            nn.ReLU(inplace=True),
+        )
+        self.enc2        = nn.Conv2d(C, C * 2, 3, padding=1)
+        self.channel_mix = nn.Sequential(        # cross-channel blend after attention
+            nn.Conv2d(C, C, 1),
+            nn.ReLU(inplace=True),
         )
 
-    @staticmethod
-    def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
-        """
-        Closed-form: mỗi giá trị trong [0,1], tổng = k.
+    def forward(self, x: torch.Tensor):
+        enc2_out        = self.enc2(self.enc1(x))          # (B, 2C, H/2, W/2)
+        score, features = enc2_out.chunk(2, dim=1)
 
-        Proof: j* ≤ k (nếu j* > k thì sum ≥ j* > k, mâu thuẫn).
-        → Chỉ cần topk(k) thay vì sort(L): k log k << L log L.
-        Toàn bộ là CUDA ops đơn lẻ, không có Python for loop.
-        """
-        L = score.shape[-1]
-        int_k = int(k)
-        p = F.softmax(score, dim=-1) * k                          # (B, N, L), sum = k
+        B, C, Hh, Ww = score.shape
+        k    = min(self.focus_size * self.focus_size, Hh * Ww - 1)
+        attn = _clamped_softmax(score.view(B, C, Hh * Ww), float(k))
+        attn = attn.view(B, C, Hh, Ww)
 
-        top_vals = torch.topk(p, k=int_k, dim=-1).values          # (B, N, k)
-        top_sorted = torch.sort(top_vals, dim=-1, descending=True).values
-        cumsum = top_sorted.cumsum(dim=-1)                         # (B, N, k)
+        attended = self.channel_mix(attn * features)       # (B, C, H/2, W/2)
+        return attended, attn
 
-        j = torch.arange(1, int_k + 1, device=score.device, dtype=p.dtype)
-        lam_j = (j - cumsum) / (L - j).clamp(min=1e-9)
 
-        valid = top_sorted - 1.0 >= lam_j
-        j_sat = valid.long().sum(dim=-1, keepdim=True)            # (B, N, 1)
-
-        lam_star = torch.gather(lam_j, dim=-1, index=(j_sat - 1).clamp(min=0))
-        lam_star = lam_star * (j_sat > 0).to(p.dtype)
-
-        return (p - lam_star).clamp(0.0, 1.0)
-
-    def forward(self, x):
-        out = self.encoder(x)                                      # (B, 2N, H', W')
-        score, features = out.chunk(2, dim=1)
-        B, N, H, W = score.shape
-        attn = self._clamped_softmax(score.view(B, N, H * W), float(self.focus_k))
-        attn = attn.view(B, N, H, W)
-        return attn * features, attn
-
-    def get_num_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
+# ── Multi-scale model ─────────────────────────────────────────────────────────
 
 class sf_seg(nn.Module):
-    def __init__(self, num_channels=32, focus_size=16, encoder_stride=1):
-        """
-        encoder_stride=2: encoder works at H/2 × W/2, logits upsampled to input
-        resolution BEFORE sigmoid — gradient flows through unbounded logits, not
-        through the saturating sigmoid nonlinearity at low resolution.
+    """
+    Multi-scale Sparse-Focus Segmentation.
 
-        focus_size=16 recommended with encoder_stride=2:
-          k = 16² = 256 pixel coverage per channel (same as stride=1)
-          k/L = 256/4096 = 6.25%  (denser than stride=1, but absolute k preserved)
-        """
-        super(sf_seg, self).__init__()
-        self.encoder_stride = encoder_stride
-        self.attention_block = AttentionBlock(
-            num_channels=num_channels,
-            focus_size=focus_size,
-            encoder_stride=encoder_stride,
+    Three independent attention heads receive the image at three resolutions.
+    Outputs are fused bottom-up (coarse→fine) in a UNet-style decoder.
+    No shared weights between heads — each scale learns its own attention
+    pattern without interference.
+
+    Scales (default image_size=224, encoder_stride=2 inside each head):
+    ┌──────────────┬─────────────┬──────────────────┬──────────────┐
+    │ Head         │ Input       │ Attention space   │ Coverage k/L │
+    ├──────────────┼─────────────┼──────────────────┼──────────────┤
+    │ head_small   │ H/16 (14²)  │ H/32 × W/32 (7²) │ ~33%  global │
+    │ head_medium  │ H/4  (56²)  │ H/8  × W/8 (28²) │ ~33%  mid    │
+    │ head_large   │ H    (224²) │ H/2  × W/2 (112²)│  ~8%  local  │
+    └──────────────┴─────────────┴──────────────────┴──────────────┘
+
+    Decoder (bottom-up):
+      a_small  (C, 7,   7)
+        ↓ upsample ×4 → blend_up_sm (C→C, 3×3)          adapt to 28×28 space
+        cat[↑, a_medium] → fuse_sm_med (2×conv)  →  d_med (C, 28,  28)
+        ↓ upsample ×4 → blend_up_med (C→C, 3×3)          adapt to 112×112 space
+        cat[↑, a_large]  → fuse_med_lg (2×conv)  →  d_lg  (C//2, 112, 112)
+        ↓ upsample ×2 → pre_masks (C//2→C//2, 3×3)       final blend
+        → masks (1×1)  →  logits (num_classes, H, W)
+
+    blend_up_sm / blend_up_med: learned projections applied after bilinear
+    upsample — they adapt stretched features to the target resolution space
+    before concatenation (same principle as FPN lateral connections).
+    """
+
+    def __init__(self, num_channels: int = 32, focus_size: int = 32,
+                 encoder_stride: int = 2, num_classes: int = 1):
+        super().__init__()
+        self.num_classes    = num_classes
+        self.encoder_stride = encoder_stride   # kept for API compat
+        C = num_channels
+
+        # ── Three independent attention heads ─────────────────────────────────
+        # focus_size scales with the attention space area to keep ~8–33% coverage:
+        #   small  7×7  = 49:    fs//8 → k ≈ 33%  (dense global context)
+        #   medium 28×28= 784:   fs//2 → k ≈ 33%  (mid-range context)
+        #   large  112×112=12544: fs   → k ≈  8%  (fine local selection)
+        self.head_small  = attention_head(C, focus_size=max(2, focus_size // 8))
+        self.head_medium = attention_head(C, focus_size=max(4, focus_size // 2))
+        self.head_large  = attention_head(C, focus_size=focus_size)
+
+        # ── Decoder ──────────────────────────────────────────────────────────
+        # Post-upsample blending: adapt stretched features before concat
+        self.blend_up_sm  = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
         )
-        self.masks = nn.Conv2d(in_channels=num_channels, out_channels=1, kernel_size=3, padding=1)
+        self.blend_up_med = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
+        )
+
+        # Fusion: concat(upsampled, skip) → refined features
+        self.fuse_sm_med = nn.Sequential(          # symmetric with fuse_med_lg
+            nn.Conv2d(C + C, C, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(C, C, 3, padding=1),     nn.ReLU(inplace=True),
+        )
+        self.fuse_med_lg = nn.Sequential(
+            nn.Conv2d(C + C, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+        )
+
+        # Final blend before 1×1 prediction
+        self.pre_masks = nn.Sequential(
+            nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+        )
+        out_ch     = num_classes if num_classes > 1 else 1
+        self.masks = nn.Conv2d(C // 2, out_ch, kernel_size=1)
+
+    # ── Forward ──────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor):
         H, W = x.shape[2], x.shape[3]
-        attended_features, attn = self.attention_block(x)   # (B, N, H', W')
 
-        logits = self.masks(attended_features)               # (B, 1, H', W') — raw, unbounded
+        # Resize to three scales
+        x_small  = F.interpolate(x, size=(max(H // 16, 2), max(W // 16, 2)),
+                                  mode='bilinear', align_corners=False)
+        x_medium = F.interpolate(x, size=(H // 4, W // 4),
+                                  mode='bilinear', align_corners=False)
 
-        # Upsample logits trước sigmoid: gradient qua logit (unbounded) mượt hơn
-        # qua sigmoid value (bounded [0,1]) đã bị squash ở resolution thấp
-        if self.encoder_stride > 1:
-            logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+        # Attention at each scale (independent)
+        a_small,  _      = self.head_small(x_small)           # (B, C, H/32, W/32)
+        a_medium, _      = self.head_medium(x_medium)         # (B, C, H/8,  W/8)
+        a_large,  attn_l = self.head_large(x)                 # (B, C, H/2,  W/2)
 
-        masks = torch.sigmoid(logits)                        # sigmoid ở full resolution
+        # Decoder: bottom-up
+        a_s_up = self.blend_up_sm(
+            F.interpolate(a_small, size=a_medium.shape[2:],
+                          mode='bilinear', align_corners=False))
+        d_med  = self.fuse_sm_med(torch.cat([a_s_up, a_medium], dim=1))
 
-        attn_guide = attn.amax(dim=1, keepdim=True)
-        if self.encoder_stride > 1:
-            attn_guide = F.interpolate(attn_guide, size=(H, W), mode='bilinear', align_corners=False)
+        d_m_up = self.blend_up_med(
+            F.interpolate(d_med, size=a_large.shape[2:],
+                          mode='bilinear', align_corners=False))
+        d_lg   = self.fuse_med_lg(torch.cat([d_m_up, a_large], dim=1))
 
-        return masks, attn_guide, attn
+        d_up   = self.pre_masks(
+            F.interpolate(d_lg, size=(H, W), mode='bilinear', align_corners=False))
+        logits = self.masks(d_up)
+
+        attn_guide = attn_l.amax(dim=1, keepdim=True)
+        attn_guide = F.interpolate(attn_guide, size=(H, W),
+                                   mode='bilinear', align_corners=False)
+        return logits, attn_guide, attn_l
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+
 def main():
-    for stride, fs in [(1, 16), (2, 16)]:
-        model = sf_seg(num_channels=64, focus_size=fs, encoder_stride=stride)
-        x = torch.randn(2, 3, 128, 128)
-        masks, attn_guide, attn = model(x)
-        L = attn.shape[2] * attn.shape[3]
-        k = fs * fs
-        print(f"stride={stride} focus_size={fs}: params={model.get_num_parameters():,} "
-              f"attn={attn.shape} masks={masks.shape} k={k} k/L={k/L:.2%}")
+    print("sf_seg — Multi-scale Sparse-Focus Segmentation\n")
+    model = sf_seg(num_channels=64, focus_size=32, encoder_stride=2, num_classes=81)
+    x     = torch.randn(2, 3, 224, 224)
+    logits, attn_guide, attn = model(x)
+
+    print(f"Parameters  : {model.get_num_parameters():,}")
+    print(f"Output      : logits {tuple(logits.shape)}")
+    print(f"Attn guide  : {tuple(attn_guide.shape)}")
+    print()
+
+    rows = [
+        ("head_small",  max(224//16,2), max(224//16,2)//2, model.head_small.focus_size),
+        ("head_medium", 224//4,         224//8,             model.head_medium.focus_size),
+        ("head_large",  224,            224//2,             model.head_large.focus_size),
+    ]
+    print(f"{'Head':<14} {'Input':>9} {'Attn space':>12} {'k':>6} {'L':>8} {'k/L':>7}")
+    print("-" * 58)
+    for name, inp, attn_size, fs in rows:
+        L = attn_size * attn_size
+        k = min(fs * fs, L - 1)
+        print(f"{name:<14} {inp:>4}×{inp:<4} {attn_size:>4}×{attn_size:<4}  "
+              f"{k:>6} {L:>8} {100*k/L:>6.1f}%")
+
 
 if __name__ == "__main__":
     main()

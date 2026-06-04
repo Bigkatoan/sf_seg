@@ -6,37 +6,31 @@ import torch
 import torch.nn.functional as F
 
 
+# ── Binary losses (num_classes == 1) ──────────────────────────────────────────
+
 def iou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3, reduction: str = "mean") -> torch.Tensor:
-    """IoU loss (1 - IoU).
+    """Soft IoU loss (1 - IoU) for binary segmentation.
 
-    Formula (per-sample):
-        inter = gt * pred
-        union = (gt + pred) - inter
-        iou = (inter.sum + eps) / (union.sum + eps)
-        loss = 1 - iou
-
-    pred is expected to be probabilities in [0,1] (i.e., model with final sigmoid).
-    target should be binary (0/1) of same shape as pred.
-    Returns: scalar loss (averaged over batch when reduction='mean').
+    pred   : (B, 1, H, W) probabilities in [0, 1] — apply sigmoid before calling.
+    target : (B, 1, H, W) or (B, H, W) binary float.
     """
     pred = pred.float()
     target = target.float()
 
     if pred.shape != target.shape:
-        # allow target to be (B,H,W) when pred is (B,1,H,W)
         if pred.dim() == 4 and target.dim() == 3 and pred.size(0) == target.size(0):
             target = target.unsqueeze(1)
         else:
             raise ValueError(f"pred and target must have same shape, got {pred.shape} vs {target.shape}")
 
     b = pred.shape[0]
-    pred_flat = pred.view(b, -1)
+    pred_flat   = pred.view(b, -1)
     target_flat = target.view(b, -1)
 
     inter = (pred_flat * target_flat).sum(dim=1)
     union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - inter
-    iou = (inter + eps) / (union + eps)
-    loss = 1.0 - iou
+    iou   = (inter + eps) / (union + eps)
+    loss  = 1.0 - iou
 
     if reduction == "mean":
         return loss.mean()
@@ -44,13 +38,17 @@ def iou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3, reduct
         return loss.sum()
     return loss
 
+
 def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-    """Mean Squared Error loss."""
+    """MSE loss for binary segmentation.
+
+    pred   : (B, 1, H, W) probabilities in [0, 1].
+    target : (B, 1, H, W) or (B, H, W) binary float.
+    """
     pred = pred.float()
     target = target.float()
 
     if pred.shape != target.shape:
-        # allow target to be (B,H,W) when pred is (B,1,H,W)
         if pred.dim() == 4 and target.dim() == 3 and pred.size(0) == target.size(0):
             target = target.unsqueeze(1)
         else:
@@ -64,48 +62,105 @@ def mse_loss(pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") 
         return loss.sum()
     return loss
 
-def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.1, reduction: str = "mean") -> torch.Tensor:
-    """Combined loss: alpha * IoU + (1-alpha) * MSE."""
-    iou = iou_loss(pred, target, reduction=reduction)
-    mse = mse_loss(pred, target, reduction=reduction)
-    return alpha * iou + (1 - alpha) * mse
 
+def combine_losses(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.1, reduction: str = "mean") -> torch.Tensor:
+    """Combined binary loss: alpha * IoU + (1-alpha) * MSE.
+
+    pred   : (B, 1, H, W) probabilities in [0, 1].
+    target : (B, 1, H, W) or (B, H, W) binary float.
+    """
+    return alpha * iou_loss(pred, target, reduction=reduction) + (1 - alpha) * mse_loss(pred, target, reduction=reduction)
+
+
+# ── Multi-class losses (num_classes > 1) ──────────────────────────────────────
+
+def multiclass_iou_loss(logits: torch.Tensor, target: torch.Tensor,
+                        eps: float = 1e-3, no_obj_weight: float = 0.1) -> torch.Tensor:
+    """Soft mean-IoU loss for multi-class segmentation with no-object weighting.
+
+    logits        : (B, C, H, W) raw logits — softmax applied internally.
+    target        : (B, H, W) long tensor with class indices in [0, C-1].
+    no_obj_weight : weight applied to classes absent from a sample's target
+                    (0 = ignore absent classes, 1 = treat same as present).
+                    Prevents absent classes from producing a spuriously large
+                    loss (IoU≈0 even though the class simply isn't in the image).
+    """
+    B, C, H, W = logits.shape
+    probs = F.softmax(logits, dim=1)                                # (B, C, H, W)
+
+    target_onehot = F.one_hot(target, num_classes=C)                # (B, H, W, C)
+    target_onehot = target_onehot.permute(0, 3, 1, 2).float()      # (B, C, H, W)
+
+    pred_flat   = probs.view(B, C, -1)           # (B, C, H*W)
+    target_flat = target_onehot.view(B, C, -1)   # (B, C, H*W)
+
+    inter = (pred_flat * target_flat).sum(dim=-1)                   # (B, C)
+    union = pred_flat.sum(dim=-1) + target_flat.sum(dim=-1) - inter
+    iou   = (inter + eps) / (union + eps)                           # (B, C)
+
+    # Per-sample, per-class presence flag: 1 if class appears, 0 if absent
+    present = (target_flat.sum(dim=-1) > 0).float()                 # (B, C)
+    # Weight: present classes → 1.0,  absent classes → no_obj_weight
+    weight = present + no_obj_weight * (1.0 - present)              # (B, C)
+
+    weighted_loss = (1.0 - iou) * weight                            # (B, C)
+    # Normalise by total weight so the scale stays ~1 regardless of class balance
+    return weighted_loss.sum() / weight.sum().clamp(min=1.0)
+
+
+def ce_iou_loss(logits: torch.Tensor, target: torch.Tensor,
+                class_weights: torch.Tensor | None = None,
+                ce_weight: float = 0.5, iou_weight: float = 0.5,
+                no_obj_weight: float = 0.1) -> torch.Tensor:
+    """Combined CrossEntropy + soft-IoU loss for multi-class segmentation.
+
+    logits        : (B, C, H, W) raw logits.
+    target        : (B, H, W) long tensor with class indices in [0, C-1].
+    class_weights : optional (C,) float tensor for inverse-frequency weighting in CE.
+    no_obj_weight : passed to multiclass_iou_loss (see docstring there).
+    """
+    ce  = F.cross_entropy(logits, target, weight=class_weights)
+    iou = multiclass_iou_loss(logits, target, no_obj_weight=no_obj_weight)
+    return ce_weight * ce + iou_weight * iou
+
+
+# ── Attention regulariser (class-agnostic) ────────────────────────────────────
 
 def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Penalize cosine similarity between attention channels (Gram matrix off-diagonal).
 
     attn: (B, C, H, W) raw attention maps from clamped softmax.
-
-    For each sample, compute the C×C Gram matrix of L2-normalised channel vectors.
-    Off-diagonal entries are cosine similarities in [-1, 1]; we minimise their
-    squared values so every pair of channels attends to different regions.
-
-    Loss = 0  when all channels are perfectly orthogonal.
-    Loss = 1  when all channels are identical.
     """
     B, C, H, W = attn.shape
     a = attn.view(B, C, H * W)
 
-    # Subsample spatial locations: Gram matrix gradient signal không đổi
-    # khi dùng random subset — tiết kiệm O(L) → O(max_pixels) cho bmm
+    # Subsample spatial locations to save memory
     L = a.shape[-1]
     if L > 2048:
         idx = torch.randperm(L, device=a.device)[:2048]
         a = a[:, :, idx]
 
-    a = F.normalize(a.float(), dim=-1, eps=eps)                # unit norm per channel
-    gram = torch.bmm(a, a.transpose(1, 2))                     # (B, C, C) cosine sims
-    eye = torch.eye(C, device=attn.device, dtype=gram.dtype)
+    a    = F.normalize(a.float(), dim=-1, eps=eps)                 # unit norm per channel
+    gram = torch.bmm(a, a.transpose(1, 2))                         # (B, C, C)
+    eye  = torch.eye(C, device=attn.device, dtype=gram.dtype)
     off_diag = gram * (1.0 - eye)
     return (off_diag ** 2).sum(dim=[1, 2]).mean() / (C * (C - 1))
 
 
 if __name__ == "__main__":
-    # quick smoke test
-    x = torch.randn(2, 3, 128, 128)
-    y = (torch.rand(2, 1, 128, 128) > 0.5).float()
-    p = torch.sigmoid(torch.randn(2, 1, 128, 128))
-    print("iou_loss:     ", iou_loss(p, y).item())
+    # smoke tests
+    # binary
+    p  = torch.sigmoid(torch.randn(2, 1, 128, 128))
+    y  = (torch.rand(2, 1, 128, 128) > 0.5).float()
+    print("iou_loss:      ", iou_loss(p, y).item())
     print("combine_losses:", combine_losses(p, y).item())
-    attn = torch.rand(2, 64, 128, 128)
+
+    # multi-class
+    logits = torch.randn(2, 81, 128, 128)
+    target = torch.randint(0, 81, (2, 128, 128))
+    print("multiclass_iou_loss:", multiclass_iou_loss(logits, target).item())
+    print("ce_iou_loss:        ", ce_iou_loss(logits, target).item())
+
+    # attention diversity
+    attn = torch.rand(2, 64, 32, 32)
     print("diversity_loss:", diversity_loss(attn).item())

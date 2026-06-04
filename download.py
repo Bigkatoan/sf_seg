@@ -108,29 +108,26 @@ def download_annotations(root: Path) -> Path:
     return inst
 
 
-def get_person_image_infos(inst_json_path: Path) -> dict:
-    """Return dict image_id -> image_info for images that contain person annotations."""
+def get_all_image_infos(inst_json_path: Path) -> dict:
+    """Return dict image_id -> image_info for all annotated images, plus category mapping."""
     print("Loading annotation JSON (may be large)...")
     with open(inst_json_path, "r") as f:
         ann = json.load(f)
 
-    # find person category id (should be 1 but be robust)
-    person_id = None
+    # Build category ID -> sequential class index (1-based, 0=background)
+    cat_ids = sorted(c["id"] for c in ann.get("categories", []))
+    cat_id_to_idx = {cid: i + 1 for i, cid in enumerate(cat_ids)}
+    idx_to_name = {0: "background"}
     for c in ann.get("categories", []):
-        if c.get("name", "").lower() == "person":
-            person_id = c["id"]
-            break
-    if person_id is None:
-        raise RuntimeError("Person category not found in annotations")
+        idx_to_name[cat_id_to_idx[c["id"]]] = c["name"]
 
     img_map = {img["id"]: img for img in ann.get("images", [])}
     image_ids = set()
     for a in ann.get("annotations", []):
-        if a.get("category_id") == person_id:
-            image_ids.add(a.get("image_id"))
+        image_ids.add(a.get("image_id"))
 
     info = {iid: img_map[iid] for iid in image_ids if iid in img_map}
-    return {"person_id": person_id, "images": info}
+    return {"cat_id_to_idx": cat_id_to_idx, "idx_to_name": idx_to_name, "images": info}
 
 
 def download_image_file(file_name: str, split: str, out_dir: Path) -> Path:
@@ -141,7 +138,9 @@ def download_image_file(file_name: str, split: str, out_dir: Path) -> Path:
     return dest
 
 
-def build_person_masks(inst_json_path: Path, selected_images: dict, out_mask_dir: Path) -> None:
+def build_all_class_masks(inst_json_path: Path, selected_images: dict,
+                          cat_id_to_idx: dict, out_mask_dir: Path) -> None:
+    """Build multi-class masks where each pixel = class index (0=background, 1-80=COCO class)."""
     try:
         from pycocotools.coco import COCO
     except Exception as e:
@@ -150,25 +149,21 @@ def build_person_masks(inst_json_path: Path, selected_images: dict, out_mask_dir
 
     coco = COCO(str(inst_json_path))
     out_mask_dir.mkdir(parents=True, exist_ok=True)
-    person_id = None
-    for c in coco.loadCats(coco.getCatIds()):
-        if c.get("name", "").lower() == "person":
-            person_id = c["id"]
-            break
-    if person_id is None:
-        print("Person category id not found in COCO annotations")
-        return
 
     for img_id, info in tqdm(selected_images.items(), desc="Building masks"):
-        anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id], catIds=[person_id]))
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id]))
         if not anns:
             continue
         h, w = info["height"], info["width"]
-        mask = np.zeros((h, w), dtype=bool)
-        for ann in anns:
+        mask = np.zeros((h, w), dtype=np.uint8)  # 0 = background
+        # Sort by area descending so smaller objects paint on top
+        for ann in sorted(anns, key=lambda a: a.get("area", 0), reverse=True):
+            class_idx = cat_id_to_idx.get(ann.get("category_id"), 0)
+            if class_idx == 0:
+                continue
             m = coco.annToMask(ann).astype(bool)
-            mask = mask | m
-        mask_img = Image.fromarray((mask.astype("uint8") * 255))
+            mask[m] = class_idx
+        mask_img = Image.fromarray(mask)  # uint8 grayscale, values 0..num_classes-1
         name = info["file_name"].rsplit('.', 1)[0] + ".png"
         mask_img.save(out_mask_dir / name)
 
@@ -214,25 +209,33 @@ def main():
     if not inst.exists():
         raise FileNotFoundError("instances_train2017.json not found after extracting annotations")
 
-    # read annotations and collect images with person
-    print("Parsing annotations for person category...")
+    # read annotations and collect all annotated images
+    print("Parsing annotations for all categories...")
     with open(inst, "r") as f:
         ann = json.load(f)
-    person_id = None
+
+    cat_ids = sorted(c["id"] for c in ann.get("categories", []))
+    cat_id_to_idx = {cid: i + 1 for i, cid in enumerate(cat_ids)}
+    idx_to_name = {0: "background"}
     for c in ann.get("categories", []):
-        if c.get("name", "").lower() == "person":
-            person_id = c["id"]
-            break
-    if person_id is None:
-        raise RuntimeError("Person category id not found in annotations")
+        idx_to_name[cat_id_to_idx[c["id"]]] = c["name"]
 
     img_map = {img["id"]: img for img in ann.get("images", [])}
     image_ids = set()
     for a in ann.get("annotations", []):
-        if a.get("category_id") == person_id:
-            image_ids.add(a.get("image_id"))
+        image_ids.add(a.get("image_id"))
     images_info = {iid: img_map[iid] for iid in image_ids if iid in img_map}
-    print(f"Found {len(images_info)} images containing person annotations")
+    print(f"Found {len(images_info)} annotated images across {len(cat_ids)} categories")
+
+    # Save category mapping
+    mapping_path = root / "cat_to_idx.json"
+    with open(mapping_path, "w") as f:
+        json.dump({
+            "cat_id_to_idx": {str(k): v for k, v in cat_id_to_idx.items()},
+            "idx_to_name":   {str(k): v for k, v in idx_to_name.items()},
+            "num_classes":   len(cat_ids) + 1,
+        }, f, indent=2)
+    print(f"Saved category mapping → {mapping_path}")
 
     # limit if requested
     img_items = list(images_info.items())
@@ -273,30 +276,28 @@ def main():
             src = images_src_dir / fname
             if not src.exists():
                 return (fname, "missing", None)
-            # build mask
             try:
-                anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id], catIds=[person_id]))
+                anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id]))
                 if not anns:
                     return (fname, "no_anns", None)
                 h, w = info["height"], info["width"]
-                mask = np.zeros((h, w), dtype=bool)
-                for ann in anns:
-                    m = coco.annToMask(ann).astype(bool)
-                    mask = mask | m
+                mask = np.zeros((h, w), dtype=np.uint8)  # 0 = background
+                # Sort by area desc so smaller objects paint over larger ones
+                for ann_item in sorted(anns, key=lambda a: a.get("area", 0), reverse=True):
+                    class_idx = cat_id_to_idx.get(ann_item.get("category_id"), 0)
+                    if class_idx == 0:
+                        continue
+                    m = coco.annToMask(ann_item).astype(bool)
+                    mask[m] = class_idx
 
                 img = Image.open(src).convert("RGB")
-                img_resized = img.resize((image_size, image_size), Image.BILINEAR)
-                mask_img = Image.fromarray((mask.astype("uint8") * 255))
-                mask_resized = mask_img.resize((image_size, image_size), Image.NEAREST)
+                img_resized  = img.resize((image_size, image_size), Image.BILINEAR)
+                mask_resized = Image.fromarray(mask).resize((image_size, image_size), Image.NEAREST)
 
-                out_img_dir = out_images_train if split == "train" else out_images_val
-                out_mask_dir = out_masks_train if split == "train" else out_masks_val
-                out_img_path = out_img_dir / fname
-                out_mask_name = fname.rsplit(".", 1)[0] + ".png"
-                out_mask_path = out_mask_dir / out_mask_name
-
-                img_resized.save(out_img_path)
-                mask_resized.save(out_mask_path)
+                out_img_dir  = out_images_train if split == "train" else out_images_val
+                out_mask_dir = out_masks_train  if split == "train" else out_masks_val
+                img_resized.save(out_img_dir / fname)
+                mask_resized.save(out_mask_dir / (fname.rsplit(".", 1)[0] + ".png"))
                 return (fname, "ok", None)
             except Exception as e:
                 return (fname, "err", str(e))
