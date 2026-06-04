@@ -191,10 +191,17 @@ def save_val_sample(model, dataset, device, out_dir, epoch, cat_names=None):
     w, h    = img_pil.size
 
     if model.num_classes > 1:
+        # Smooth logits spatially before argmax to reduce isolated pixel noise,
+        # then mask out low-confidence pixels as background.
+        smooth  = F.avg_pool2d(logits, kernel_size=5, stride=1, padding=2)
+        probs   = torch.softmax(smooth[0], dim=0)       # (C, H, W)
+        conf, pred_idx = probs.max(dim=0)               # (H, W)
+        pred_idx[conf < 0.4] = 0                        # uncertain → background
+
         pal        = _make_palette(model.num_classes)
         gt_pil     = Image.fromarray(pal[mask_t.numpy().astype(np.int32)])
-        pred_pil   = Image.fromarray(pal[logits[0].argmax(0).numpy().astype(np.int32)])
-        pred_ids   = sorted(set(logits[0].argmax(0).numpy().flat) - {0})[:8]
+        pred_pil   = Image.fromarray(pal[pred_idx.numpy().astype(np.int32)])
+        pred_ids   = sorted(set(pred_idx.numpy().flat) - {0})[:8]
         footer     = " ".join(
             cat_names.get(str(c), str(c)) if cat_names else str(c) for c in pred_ids)
     else:
