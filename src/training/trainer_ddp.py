@@ -36,7 +36,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw, ImageFont
 
 from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
-                         multiclass_iou_loss, ce_iou_loss)
+                         multiclass_iou_loss, ce_iou_loss, focal_loss, focal_iou_loss)
 from src.models import sf_seg
 
 
@@ -173,6 +173,12 @@ def compute_class_weights(masks_dir: Path, num_classes: int,
 def seg_loss(logits, masks, loss_type, criterion, num_classes,
              no_obj_weight=0.1, class_weights=None):
     if num_classes > 1:
+        if loss_type == "focal_iou":
+            return focal_iou_loss(logits, masks,
+                                  class_weights=class_weights,
+                                  no_obj_weight=no_obj_weight)
+        if loss_type == "focal":
+            return focal_loss(logits, masks, weight=class_weights)
         if loss_type == "ce_iou":
             return ce_iou_loss(logits, masks,
                                class_weights=class_weights,
