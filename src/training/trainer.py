@@ -259,8 +259,19 @@ def train(args):
     kw = dict(num_workers=args.num_workers, pin_memory=device.type == 'cuda',
               prefetch_factor=2 if args.num_workers > 0 else None,
               persistent_workers=args.num_workers > 0)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  **kw)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, **kw)
+
+    if args.class_diverse and num_classes > 1:
+        from src.dataloaders.sampler import build_class_index, ClassDiverseBatchSampler
+        class_idx = build_class_index(
+            data_root / 'masks' / 'train', num_classes,
+            cache_path=data_root / 'class_index.json')
+        batch_sampler = ClassDiverseBatchSampler(
+            class_idx, len(train_ds), args.batch_size, drop_last=True)
+        train_loader = DataLoader(train_ds, batch_sampler=batch_sampler, **kw)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **kw)
+
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **kw)
 
     model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
                    encoder_stride=args.encoder_stride, num_classes=num_classes,
@@ -503,8 +514,9 @@ def parse_args():
     p.add_argument("--absent-weight",    type=float, default=None)
     p.add_argument("--attn-guide-weight",     type=float, default=None)
     p.add_argument("--attn-exclusive-weight", type=float, default=None)
-    p.add_argument("--decoder-type",  default=None, choices=["dense", "sparse"])
-    p.add_argument("--sparse-weight", type=float, default=None)
+    p.add_argument("--decoder-type",   default=None, choices=["dense", "sparse"])
+    p.add_argument("--sparse-weight",  type=float, default=None)
+    p.add_argument("--class-diverse",  action="store_true", default=None)
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
@@ -529,7 +541,7 @@ def merge_config(args):
         num_channels=64, focus_size=32, encoder_stride=2,
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
         absent_weight=0.2, attn_guide_weight=0.0, attn_exclusive_weight=0.0,
-        decoder_type="dense", sparse_weight=0.0,
+        decoder_type="dense", sparse_weight=0.0, class_diverse=True,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224,
     )
