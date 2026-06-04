@@ -186,7 +186,8 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     γ=2 → cubic focal-IoU + mass penalty  [default]
     """
     B, C, H, W = logits.shape
-    probs = F.softmax(logits, dim=1)                                  # (B, C, H, W)
+    # float32 — softmax in float16 overflows when logits have large range (AMP)
+    probs = F.softmax(logits.float(), dim=1)                          # (B, C, H, W)
 
     tgt_oh    = F.one_hot(target, num_classes=C).permute(0, 3, 1, 2).float()
     pred_flat = probs.view(B, C, -1)                                  # (B, C, H*W)
@@ -194,7 +195,7 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
 
     inter = (pred_flat * tgt_flat).sum(-1)                            # (B, C)
     union = pred_flat.sum(-1) + tgt_flat.sum(-1) - inter
-    iou   = (inter + eps) / (union + eps)                             # (B, C) ∈ [0,1]
+    iou   = ((inter + eps) / (union + eps)).clamp(0.0, 1.0)          # (B, C) ∈ [0,1]
 
     present = (tgt_flat.sum(-1) > 0).float()                         # (B, C)
     absent  = 1.0 - present                                           # (B, C)
@@ -239,8 +240,8 @@ def attention_guide_loss(attn: torch.Tensor, target: torch.Tensor,
     """
     B, C_attn, _, _ = attn.shape
 
-    # Downsample both to guide_size for efficiency
-    attn_s = F.adaptive_avg_pool2d(attn, (guide_size, guide_size))   # (B, K, g, g)
+    # float32 — attention maps may be float16 under AMP; bmm accumulation needs precision
+    attn_s = F.adaptive_avg_pool2d(attn.float(), (guide_size, guide_size))  # (B,K,g,g)
     tgt_s  = F.interpolate(
         target.float().unsqueeze(1), (guide_size, guide_size), mode='nearest'
     ).squeeze(1).long()                                               # (B, g, g)
@@ -304,7 +305,8 @@ def attention_exclusivity_loss(attn: torch.Tensor, target: torch.Tensor,
     """
     B, K, _, _ = attn.shape
 
-    attn_s = F.adaptive_avg_pool2d(attn, (guide_size, guide_size))   # (B, K, g, g)
+    # float32 — attn may be float16 under AMP
+    attn_s = F.adaptive_avg_pool2d(attn.float(), (guide_size, guide_size))  # (B,K,g,g)
     tgt_s  = F.interpolate(
         target.float().unsqueeze(1), (guide_size, guide_size), mode='nearest'
     ).squeeze(1).long()                                               # (B, g, g)
@@ -321,7 +323,7 @@ def attention_exclusivity_loss(attn: torch.Tensor, target: torch.Tensor,
     # IoU(channel k, class c) — full gradient for the loss term
     inter      = torch.bmm(gt_f, atn_f.transpose(1, 2))              # (B, C, K)
     union      = gt_f.sum(-1, keepdim=True) + atn_f.sum(-1).unsqueeze(1) - inter
-    iou_m      = (inter + eps) / (union + eps)                        # (B, C, K)
+    iou_m      = ((inter + eps) / (union + eps)).clamp(0.0, 1.0)     # (B, C, K)
     iou_m      = iou_m * present.float().unsqueeze(-1)               # mask absent
     iou_per_ch = iou_m.permute(0, 2, 1)                              # (B, K, C)
 

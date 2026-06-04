@@ -374,6 +374,15 @@ def train(args):
                      if args.sparse_weight > 0 and sp_raw is not None \
                      else torch.tensor(0., device=device)
                 loss = s + d + g + e + sp
+
+            if not torch.isfinite(loss):
+                logging.warning(
+                    f"Non-finite loss ({loss.item():.4f}) at epoch {epoch} "
+                    f"seg={s.item():.4f} div={d.item():.4f} "
+                    f"guide={g.item():.4f} excl={e.item():.4f} — skipping batch")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
