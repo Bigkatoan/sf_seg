@@ -1,6 +1,8 @@
 # sf_seg — Multi-scale Sparse-Focus Segmentation
 
-Lightweight semantic segmentation for COCO 80 classes, built around one core idea: **budget-constrained spatial attention via clamped softmax**. Three independent attention heads operate at different image scales; their outputs are fused bottom-up in a UNet-style decoder with learned blending at every transition.
+Lightweight semantic segmentation built around **budget-constrained spatial attention via clamped softmax**. Three independent attention heads operate at different image scales; outputs are fused bottom-up in a UNet-style decoder with learned blending at every transition.
+
+Supports any semantic segmentation dataset — ships pre-configured for **ADE20K-150** (recommended) and **COCO-80**.
 
 ---
 
@@ -43,8 +45,6 @@ x_scale  (B, 3, H_s, W_s)
   channel_mix: Conv(C→C, 1×1) + ReLU       → cross-channel blend
 ```
 
-`channel_mix` is a 1×1 conv applied after the element-wise attention weighting. Because `attn × features` weights each channel independently, it never mixes information across channels — `channel_mix` closes that gap before features enter the decoder.
-
 ### Clamped Softmax (Budget Attention)
 
 The core constraint: each channel attends to **exactly k pixels**, with each weight in **[0, 1]**.
@@ -58,8 +58,6 @@ p = softmax(score) × k              # sum = k, but values may exceed 1
 attn = clamp(p − λ*, 0, 1)          # exactly k total weight, each ≤ 1
 ```
 
-Proof that the solution is valid: any j\* saturating pixels must satisfy j\* ≤ k (otherwise sum ≥ j\* > k, contradiction). So only topk(k) candidates can saturate — the full sort over L pixels is unnecessary.
-
 ### Scale / Coverage Table (default: image_size=224, focus_size=32)
 
 | Head         | Input     | Attn space  |   k  |    L  | Coverage |
@@ -71,8 +69,6 @@ Proof that the solution is valid: any j\* saturating pixels must satisfy j\* ≤
 Dense coverage at small scales (global context) + sparse at large scale (local selection).
 
 ### Blending Strategy
-
-Three explicit blending points prevent information from passing through the decoder in a raw, unprocessed state:
 
 | Location | Layer | Purpose |
 |---|---|---|
@@ -94,15 +90,13 @@ Three explicit blending points prevent information from passing through the deco
 | `iou` | Soft mean-IoU with `no_obj_weight` for absent classes |
 | `ce_iou` *(default)* | `0.5 × CE + 0.5 × soft-IoU` |
 
-**`no_obj_weight`** (default 0.01): weight applied to classes absent from a sample's GT mask. Without it, the model is strongly penalised for predicting any probability for a class that simply isn't in the image — distorting gradients. Setting it to 0 ignores absent classes entirely; 1.0 treats them the same as present classes.
+**`no_obj_weight`** (default 0.01): weight applied to classes absent from a sample's GT mask. Without it, the model is strongly penalised for predicting any probability for a class that simply isn't in the image — distorting gradients.
 
-**Class frequency weights** (median-frequency balancing, computed from training masks):
+**Class frequency weights** (median-frequency balancing, computed from training masks on first run, cached to `data/class_freq.json`):
 
 ```
 w_c = median_freq / freq_c,   clipped to [0.05, 20]
 ```
-
-Prevents dominant classes (background, person) from dominating the CE gradient.
 
 **Binary** (num_classes = 1): `iou`, `bce`, `bce_iou`, `combine`, `mse`.
 
@@ -114,7 +108,236 @@ G = A @ Aᵀ                                    # (B, C, C) cosine-similarity Gr
 loss_div = mean(off_diag(G)²) / (C × (C-1))
 ```
 
-Pushes attention channels to cover different spatial regions. No foreground guidance loss — in multi-class segmentation the model learns spatial focus naturally from the CE signal.
+---
+
+## Model Size
+
+With `num_channels=64`, `focus_size=32`:
+
+| num_classes | Params |
+|---|---|
+| 151 (ADE20K) | ~484 K |
+| 81  (COCO-80)| ~482 K |
+
+Adjust `num_channels` to trade capacity for speed: `32`→~100 K · `48`→~220 K · `64`→~480 K · `96`→~1.1 M.
+
+---
+
+## Datasets
+
+### ADE20K-150 (default, recommended)
+
+| | |
+|---|---|
+| Source | [MIT CSAIL ADE20K Challenge 2016](https://data.csail.mit.edu/places/ADEchallenge/ADEChallengeData2016.zip) (~922 MB) |
+| Train / Val | 20,210 / 2,000 images |
+| Classes | 150 semantic categories + background → `num_classes=151` |
+| Mask format | uint8 PNG, pixel = class index 0–150 (no decoding needed) |
+| Density | Fully-dense — every pixel labelled (97% foreground ratio) |
+| Avg classes/image | ~10 |
+| Why better than COCO | Covers **stuff** (wall, sky, floor, ceiling) + **things** (person, car) → exercises all three attention heads equally |
+
+### COCO-80
+
+| | |
+|---|---|
+| Source | [COCO 2017](http://images.cocodataset.org/zips/train2017.zip) (~18 GB) |
+| Train / Val | ~118,000 / 5,000 images (filtered to annotated only) |
+| Classes | 80 object categories + background → `num_classes=81` |
+| Mask format | uint8 PNG, pixel = class index 0–80 |
+| Density | Sparse — only annotated objects are labelled (~40–60% foreground) |
+| Avg classes/image | ~3–5 |
+
+---
+
+## Quick Start
+
+### Install
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+### Train on ADE20K-150
+
+**Step 1 — Prepare data** (run once, ~922 MB download):
+```bash
+python prepare_ade20k.py --download
+# Options:
+#   --image-size 224      resize to 224×224 (default)
+#   --workers 8           parallel workers
+#   --clean-zip           delete zip after extraction
+#   --clean-coco          remove existing data/images + data/masks first
+```
+
+**Step 2 — Verify `config.json`:**
+```json
+{
+  "num_classes": 151,
+  "loss_type":   "ce_iou",
+  "image_size":  224,
+  "num_channels": 64,
+  "epochs":      200
+}
+```
+
+**Step 3 — Train:**
+```bash
+python train_sf_seg.py      # reads config.json
+# or
+./train.sh
+```
+
+---
+
+### Train on COCO-80
+
+**Step 1 — Download + prepare COCO** (requires ~18 GB disk):
+```bash
+# archive/download.py is the COCO preparation script
+python archive/download.py --root data --prepare
+# Then rebuild multi-class masks (all 80 classes):
+python archive/rebuild_masks.py
+```
+
+**Step 2 — Update `config.json`:**
+```json
+{
+  "num_classes": 81,
+  "loss_type":   "ce_iou",
+  "image_size":  224,
+  "num_channels": 64
+}
+```
+
+**Step 3 — Train:**
+```bash
+python train_sf_seg.py
+```
+
+---
+
+### Resume training
+
+```bash
+python train_sf_seg.py --resume last   # continue from last checkpoint
+python train_sf_seg.py --resume checkpoints/sf_seg_best.pt
+```
+
+> Resume is skipped automatically if `num_classes` in the checkpoint does not match the current config.
+
+---
+
+## Evaluation & Benchmarking
+
+### Val-set mIoU (runs every epoch automatically)
+
+Training logs per-class IoU to console and `logs/train_log.csv` every epoch:
+
+```
+Epoch N | lr=X | train loss=X seg=X div=X acc=X mIoU=X | val loss=X seg=X acc=X mIoU=X
+         top10_cls_iou: wall=0.71  floor=0.68  ceiling=0.62  person=0.58 ...
+```
+
+---
+
+### Visualise predictions + attention maps
+
+```bash
+# Saves RGB | GT | PRED panels to outputs/attention_vis/
+python visualize_attention.py \
+    --checkpoint checkpoints/sf_seg_best.pt \
+    --data-root  data \
+    --num-images 8 \
+    --head       large        # large | medium | small
+    --show-channels 8         # individual channels to display
+    --min-range  0.05         # only channels with spatial variation ≥ 0.05
+    --output-dir outputs/attention_vis
+
+# Each output shows 6 fixed panels:
+#   [Input RGB] [GT mask] [Predicted mask]
+#   [Attn small (global)] [Attn medium] [Attn large (local)]
+#   + up to N individual channel maps from --head
+```
+
+---
+
+### Cross-dataset evaluation (LVIS)
+
+Evaluate a model trained on ADE20K / COCO on LVIS v1 val images
+(uses locally-available images — no extra download if COCO train2017 is present):
+
+```bash
+# Download LVIS val annotations first (~64 MB)
+python -c "
+import requests, zipfile, pathlib
+url  = 'https://dl.fbaipublicfiles.com/LVIS/lvis_v1_val.json.zip'
+dest = pathlib.Path('data/lvis/lvis_v1_val.json.zip')
+dest.parent.mkdir(parents=True, exist_ok=True)
+dest.write_bytes(requests.get(url).content)
+with zipfile.ZipFile(dest) as z: z.extractall('data/lvis')
+print('Done')
+"
+
+# Run evaluation
+python evaluate_lvis.py \
+    --checkpoint  checkpoints/sf_seg_best.pt \
+    --lvis-ann    data/lvis/lvis_v1_val.json \
+    --data-root   data \
+    --max-images  1000          # 0 = all available
+    --vis-samples 8             # save N visualisation images
+    --output-dir  outputs/lvis_eval
+```
+
+Output:
+```
+── Category Coverage ───
+LVIS total categories  : 1,203
+COCO-80 overlap        : 59 (4.9%)     ← model's known classes
+LVIS-only (model blind): 1,144
+
+── Results ─────────────
+mIoU (overlap classes) : X.XX%
+Background IoU         : X.XX%
+
+── Per-Class IoU ────────
+person   0.58    car   0.51    chair  0.44 ...
+```
+
+> Key finding: a COCO-trained model scores ~0% mIoU on LVIS because 95% of LVIS categories are unknown. An ADE20K-trained model similarly cannot detect LVIS-only objects. Use `evaluate_lvis.py` to measure transfer overlap.
+
+---
+
+### Latency benchmark
+
+```bash
+python benchmark.py        # requires CUDA
+# Reports per-operation latency of clamped_softmax + full forward/backward
+```
+
+---
+
+## Hyperparameters
+
+All arguments can also be set in `config.json` (CLI overrides config):
+
+| Argument | Default | Description |
+|---|---|---|
+| `--num-channels` | 64 | Feature channels C per attention head |
+| `--focus-size` | 32 | Budget k = focus_size² for large head; auto-scaled for smaller heads |
+| `--encoder-stride` | 2 | Stride inside each head's first conv |
+| `--num-classes` | 151 | Total classes incl. background — **151 for ADE20K, 81 for COCO** |
+| `--loss-type` | `ce_iou` | `ce` / `iou` / `ce_iou` (multi-class); `bce` / `combine` (binary) |
+| `--no-obj-weight` | 0.01 | IoU loss weight for classes absent from a sample (0=ignore) |
+| `--diversity-weight` | 0.1 | Attention diversity / Gram penalty |
+| `--image-size` | 224 | Square input resolution |
+| `--lr` | 1e-4 | Adam learning rate (cosine decay → lr × 0.01) |
+| `--batch-size` | 32 | Batch size |
+| `--epochs` | 200 | Training epochs |
+| `--resume` | — | `last` / `auto` / path to `.pt` checkpoint |
+| `--data-root` | `data` | Dataset root directory |
 
 ---
 
@@ -126,110 +349,9 @@ Pushes attention channels to cover different spatial regions. No foreground guid
 | LR schedule | CosineAnnealingLR (→ lr × 0.01) | Smooth decay, avoids plateau |
 | Augmentation | Flip, rotate ±15°, translate 10%, colour jitter | Regularisation |
 | Mixed precision | AMP (autocast + GradScaler) | ~2× speed, ~½ VRAM on CUDA |
-| DataLoader | pin_memory, non_blocking, prefetch=2 | CPU→GPU overlap |
-| Confusion matrix | GPU bincount per batch | Efficient mIoU, no CPU sync |
-| Checkpointing | best (val_loss) + last | Safe resume with optimizer + scheduler state |
-
----
-
-## Model Size
-
-With `num_channels=64`, `focus_size=32`, `num_classes=81`:
-
-| Component | Params |
-|---|---|
-| 3 × attention head (enc1 + enc2 + channel_mix) | ~300 K |
-| Decoder (blend_up × 2, fuse × 2, pre_masks, masks) | ~180 K |
-| **Total** | **~480 K** |
-
-Adjust `num_channels` to trade capacity for speed: 32→~100 K, 48→~220 K, 64→~480 K, 96→~1.1 M.
-
----
-
-## Dataset — ADE20K-150
-
-| | Value |
-|---|---|
-| Source | [MIT CSAIL ADE20K Challenge 2016](https://data.csail.mit.edu/places/ADEchallenge/ADEChallengeData2016.zip) |
-| Train | 20,210 images |
-| Val | 2,000 images |
-| Classes | **150** semantic categories + background = `num_classes=151` |
-| Mask format | uint8 PNG, pixel value = class index (0=background, 1–150) |
-| Coverage | Fully-dense (every pixel labelled: wall, sky, floor, car, person…) |
-| Avg classes/image | ~10 (vs ~3–5 for COCO) |
-
-Categories span both **stuff** (wall, floor, ceiling, sky, tree — global context) and **things** (person, car, chair, bed — local detail). This exercises all three attention heads.
-
-## Quick Start
-
-```bash
-pip install -r requirements.txt
-
-# Download + prepare ADE20K (run once, ~922 MB)
-python prepare_ade20k.py --download
-
-# Train
-python train_sf_seg.py          # reads config.json
-./train.sh                      # same, convenience wrapper
-```
-
-### Resume
-```bash
-python train_sf_seg.py --resume last
-```
-
----
-
-## Hyperparameters
-
-| Argument | Default | Description |
-|---|---|---|
-| `--num-channels` | 64 | Feature channels C per attention head |
-| `--focus-size` | 32 | Budget k = focus_size² for the large head; scaled for smaller heads |
-| `--encoder-stride` | 2 | Stride inside each attention head (always 2 in multi-scale mode) |
-| `--num-classes` | 151 | Total classes including background (ADE20K-150 + bg) |
-| `--loss-type` | `ce_iou` | `ce` / `iou` / `ce_iou` (multi-class); `bce` / `iou` / `combine` (binary) |
-| `--no-obj-weight` | 0.01 | Soft-IoU weight for absent classes (0 = ignore, 1 = full penalty) |
-| `--diversity-weight` | 0.1 | Attention diversity / Gram penalty |
-| `--image-size` | 224 | Square input resolution |
-| `--lr` | 1e-4 | Adam learning rate (cosine decay to lr × 0.01) |
-| `--batch-size` | 32 | Batch size |
-| `--epochs` | 200 | Training epochs |
-
-All defaults can be set in `config.json`.
-
----
-
-## Metrics & Logging
-
-Each epoch logs to console, `logs/train.log`, and `logs/train_log.csv`:
-
-```
-Epoch N | lr | train loss seg div acc mIoU | val loss seg acc mIoU
-         top10_cls_iou: person=0.72  car=0.61  bicycle=0.54 ...
-```
-
-Validation sample images are saved to `outputs/` each epoch:
-- Left: RGB input
-- Center: GT mask (colour-coded by class)
-- Right: Predicted mask (same palette) with predicted class names in footer
-
----
-
-## Comparison: New vs Old Architecture
-
-| Property | Old (single-scale) | New (multi-scale) |
-|---|---|---|
-| Attention heads | 1 (at H/2) | 3 (H/32, H/8, H/2) |
-| Object size handling | Single scale only | Small + medium + large simultaneously |
-| Decoder | 1 conv → upsample → sigmoid | 4 blend layers + 2 fusion blocks |
-| Skip connections | Single (circular, enc→skip→dec) | Clean bottom-up with independent paths |
-| Attention guidance loss | ✓ (conflicting with multi-class) | ✗ removed |
-| Class imbalance | ✗ unweighted CE | ✓ median-frequency weighting |
-| Task | Binary (person only) | 80-class COCO semantic segmentation |
-| Params (~C=64) | ~340 K | ~350 K |
-
-The new architecture is strictly better for multi-class segmentation. At the same parameter count it handles multi-scale objects, has properly independent skip connections, and uses principled class weighting. For binary segmentation the old architecture was sufficient — the new one still works and is more principled.
+| DataLoader | pin_memory, non_blocking, prefetch=2 | CPU→GPU transfer overlap |
+| Confusion matrix | GPU bincount per batch, single `.cpu()` at epoch end | Efficient mIoU, no per-batch sync |
+| Checkpointing | `sf_seg_best.pt` + `sf_seg_last.pt` | Safe resume with optimizer + scheduler state |
 
 ---
 
@@ -242,17 +364,17 @@ sf_seg/
 ├── losses.py              # CE+IoU, soft-IoU (no_obj_weight), diversity loss
 ├── prepare_ade20k.py      # Download + prepare ADE20K-150 dataset
 ├── prepare_data.py        # General resize / filter for processed images
-├── draw_arch.py           # Generate architecture diagram (docs/architecture.png)
+├── draw_arch.py           # Generate architecture diagram → docs/architecture.png
 ├── visualize_attention.py # Multi-scale attention map visualisation
-├── evaluate_lvis.py       # Cross-dataset evaluation on LVIS v1
-├── benchmark.py           # Per-op latency benchmark
-├── config.json            # Hyperparameters (num_classes=151 for ADE20K)
+├── evaluate_lvis.py       # Cross-dataset evaluation on LVIS v1 val
+├── benchmark.py           # Per-op latency benchmark (CUDA)
+├── config.json            # Default hyperparameters
 ├── requirements.txt       # Python dependencies
 ├── train.sh               # Convenience wrapper: ./train.sh [extra args]
 ├── docs/
-│   ├── architecture.png   # Architecture diagram (generated)
+│   ├── architecture.png   # Architecture diagram (generated by draw_arch.py)
 │   └── architecture.svg
-└── archive/               # Legacy COCO-specific scripts
-    ├── download.py        # (was: download COCO 2017)
-    └── rebuild_masks.py   # (was: rebuild COCO multi-class masks)
+└── archive/               # Legacy COCO-specific scripts (kept for reference)
+    ├── download.py        # Download COCO 2017 + build binary/multi-class masks
+    └── rebuild_masks.py   # Rebuild COCO masks with all 80 class indices
 ```
