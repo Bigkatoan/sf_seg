@@ -15,8 +15,8 @@
   "diversity_weight": 0.1,
   "num_classes": 151,
   "absent_weight": 0.2,
-  "attn_guide_weight": 0.0,
-  "attn_exclusive_weight": 0.0,
+  "attn_guide_weight": 0.5,
+  "attn_exclusive_weight": 0.3,
   "decoder_type": "dense",
   "resume": false
 }
