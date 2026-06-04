@@ -270,9 +270,11 @@ def train(args):
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size,
                                        rank=rank, shuffle=False)
 
-    kw = dict(num_workers=args.num_workers, pin_memory=True,
-              prefetch_factor=2 if args.num_workers > 0 else None,
-              persistent_workers=args.num_workers > 0)
+    # Cap workers per process: DDP spawns world_size processes, each with num_workers
+    nw = min(args.num_workers, max(1, 4 // world_size))
+    kw = dict(num_workers=nw, pin_memory=True,
+              prefetch_factor=2 if nw > 0 else None,
+              persistent_workers=nw > 0)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               sampler=train_sampler, **kw)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
@@ -317,15 +319,15 @@ def train(args):
 
     class_weights = None
     if num_classes > 1:
-        # Compute on rank 0 from cache, then broadcast
+        # Compute on rank 0, move to CUDA, then broadcast (NCCL requires CUDA tensors)
         if rank0:
             cw = compute_class_weights(
                 data_root / 'masks' / 'train', num_classes,
-                cache_path=data_root / 'class_freq.json')
+                cache_path=data_root / 'class_freq.json').to(device)
         else:
-            cw = torch.zeros(num_classes)
+            cw = torch.zeros(num_classes, device=device)
         dist.broadcast(cw, src=0)
-        class_weights = cw.to(device)
+        class_weights = cw
 
     if rank0:
         out_dir  = Path(args.output_dir);     out_dir.mkdir(parents=True, exist_ok=True)
