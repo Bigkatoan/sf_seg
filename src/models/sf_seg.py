@@ -111,41 +111,61 @@ class sf_seg(nn.Module):
     """
 
     def __init__(self, num_channels: int = 32, focus_size: int = 32,
-                 encoder_stride: int = 2, num_classes: int = 1):
+                 encoder_stride: int = 2, num_classes: int = 1,
+                 decoder_type: str = "dense"):
         super().__init__()
         self.num_classes    = num_classes
         self.encoder_stride = encoder_stride   # kept for API compat
+        self.decoder_type   = decoder_type
         C = num_channels
 
         # ── Three independent attention heads ─────────────────────────────────
-        # focus_size scales with the attention space area to keep ~8–33% coverage:
-        #   small  7×7  = 49:    fs//8 → k ≈ 33%  (dense global context)
-        #   medium 28×28= 784:   fs//2 → k ≈ 33%  (mid-range context)
-        #   large  112×112=12544: fs   → k ≈  8%  (fine local selection)
         self.head_small  = attention_head(C, focus_size=max(2, focus_size // 8))
         self.head_medium = attention_head(C, focus_size=max(4, focus_size // 2))
         self.head_large  = attention_head(C, focus_size=focus_size)
 
         # ── Decoder ──────────────────────────────────────────────────────────
-        # Post-upsample blending: adapt stretched features before concat
         self.blend_up_sm  = nn.Sequential(
             nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
         )
         self.blend_up_med = nn.Sequential(
             nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
         )
-
-        # Fusion: concat(upsampled, skip) → refined features
-        self.fuse_sm_med = nn.Sequential(          # symmetric with fuse_med_lg
+        self.fuse_sm_med = nn.Sequential(
             nn.Conv2d(C + C, C, 3, padding=1), nn.ReLU(inplace=True),
             nn.Conv2d(C, C, 3, padding=1),     nn.ReLU(inplace=True),
         )
-        self.fuse_med_lg = nn.Sequential(
-            nn.Conv2d(C + C, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-        )
 
-        # Final blend before 1×1 prediction
+        # ── fuse_med_lg: dense vs sparse ─────────────────────────────────────
+        if decoder_type == "dense":
+            # All 2C input channels mix freely into C//2 output channels.
+            self.fuse_med_lg = nn.Sequential(
+                nn.Conv2d(C + C, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+                nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+            )
+            self._routing = None
+
+        else:  # "sparse"
+            # Factored: depthwise spatial + sparse pointwise routing.
+            #
+            # Dense:  Conv2d(2C→C//2, 3×3)  — every input channel talks to every output
+            # Sparse: Depthwise(2C, 3×3)    — spatial per-channel  (no cross-channel mix)
+            #       + Conv1×1(2C→C//2)      — channel routing       (L1 → sparsity)
+            #       + Conv2d(C//2, 3×3)     — local spatial refine
+            #
+            # The 1×1 routing weight W ∈ R^(C//2 × 2C) is the object of interest:
+            # after training, W[i, j] ≈ 0 means output feature i ignores input channel j.
+            # Visualising W reveals which attention channels own which output features.
+            self._dw     = nn.Sequential(
+                nn.Conv2d(C + C, C + C, 3, padding=1, groups=C + C),
+                nn.ReLU(inplace=True),
+            )
+            self._routing = nn.Conv2d(C + C, C // 2, 1, bias=False)
+            self._refine  = nn.Sequential(
+                nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
+            )
+
+        # ── Final prediction ──────────────────────────────────────────────────
         self.pre_masks = nn.Sequential(
             nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
         )
@@ -177,7 +197,12 @@ class sf_seg(nn.Module):
         d_m_up = self.blend_up_med(
             F.interpolate(d_med, size=a_large.shape[2:],
                           mode='bilinear', align_corners=False))
-        d_lg   = self.fuse_med_lg(torch.cat([d_m_up, a_large], dim=1))
+        fused  = torch.cat([d_m_up, a_large], dim=1)
+
+        if self.decoder_type == "dense":
+            d_lg = self.fuse_med_lg(fused)
+        else:
+            d_lg = self._refine(F.relu(self._routing(self._dw(fused))))
 
         d_up   = self.pre_masks(
             F.interpolate(d_lg, size=(H, W), mode='bilinear', align_corners=False))
@@ -190,6 +215,30 @@ class sf_seg(nn.Module):
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def routing_sparsity_loss(self) -> torch.Tensor | None:
+        """L1 norm of routing weights (sparse variant only).
+        Add to total loss with a small weight to encourage channel specialisation.
+        Returns None for dense variant.
+        """
+        if self._routing is None:
+            return None
+        return self._routing.weight.abs().mean()
+
+    def routing_weight_stats(self) -> dict:
+        """Sparsity diagnostics for the routing matrix (sparse variant only).
+        Useful for monitoring how many channels are truly specialised.
+        Returns empty dict for dense variant.
+        """
+        if self._routing is None:
+            return {}
+        W = self._routing.weight.detach().abs()  # (C//2, 2C, 1, 1) → squeeze
+        W = W.squeeze(-1).squeeze(-1)            # (C//2, 2C)
+        return {
+            "routing_mean":     W.mean().item(),
+            "routing_sparsity": (W < 1e-3).float().mean().item(),  # fraction near-zero
+            "routing_max":      W.max().item(),
+        }
 
 
 def main():

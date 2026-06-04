@@ -263,8 +263,10 @@ def train(args):
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, **kw)
 
     model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
-                   encoder_stride=args.encoder_stride, num_classes=num_classes).to(device)
-    print(f"Model params: {model.get_num_parameters():,}  |  num_classes={num_classes}  |  device={device}")
+                   encoder_stride=args.encoder_stride, num_classes=num_classes,
+                   decoder_type=args.decoder_type).to(device)
+    print(f"Model params: {model.get_num_parameters():,}  |  "
+          f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  device={device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
@@ -367,7 +369,11 @@ def train(args):
                         attn, masks, num_classes) \
                     if args.attn_exclusive_weight > 0 and num_classes > 1 \
                     else torch.tensor(0., device=device)
-                loss = s + d + g + e
+                sp_raw = model.routing_sparsity_loss()
+                sp = args.sparse_weight * sp_raw \
+                     if args.sparse_weight > 0 and sp_raw is not None \
+                     else torch.tensor(0., device=device)
+                loss = s + d + g + e + sp
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -428,12 +434,17 @@ def train(args):
                 f"{cat_names.get(str(c),str(c))}={v:.3f}" for v, c in ranked)
 
         lr = scheduler.get_last_lr()[0]; scheduler.step()
+        routing_info = ""
+        if args.decoder_type == "sparse":
+            rs = model.routing_weight_stats()
+            routing_info = (f" | routing sparsity={rs['routing_sparsity']:.2%}"
+                            f" mean={rs['routing_mean']:.4f}")
         logging.info(
             f"Epoch {epoch}/{args.epochs} | lr={lr:.2e} | "
             f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} div={tr['div']:.4f} "
             f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} | "
             f"val   loss={vl['loss']:.4f} seg={vl['seg']:.4f} "
-            f"acc={vl['acc']:.4f} mIoU={vl_miou:.4f}" + cls_info)
+            f"acc={vl['acc']:.4f} mIoU={vl_miou:.4f}" + cls_info + routing_info)
         csv_w.writerow([epoch,
                         tr['loss'], tr['seg'], tr['div'], tr['acc'], tr_miou,
                         vl['loss'], vl['seg'],             vl['acc'], vl_miou])
@@ -483,6 +494,8 @@ def parse_args():
     p.add_argument("--absent-weight",    type=float, default=None)
     p.add_argument("--attn-guide-weight",     type=float, default=None)
     p.add_argument("--attn-exclusive-weight", type=float, default=None)
+    p.add_argument("--decoder-type",  default=None, choices=["dense", "sparse"])
+    p.add_argument("--sparse-weight", type=float, default=None)
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
@@ -507,6 +520,7 @@ def merge_config(args):
         num_channels=64, focus_size=32, encoder_stride=2,
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
         absent_weight=0.2, attn_guide_weight=0.0, attn_exclusive_weight=0.0,
+        decoder_type="dense", sparse_weight=0.0,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224,
     )

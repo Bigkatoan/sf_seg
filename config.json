@@ -17,5 +17,7 @@
   "absent_weight": 0.2,
   "attn_guide_weight": 0.5,
   "attn_exclusive_weight": 0.3,
+  "decoder_type": "dense",
+  "sparse_weight": 0.0,
   "resume": false
 }
