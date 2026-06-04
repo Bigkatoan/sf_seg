@@ -212,6 +212,72 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     return present_loss + absent_weight * absent_loss
 
 
+# ── Attention guidance (IoU-based, class-specific) ───────────────────────────
+
+def attention_guide_loss(attn: torch.Tensor, target: torch.Tensor,
+                         num_classes: int, topk: int = 1,
+                         guide_size: int = 14, eps: float = 1e-3) -> torch.Tensor:
+    """Supervise attention maps to align with GT masks via IoU-based assignment.
+
+    For each present class c in an image:
+      1. Compute IoU between GT mask_c and every attention channel  [detached]
+      2. Select top-k attention channels with highest IoU → "responsible" heads
+      3. Supervise them with Dice loss to better match mask_c
+
+    The IoU-based selection (step 1-2) is detached from the gradient graph so
+    the selector is stable and gradients only flow through the supervision loss.
+
+    Complexity:
+      Downsampling to guide_size² before the bmm keeps compute tractable:
+        bmm: B × num_classes × C_attn × guide_size²
+        guide_size=14 → ~60M ops/batch  vs  full 112×112 → ~3.9B ops
+
+    attn       : (B, C_attn, H', W') — attention maps from the model
+    target     : (B, H, W)           — class label map (long)
+    topk       : channels selected per class (1 = strict assignment)
+    guide_size : spatial resolution for IoU computation
+    """
+    B, C_attn, _, _ = attn.shape
+
+    # Downsample both to guide_size for efficiency
+    attn_s = F.adaptive_avg_pool2d(attn, (guide_size, guide_size))   # (B, K, g, g)
+    tgt_s  = F.interpolate(
+        target.float().unsqueeze(1), (guide_size, guide_size), mode='nearest'
+    ).squeeze(1).long()                                               # (B, g, g)
+    L = guide_size * guide_size
+
+    gt_oh  = F.one_hot(tgt_s, num_classes).permute(0, 3, 1, 2).float()
+    gt_f   = gt_oh.view(B, num_classes, L)                           # (B, C, L)
+    atn_f  = attn_s.view(B, C_attn, L)                              # (B, K, L)
+
+    # IoU matrix (B, num_classes, C_attn) — detached, selection is non-differentiable
+    with torch.no_grad():
+        inter   = torch.bmm(gt_f, atn_f.transpose(1, 2))            # (B, C, K)
+        union   = gt_f.sum(-1, keepdim=True) + atn_f.sum(-1).unsqueeze(1) - inter
+        iou_m   = (inter + eps) / (union + eps)                      # (B, C, K)
+        _, topk_idx = iou_m.topk(topk, dim=2)                       # (B, C, topk)
+
+    # Gather top-k attention maps for each class: (B, num_classes, topk, L)
+    idx       = topk_idx.unsqueeze(-1).expand(-1, -1, -1, L)
+    atn_exp   = atn_f.unsqueeze(1).expand(-1, num_classes, -1, -1)
+    topk_maps = torch.gather(atn_exp, 2, idx).mean(2)               # (B, C, L)
+
+    # Normalise to [0,1] for comparison with binary GT mask
+    mx        = topk_maps.amax(-1, keepdim=True).clamp(min=eps)
+    topk_norm = (topk_maps / mx).clamp(0, 1)                        # (B, C, L)
+
+    # Dice loss — only for present foreground classes (skip background idx=0)
+    present = (gt_f.sum(-1) > 0)                                     # (B, C)
+    present[:, 0] = False
+    if not present.any():
+        return torch.zeros(1, device=attn.device).squeeze()
+
+    p    = topk_norm[present]                                         # (N, L)
+    t    = gt_f[present]                                              # (N, L)
+    dice = 1 - (2 * (p * t).sum(-1) + eps) / (p.sum(-1) + t.sum(-1) + eps)
+    return dice.mean()
+
+
 # ── Attention regulariser (class-agnostic) ────────────────────────────────────
 
 def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:

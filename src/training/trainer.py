@@ -26,7 +26,8 @@ import torchvision.transforms.functional as TF
 
 from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
                          multiclass_iou_loss, ce_iou_loss,
-                         focal_loss, focal_iou_loss, pure_focal_iou_loss)
+                         focal_loss, focal_iou_loss, pure_focal_iou_loss,
+                         attention_guide_loss)
 from src.models import sf_seg
 
 
@@ -358,7 +359,11 @@ def train(args):
                              args.no_obj_weight, class_weights, args.absent_weight)
                 d = args.diversity_weight * diversity_loss(attn) if args.diversity_weight > 0 \
                     else torch.tensor(0., device=device)
-                loss = s + d
+                g = args.attn_guide_weight * attention_guide_loss(
+                        attn, masks, num_classes) \
+                    if args.attn_guide_weight > 0 and num_classes > 1 \
+                    else torch.tensor(0., device=device)
+                loss = s + d + g
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -472,6 +477,7 @@ def parse_args():
     p.add_argument("--num-classes",      type=int,   default=None)
     p.add_argument("--no-obj-weight",    type=float, default=None)
     p.add_argument("--absent-weight",    type=float, default=None)
+    p.add_argument("--attn-guide-weight", type=float, default=None)
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
@@ -495,7 +501,7 @@ def merge_config(args):
         data_root="data", epochs=200, batch_size=32, lr=1e-4, num_workers=4,
         num_channels=64, focus_size=32, encoder_stride=2,
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
-        absent_weight=0.2,
+        absent_weight=0.2, attn_guide_weight=0.0,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224,
     )
