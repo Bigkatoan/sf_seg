@@ -157,6 +157,50 @@ def focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     return focal_w * fl + iou_w * iou
 
 
+def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
+                        gamma: float = 2.0, eps: float = 1e-3,
+                        no_obj_weight: float = 0.1) -> torch.Tensor:
+    """Unified Focal-IoU: IoU itself as the confidence measure.
+
+    Formula:  L = (1 − IoU_c)^(γ+1)  per class c
+
+    Derivation from focal loss  FL = (1−p_t)^γ · loss(p_t) :
+      replace  p_t    →  IoU_c          (class-level confidence)
+      replace  loss   →  1 − IoU_c      (soft-IoU loss)
+      ⟹  FL-IoU = (1−IoU_c)^γ · (1−IoU_c) = (1−IoU_c)^(γ+1)
+
+    Properties:
+      γ=0  →  plain soft-IoU (no focus)
+      γ=1  →  quadratic:  (1−IoU)²
+      γ=2  →  cubic:      (1−IoU)³  — strong focus on hard classes
+
+    Advantages over focal_CE + IoU:
+      · Single formula, no focal_w / iou_w coefficients to tune
+      · Directly optimises the evaluation metric (IoU)
+      · Focal weighting is grounded in the same geometric quantity
+      · No CE term means no pixel-level class_weight vector needed
+    """
+    B, C, H, W = logits.shape
+    probs = F.softmax(logits, dim=1)                                  # (B, C, H, W)
+
+    tgt_oh    = F.one_hot(target, num_classes=C).permute(0, 3, 1, 2).float()
+    pred_flat = probs.view(B, C, -1)                                  # (B, C, H*W)
+    tgt_flat  = tgt_oh.view(B, C, -1)
+
+    inter = (pred_flat * tgt_flat).sum(-1)                            # (B, C)
+    union = pred_flat.sum(-1) + tgt_flat.sum(-1) - inter
+    iou   = (inter + eps) / (union + eps)                             # (B, C) ∈ [0,1]
+
+    # Focal-IoU core: (1 − IoU)^(γ+1)
+    loss  = (1 - iou).pow(1 + gamma)                                  # (B, C)
+
+    # Present classes → weight 1.0, absent → no_obj_weight
+    present = (tgt_flat.sum(-1) > 0).float()
+    weight  = present + no_obj_weight * (1.0 - present)
+
+    return (loss * weight).sum() / weight.sum().clamp(min=1.0)
+
+
 # ── Attention regulariser (class-agnostic) ────────────────────────────────────
 
 def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:

@@ -7,7 +7,7 @@
   "log_dir": "logs",
   "output_dir": "outputs",
   "checkpoint_dir": "checkpoints",
-  "loss_type": "focal_iou",
+  "loss_type": "pure_focal_iou",
   "image_size": 224,
   "num_channels": 128,
   "focus_size": 32,
@@ -15,5 +15,5 @@
   "diversity_weight": 0.1,
   "num_classes": 151,
   "no_obj_weight": 0.05,
-  "resume": true
+  "resume": false
 }
