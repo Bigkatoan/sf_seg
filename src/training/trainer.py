@@ -151,10 +151,10 @@ def compute_class_weights(masks_dir: Path, num_classes: int,
 # ── Loss dispatcher ───────────────────────────────────────────────────────────
 
 def seg_loss(logits, masks, loss_type, criterion, num_classes,
-             no_obj_weight=0.1, class_weights=None):
+             no_obj_weight=0.1, class_weights=None, absent_weight=0.2):
     if num_classes > 1:
         if loss_type == "pure_focal_iou":
-            return pure_focal_iou_loss(logits, masks, no_obj_weight=no_obj_weight)
+            return pure_focal_iou_loss(logits, masks, absent_weight=absent_weight)
         if loss_type == "focal_iou":
             return focal_iou_loss(logits, masks,
                                   class_weights=class_weights,
@@ -355,7 +355,7 @@ def train(args):
             with autocast('cuda', enabled=device.type == 'cuda'):
                 logits, _, attn = model(imgs)
                 s = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
-                             args.no_obj_weight, class_weights)
+                             args.no_obj_weight, class_weights, args.absent_weight)
                 d = args.diversity_weight * diversity_loss(attn) if args.diversity_weight > 0 \
                     else torch.tensor(0., device=device)
                 loss = s + d
@@ -394,7 +394,7 @@ def train(args):
                 with autocast('cuda', enabled=device.type == 'cuda'):
                     logits, _, _ = model(imgs)
                     s    = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
-                                    args.no_obj_weight, class_weights)
+                                    args.no_obj_weight, class_weights, args.absent_weight)
                 b = imgs.size(0)
                 if num_classes > 1:
                     pred = logits.argmax(dim=1)
@@ -471,6 +471,7 @@ def parse_args():
     p.add_argument("--diversity-weight", type=float, default=None)
     p.add_argument("--num-classes",      type=int,   default=None)
     p.add_argument("--no-obj-weight",    type=float, default=None)
+    p.add_argument("--absent-weight",    type=float, default=None)
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
@@ -494,6 +495,7 @@ def merge_config(args):
         data_root="data", epochs=200, batch_size=32, lr=1e-4, num_workers=4,
         num_channels=64, focus_size=32, encoder_stride=2,
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
+        absent_weight=0.2,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224,
     )

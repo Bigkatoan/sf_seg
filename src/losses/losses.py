@@ -159,29 +159,31 @@ def focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
 
 def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
                         gamma: float = 2.0, eps: float = 1e-3,
-                        no_obj_weight: float = 0.3) -> torch.Tensor:
-    """Unified Focal-IoU: IoU itself as the confidence measure.
+                        absent_weight: float = 0.2) -> torch.Tensor:
+    """Unified Focal-IoU with Spatial Mass Penalty for absent classes.
 
-    Formula:  L = (1 − IoU_c)^(γ+1)  per class c
+    Two separate objectives, each operating at its natural granularity:
 
-    Derivation from focal loss  FL = (1−p_t)^γ · loss(p_t) :
-      replace  p_t    →  IoU_c          (class-level confidence)
-      replace  loss   →  1 − IoU_c      (soft-IoU loss)
-      ⟹  FL-IoU = (1−IoU_c)^γ · (1−IoU_c) = (1−IoU_c)^(γ+1)
+      Present classes  →  (1 − IoU_c)^(γ+1)        [class-level, geometric]
+      Absent  classes  →  mean_{x,y}(p_c(x,y))      [pixel-level, spatial]
 
-    Properties:
-      γ=0  →  plain soft-IoU (no focus)
-      γ=1  →  quadratic:  (1−IoU)²
-      γ=2  →  cubic:      (1−IoU)³  — strong focus on hard classes
+    Why Spatial Mass Penalty instead of no_obj_weight on IoU:
+      For an absent class c, p_c(x,y) is a spatial probability mass function
+      that encodes WHERE the model thinks class c might exist (even though it
+      doesn't). Scaling the IoU term (no_obj_weight) discards this spatial
+      signal. The mass penalty min{mean(p_c)} instead directly constrains the
+      model to allocate ZERO spatial attention to absent classes — a strictly
+      stronger and more informative constraint at pixel level.
 
-    Why no_obj_weight is still needed (despite focal self-regulation):
-      Theoretically, if the model outputs prob≈0 for an absent class:
-        inter=0, union≈0 → IoU=ε/ε=1 → loss=0  (no penalty, automatic)
-      In practice, softmax over 151 classes gives each absent class
-      ≈1/151×H×W≈332 prediction units, so IoU≈ε/332≈0 and loss≈1.
-      → ~148 absent classes still dominate gradient without no_obj_weight.
-      The focal mechanism already provides partial relief, so this value
-      can be set higher (0.3) than in non-focal losses (0.01–0.05).
+      Absent IoU ≈ ε / (Σ p_c + ε): measures overlap (always 0).
+      Absent mass = mean(p_c):        measures total spatial allocation.
+
+    Combined formula per image:
+      L = (1/N_present) Σ_{c∈present} (1−IoU_c)^(γ+1)
+        + absent_weight × (1/N_absent) Σ_{c∈absent} mean(p_c)
+
+    γ=0 → plain soft-IoU + mass penalty
+    γ=2 → cubic focal-IoU + mass penalty  [default]
     """
     B, C, H, W = logits.shape
     probs = F.softmax(logits, dim=1)                                  # (B, C, H, W)
@@ -194,16 +196,20 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     union = pred_flat.sum(-1) + tgt_flat.sum(-1) - inter
     iou   = (inter + eps) / (union + eps)                             # (B, C) ∈ [0,1]
 
-    # Focal-IoU core: (1 − IoU)^(γ+1)
-    loss  = (1 - iou).pow(1 + gamma)                                  # (B, C)
+    present = (tgt_flat.sum(-1) > 0).float()                         # (B, C)
+    absent  = 1.0 - present                                           # (B, C)
 
-    # Present classes → weight 1.0, absent → no_obj_weight.
-    # Focal already down-weights well-predicted absent classes as training
-    # progresses, so no_obj_weight can be higher than in non-focal losses.
-    present = (tgt_flat.sum(-1) > 0).float()
-    weight  = present + no_obj_weight * (1.0 - present)
+    # Present: focal-IoU — (1-IoU)^(γ+1), normalised by number of present classes
+    focal_iou    = (1 - iou).pow(1 + gamma) * present                # (B, C)
+    n_present    = present.sum().clamp(min=1)
+    present_loss = focal_iou.sum() / n_present
 
-    return (loss * weight).sum() / weight.sum().clamp(min=1.0)
+    # Absent: spatial mass penalty — directly minimise average predicted
+    # probability across all pixels for each absent class
+    spatial_mass = pred_flat.mean(-1)                                 # (B, C)
+    absent_loss  = (spatial_mass * absent).sum() / absent.sum().clamp(min=1)
+
+    return present_loss + absent_weight * absent_loss
 
 
 # ── Attention regulariser (class-agnostic) ────────────────────────────────────

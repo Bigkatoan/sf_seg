@@ -14,6 +14,6 @@
   "encoder_stride": 2,
   "diversity_weight": 0.1,
   "num_classes": 151,
-  "no_obj_weight": 0.3,
+  "absent_weight": 0.2,
   "resume": false
 }
