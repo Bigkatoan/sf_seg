@@ -3,6 +3,12 @@
 
 Uses torch_xla for TPU acceleration. Falls back to CUDA/CPU if XLA is not available.
 Run via train.sh which handles dependency installation automatically.
+
+XLA performance rules applied here:
+  - Fixed batch size (drop_last=True) → no shape recompilation at epoch end
+  - All per-step metrics packed into ONE tensor → single XLA→CPU transfer per step
+  - No .item() / .cpu() calls inside the hot loop (confusion matrix kept on device)
+  - xm.mark_step() called exactly once per step (inside optimizer_step)
 """
 from __future__ import annotations
 
@@ -36,12 +42,16 @@ try:
 except ImportError:
     _HAS_XLA = False
 
-def get_device(force_tpu: bool = False):
+def get_device():
     if _HAS_XLA:
-        dev = xm.xla_device()
+        # New API (avoids DeprecationWarning from xm.xla_device())
+        try:
+            dev = torch_xla.device()
+        except Exception:
+            dev = xm.xla_device()
         print(f"Using TPU device: {dev}")
         return dev, "xla"
-    if torch.cuda.is_available() and not force_tpu:
+    if torch.cuda.is_available():
         dev = torch.device("cuda")
         print(f"XLA not found — using GPU: {torch.cuda.get_device_name(0)}")
         return dev, "cuda"
@@ -49,12 +59,11 @@ def get_device(force_tpu: bool = False):
     print("XLA not found — using CPU")
     return dev, "cpu"
 
-def optimizer_step(optimizer, scaler, loss, device_type: str):
-    """Unified backward + optimizer step for XLA/CUDA/CPU."""
+def do_optimizer_step(optimizer, scaler, loss, device_type: str):
     if device_type == "xla":
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        xm.optimizer_step(optimizer)
+        xm.optimizer_step(optimizer)   # flushes XLA graph
     elif device_type == "cuda":
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -205,8 +214,7 @@ def save_val_sample(model, dataset, device, out_dir, epoch, cat_names=None):
     model.eval()
     with torch.no_grad():
         logits, _, _ = model(img_t.unsqueeze(0).to(device))
-        # Move to CPU for PIL operations
-        logits = logits.cpu()
+        logits = logits.cpu()   # single transfer for visualisation
     if _HAS_XLA:
         xm.mark_step()
 
@@ -226,9 +234,9 @@ def save_val_sample(model, dataset, device, out_dir, epoch, cat_names=None):
         footer   = ""
 
     combined = Image.new('RGB', (w * 3, h))
-    combined.paste(img_pil,                                       (0,     0))
-    combined.paste(gt_pil.resize((w, h), Image.NEAREST),         (w,     0))
-    combined.paste(pred_pil.resize((w, h), Image.NEAREST),       (w * 2, 0))
+    combined.paste(img_pil,                                 (0,     0))
+    combined.paste(gt_pil.resize((w, h), Image.NEAREST),   (w,     0))
+    combined.paste(pred_pil.resize((w, h), Image.NEAREST), (w * 2, 0))
     try:
         draw = ImageDraw.Draw(combined)
         font = ImageFont.load_default()
@@ -264,24 +272,27 @@ def train(args):
         logging.warning("No val samples; using train split for validation")
         val_ds = train_ds
 
-    # TPU: pin_memory must be False; limit workers for stability in Colab
-    pin   = device_type == "cuda"
-    nw    = args.num_workers if device_type != "xla" else min(args.num_workers, 4)
-    kw    = dict(num_workers=nw, pin_memory=pin,
-                 prefetch_factor=2 if nw > 0 else None,
-                 persistent_workers=nw > 0)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  **kw)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, **kw)
+    # XLA: pin_memory=False, drop_last=True (fixed shapes → no recompilation)
+    pin  = device_type == "cuda"
+    nw   = min(args.num_workers, 4) if device_type == "xla" else args.num_workers
+    drop = device_type == "xla"     # drop_last only for XLA (static shapes)
+    kw   = dict(num_workers=nw, pin_memory=pin,
+                prefetch_factor=2 if nw > 0 else None,
+                persistent_workers=nw > 0)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, drop_last=drop, **kw)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+                              shuffle=False, drop_last=False, **kw)
 
     model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
                    encoder_stride=args.encoder_stride, num_classes=num_classes).to(device)
-    print(f"Model params: {model.get_num_parameters():,}  |  num_classes={num_classes}  |  device_type={device_type}")
+    print(f"Model params: {model.get_num_parameters():,}  |  "
+          f"num_classes={num_classes}  |  device_type={device_type}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
-    # GradScaler only for CUDA
     from torch.amp import GradScaler
     scaler = GradScaler('cuda', enabled=device_type == "cuda")
 
@@ -291,6 +302,10 @@ def train(args):
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, handlers=[
         logging.FileHandler(log_dir / 'train.log'), logging.StreamHandler()])
+
+    if device_type == "xla":
+        logging.info("XLA note: first 5-10 iterations are slow (graph compilation). "
+                     "Speed improves after warmup.")
 
     cat_names = None
     cat_map = data_root / "cat_to_idx.json"
@@ -349,49 +364,64 @@ def train(args):
     # ── Epoch loop ─────────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs + 1):
 
-        # Train
+        # ── Train ──────────────────────────────────────────────────────────────
         model.train()
-        tr   = dict(loss=0., seg=0., div=0., acc=0.)
-        seen = 0
-        conf_tr = torch.zeros(num_classes, num_classes, dtype=torch.long)
+        tr_loss = tr_seg = tr_div = tr_acc = 0.0
+        seen    = 0
+        conf_tr = torch.zeros(num_classes, num_classes, dtype=torch.long)  # CPU
+
         bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for imgs, masks in bar:
             imgs  = imgs.to(device)
             masks = masks.to(device)
 
             logits, _, attn = model(imgs)
-            s = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
-                         args.no_obj_weight, class_weights)
-            d = args.diversity_weight * diversity_loss(attn) if args.diversity_weight > 0 \
-                else torch.tensor(0., device=device)
+            s    = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
+                            args.no_obj_weight, class_weights)
+            d    = args.diversity_weight * diversity_loss(attn) \
+                   if args.diversity_weight > 0 else torch.zeros(1, device=device)
             loss = s + d
 
-            optimizer_step(optimizer, scaler, loss, device_type)
-
-            b = imgs.size(0)
+            do_optimizer_step(optimizer, scaler, loss, device_type)
+            # After optimizer step, XLA graph is flushed. Now compute metrics
+            # on device and pack into ONE tensor → single XLA→CPU transfer.
             with torch.no_grad():
                 if num_classes > 1:
-                    pred = logits.argmax(dim=1).cpu()
-                    acc  = (pred == masks.cpu()).float().mean().item()
-                    update_confusion_matrix(conf_tr, pred, masks.cpu())
+                    pred   = logits.argmax(dim=1)
+                    acc_t  = (pred == masks).float().mean()
                 else:
-                    acc = ((torch.sigmoid(logits).cpu() > 0.5).float() == masks.cpu()).float().mean().item()
-            tr['loss'] += loss.item() * b; tr['seg'] += s.item() * b
-            tr['div']  += d.item()    * b; tr['acc'] += acc * b; seen += b
-            bar.set_postfix(loss=f"{loss.item():.4f}", seg=f"{s.item():.4f}",
-                            div=f"{d.item():.4f}", acc=f"{acc:.4f}")
+                    acc_t  = ((torch.sigmoid(logits) > 0.5).float() == masks).float().mean()
+                # [loss, seg, div, acc] — 4 scalars, one transfer
+                metrics = torch.stack([loss.detach(), s.detach(),
+                                       d.detach().mean(), acc_t])
+            if _HAS_XLA:
+                xm.mark_step()   # flush metric graph before transfer
 
-        if _HAS_XLA:
-            xm.mark_step()
+            loss_v, s_v, d_v, acc_v = metrics.tolist()   # single XLA→CPU sync
 
-        tr = {k: v / seen for k, v in tr.items()}
+            b = imgs.size(0)
+            tr_loss += loss_v * b
+            tr_seg  += s_v   * b
+            tr_div  += d_v   * b
+            tr_acc  += acc_v * b
+            seen    += b
+
+            # Confusion matrix: transfer pred/masks once per batch (for mIoU)
+            if num_classes > 1:
+                update_confusion_matrix(conf_tr, pred.cpu(), masks.cpu())
+
+            bar.set_postfix(loss=f"{loss_v:.4f}", seg=f"{s_v:.4f}",
+                            div=f"{d_v:.4f}", acc=f"{acc_v:.4f}")
+
+        tr_loss /= seen; tr_seg /= seen; tr_div /= seen; tr_acc /= seen
         tr_miou, _ = miou_from_confusion(conf_tr) if num_classes > 1 else (0., None)
 
-        # Val
+        # ── Val ────────────────────────────────────────────────────────────────
         model.eval()
-        vl    = dict(loss=0., seg=0., acc=0.)
-        vseen = 0
-        conf_vl = torch.zeros(num_classes, num_classes, dtype=torch.long)
+        vl_loss = vl_seg = vl_acc = 0.0
+        vseen   = 0
+        conf_vl = torch.zeros(num_classes, num_classes, dtype=torch.long)  # CPU
+
         with torch.inference_mode():
             bar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]  ", leave=False)
             for imgs, masks in bar:
@@ -400,21 +430,29 @@ def train(args):
                 logits, _, _ = model(imgs)
                 s = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
                              args.no_obj_weight, class_weights)
+                with torch.no_grad():
+                    if num_classes > 1:
+                        pred  = logits.argmax(dim=1)
+                        acc_t = (pred == masks).float().mean()
+                    else:
+                        acc_t = ((torch.sigmoid(logits) > 0.5).float() == masks).float().mean()
+                    metrics = torch.stack([s.detach(), acc_t])
+                if _HAS_XLA:
+                    xm.mark_step()
+
+                s_v, acc_v = metrics.tolist()
                 b = imgs.size(0)
+                vl_loss += s_v   * b
+                vl_seg  += s_v   * b
+                vl_acc  += acc_v * b
+                vseen   += b
+
                 if num_classes > 1:
-                    pred = logits.argmax(dim=1).cpu()
-                    acc  = (pred == masks.cpu()).float().mean().item()
-                    update_confusion_matrix(conf_vl, pred, masks.cpu())
-                else:
-                    acc = ((torch.sigmoid(logits).cpu() > 0.5).float() == masks.cpu()).float().mean().item()
-                vl['loss'] += s.item() * b; vl['seg'] += s.item() * b
-                vl['acc']  += acc * b; vseen += b
-                bar.set_postfix(loss=f"{s.item():.4f}", acc=f"{acc:.4f}")
+                    update_confusion_matrix(conf_vl, pred.cpu(), masks.cpu())
+                bar.set_postfix(loss=f"{s_v:.4f}", acc=f"{acc_v:.4f}")
 
-        if _HAS_XLA:
-            xm.mark_step()
-
-        vl = {k: v / vseen for k, v in vl.items()} if vseen else vl
+        if vseen:
+            vl_loss /= vseen; vl_seg /= vseen; vl_acc /= vseen
         vl_miou, vl_per = miou_from_confusion(conf_vl) if num_classes > 1 else (0., None)
 
         cls_info = ""
@@ -428,19 +466,19 @@ def train(args):
         lr = scheduler.get_last_lr()[0]; scheduler.step()
         logging.info(
             f"Epoch {epoch}/{args.epochs} | lr={lr:.2e} | "
-            f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} div={tr['div']:.4f} "
-            f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} | "
-            f"val   loss={vl['loss']:.4f} seg={vl['seg']:.4f} "
-            f"acc={vl['acc']:.4f} mIoU={vl_miou:.4f}" + cls_info)
+            f"train loss={tr_loss:.4f} seg={tr_seg:.4f} div={tr_div:.4f} "
+            f"acc={tr_acc:.4f} mIoU={tr_miou:.4f} | "
+            f"val   loss={vl_loss:.4f} seg={vl_seg:.4f} "
+            f"acc={vl_acc:.4f} mIoU={vl_miou:.4f}" + cls_info)
         csv_w.writerow([epoch,
-                        tr['loss'], tr['seg'], tr['div'], tr['acc'], tr_miou,
-                        vl['loss'], vl['seg'],             vl['acc'], vl_miou])
+                        tr_loss, tr_seg, tr_div, tr_acc, tr_miou,
+                        vl_loss, vl_seg,          vl_acc, vl_miou])
         csv_file.flush()
 
-        # Checkpoint — load to CPU first so XLA tensors are serialisable
+        # Checkpoint — always serialise from CPU to avoid XLA tensor issues
         try:
-            improved = vseen and vl['loss'] < best_val
-            if improved: best_val = vl['loss']
+            improved = vseen and vl_loss < best_val
+            if improved: best_val = vl_loss
             cpu_state = {k: v.cpu() for k, v in model.state_dict().items()}
             ckpt = dict(epoch=epoch, model_state_dict=cpu_state,
                         optimizer_state_dict=optimizer.state_dict(),
@@ -450,14 +488,12 @@ def train(args):
                         num_classes=num_classes)
             if _HAS_XLA:
                 xm.save(ckpt, str(last_path))
-                if improved:
-                    xm.save(ckpt, str(best_path))
+                if improved: xm.save(ckpt, str(best_path))
             else:
                 torch.save(ckpt, last_path)
-                if improved:
-                    torch.save(ckpt, best_path)
+                if improved: torch.save(ckpt, best_path)
             if improved:
-                logging.info(f"New best saved (val_loss={vl['loss']:.6f})")
+                logging.info(f"New best saved (val_loss={vl_loss:.6f})")
         except Exception as e:
             logging.warning(f"Checkpoint save failed: {e}")
 
