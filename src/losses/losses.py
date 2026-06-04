@@ -137,7 +137,8 @@ def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     # Subsample spatial locations to save memory
     L = a.shape[-1]
     if L > 2048:
-        idx = torch.randperm(L, device=a.device)[:2048]
+        # Generate permutation on CPU — XLA (TPU) cannot compile int64 rng ops
+        idx = torch.randperm(L)[:2048].to(a.device)
         a = a[:, :, idx]
 
     a    = F.normalize(a.float(), dim=-1, eps=eps)                 # unit norm per channel
