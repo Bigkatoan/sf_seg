@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train sf_seg on COCO2017 person segmentation.
+# Train sf_seg on ADE20K-150 semantic segmentation.
 # Usage: ./train.sh [extra args]
-# Example: ./train.sh --epochs 50 --loss-type combine
+# Prepare data first: python prepare_ade20k.py --download
 rm -rf outputs checkpoints logs
 python train_sf_seg.py "$@"

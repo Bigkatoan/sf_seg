@@ -13,7 +13,7 @@
   "focus_size": 32,
   "encoder_stride": 2,
   "diversity_weight": 0.1,
-  "num_classes": 81,
+  "num_classes": 151,
   "no_obj_weight": 0.01,
   "resume": false
 }

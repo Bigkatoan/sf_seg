@@ -146,13 +146,27 @@ Adjust `num_channels` to trade capacity for speed: 32→~100 K, 48→~220 K, 64�
 
 ---
 
+## Dataset — ADE20K-150
+
+| | Value |
+|---|---|
+| Source | [MIT CSAIL ADE20K Challenge 2016](https://data.csail.mit.edu/places/ADEchallenge/ADEChallengeData2016.zip) |
+| Train | 20,210 images |
+| Val | 2,000 images |
+| Classes | **150** semantic categories + background = `num_classes=151` |
+| Mask format | uint8 PNG, pixel value = class index (0=background, 1–150) |
+| Coverage | Fully-dense (every pixel labelled: wall, sky, floor, car, person…) |
+| Avg classes/image | ~10 (vs ~3–5 for COCO) |
+
+Categories span both **stuff** (wall, floor, ceiling, sky, tree — global context) and **things** (person, car, chair, bed — local detail). This exercises all three attention heads.
+
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 
-# Prepare COCO masks for all 80 classes (run once)
-python rebuild_masks.py
+# Download + prepare ADE20K (run once, ~922 MB)
+python prepare_ade20k.py --download
 
 # Train
 python train_sf_seg.py          # reads config.json
@@ -173,7 +187,7 @@ python train_sf_seg.py --resume last
 | `--num-channels` | 64 | Feature channels C per attention head |
 | `--focus-size` | 32 | Budget k = focus_size² for the large head; scaled for smaller heads |
 | `--encoder-stride` | 2 | Stride inside each attention head (always 2 in multi-scale mode) |
-| `--num-classes` | 81 | Total classes including background (1 = binary) |
+| `--num-classes` | 151 | Total classes including background (ADE20K-150 + bg) |
 | `--loss-type` | `ce_iou` | `ce` / `iou` / `ce_iou` (multi-class); `bce` / `iou` / `combine` (binary) |
 | `--no-obj-weight` | 0.01 | Soft-IoU weight for absent classes (0 = ignore, 1 = full penalty) |
 | `--diversity-weight` | 0.1 | Attention diversity / Gram penalty |
@@ -223,15 +237,22 @@ The new architecture is strictly better for multi-class segmentation. At the sam
 
 ```
 sf_seg/
-├── sf_seg.py              # Model: attention_head, sf_seg (multi-scale)
-├── train_sf_seg.py        # Training script: AMP, mIoU, class weights, logging
+├── sf_seg.py              # Model: attention_head + sf_seg (multi-scale pyramid)
+├── train_sf_seg.py        # Training: AMP, mIoU, class-freq weights, CSV logging
 ├── losses.py              # CE+IoU, soft-IoU (no_obj_weight), diversity loss
-├── rebuild_masks.py       # Rebuild COCO multi-class masks from annotations
-├── download.py            # Download COCO 2017 + prepare masks
-├── prepare_data.py        # Resize / filter existing processed images
-├── visualize_attention.py # Attention map visualization
+├── prepare_ade20k.py      # Download + prepare ADE20K-150 dataset
+├── prepare_data.py        # General resize / filter for processed images
+├── draw_arch.py           # Generate architecture diagram (docs/architecture.png)
+├── visualize_attention.py # Multi-scale attention map visualisation
+├── evaluate_lvis.py       # Cross-dataset evaluation on LVIS v1
 ├── benchmark.py           # Per-op latency benchmark
-├── config.json            # Default hyperparameters
+├── config.json            # Hyperparameters (num_classes=151 for ADE20K)
 ├── requirements.txt       # Python dependencies
-└── train.sh               # Convenience wrapper: ./train.sh [extra args]
+├── train.sh               # Convenience wrapper: ./train.sh [extra args]
+├── docs/
+│   ├── architecture.png   # Architecture diagram (generated)
+│   └── architecture.svg
+└── archive/               # Legacy COCO-specific scripts
+    ├── download.py        # (was: download COCO 2017)
+    └── rebuild_masks.py   # (was: rebuild COCO multi-class masks)
 ```
