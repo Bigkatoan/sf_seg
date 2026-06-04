@@ -124,6 +124,39 @@ def ce_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     return ce_weight * ce + iou_weight * iou
 
 
+def focal_loss(logits: torch.Tensor, target: torch.Tensor,
+               gamma: float = 2.0,
+               weight: torch.Tensor | None = None) -> torch.Tensor:
+    """Multi-class focal loss (Lin et al., 2017).
+
+    Down-weights easy examples exponentially so training focuses on hard,
+    rare foreground classes instead of the dominant background.
+
+    focal(p_t) = (1 - p_t)^gamma * CE(p_t)
+
+    gamma=0  → plain cross-entropy
+    gamma=2  → standard focal (recommended for severe class imbalance)
+    """
+    ce = F.cross_entropy(logits, target, weight=weight, reduction='none')  # (B,H,W)
+    pt = torch.exp(-ce)                                                    # model confidence
+    return ((1 - pt) ** gamma * ce).mean()
+
+
+def focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
+                   class_weights: torch.Tensor | None = None,
+                   gamma: float = 2.0,
+                   focal_w: float = 0.6, iou_w: float = 0.4,
+                   no_obj_weight: float = 0.1) -> torch.Tensor:
+    """Focal loss + soft-IoU — best choice for heavily imbalanced datasets.
+
+    Focal replaces CE: it ignores easy background pixels and pushes the
+    model to learn rare foreground classes much more aggressively.
+    """
+    fl  = focal_loss(logits, target, gamma=gamma, weight=class_weights)
+    iou = multiclass_iou_loss(logits, target, no_obj_weight=no_obj_weight)
+    return focal_w * fl + iou_w * iou
+
+
 # ── Attention regulariser (class-agnostic) ────────────────────────────────────
 
 def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:

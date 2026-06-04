@@ -25,7 +25,7 @@ from tqdm import tqdm
 import torchvision.transforms.functional as TF
 
 from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
-                         multiclass_iou_loss, ce_iou_loss)
+                         multiclass_iou_loss, ce_iou_loss, focal_loss, focal_iou_loss)
 from src.models import sf_seg
 
 
@@ -152,6 +152,12 @@ def compute_class_weights(masks_dir: Path, num_classes: int,
 def seg_loss(logits, masks, loss_type, criterion, num_classes,
              no_obj_weight=0.1, class_weights=None):
     if num_classes > 1:
+        if loss_type == "focal_iou":
+            return focal_iou_loss(logits, masks,
+                                  class_weights=class_weights,
+                                  no_obj_weight=no_obj_weight)
+        if loss_type == "focal":
+            return focal_loss(logits, masks, weight=class_weights)
         if loss_type == "ce_iou":
             return ce_iou_loss(logits, masks,
                                class_weights=class_weights,
@@ -191,10 +197,15 @@ def save_val_sample(model, dataset, device, out_dir, epoch, cat_names=None):
     w, h    = img_pil.size
 
     if model.num_classes > 1:
+        smooth  = F.avg_pool2d(logits, kernel_size=5, stride=1, padding=2)
+        probs   = torch.softmax(smooth[0], dim=0)
+        conf, pred_idx = probs.max(dim=0)
+        pred_idx[conf < 0.4] = 0
+
         pal        = _make_palette(model.num_classes)
         gt_pil     = Image.fromarray(pal[mask_t.numpy().astype(np.int32)])
-        pred_pil   = Image.fromarray(pal[logits[0].argmax(0).numpy().astype(np.int32)])
-        pred_ids   = sorted(set(logits[0].argmax(0).numpy().flat) - {0})[:8]
+        pred_pil   = Image.fromarray(pal[pred_idx.numpy().astype(np.int32)])
+        pred_ids   = sorted(set(pred_idx.numpy().flat) - {0})[:8]
         footer     = " ".join(
             cat_names.get(str(c), str(c)) if cat_names else str(c) for c in pred_ids)
     else:
@@ -253,9 +264,14 @@ def train(args):
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr)
+    warmup_ep    = min(5, args.epochs // 10)          # 5-epoch linear warmup
+    warmup_sched = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep)
+    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.01)
+    scheduler    = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_ep])
     scaler = GradScaler('cuda', enabled=device.type == 'cuda')
 
     criterion = nn.BCELoss() if num_classes == 1 and args.loss_type in ("bce", "bce_iou") else None
@@ -342,6 +358,8 @@ def train(args):
                 loss = s + d
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -451,7 +469,8 @@ def parse_args():
     p.add_argument("--num-classes",      type=int,   default=None)
     p.add_argument("--no-obj-weight",    type=float, default=None)
     p.add_argument("--loss-type",        default=None,
-                   choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou"])
+                   choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
+                            "focal", "focal_iou"])
     p.add_argument("--resume",           default=None)
     p.add_argument("--image-size",       type=int,   default=None)
     p.add_argument("--log-dir",          default=None)

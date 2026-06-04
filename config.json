@@ -7,13 +7,13 @@
   "log_dir": "logs",
   "output_dir": "outputs",
   "checkpoint_dir": "checkpoints",
-  "loss_type": "ce_iou",
+  "loss_type": "focal_iou",
   "image_size": 224,
-  "num_channels": 64,
+  "num_channels": 128,
   "focus_size": 32,
   "encoder_stride": 2,
   "diversity_weight": 0.1,
   "num_classes": 151,
-  "no_obj_weight": 0.01,
-  "resume": false
+  "no_obj_weight": 0.05,
+  "resume": true
 }
