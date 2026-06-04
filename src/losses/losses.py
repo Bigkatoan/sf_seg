@@ -159,7 +159,7 @@ def focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
 
 def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
                         gamma: float = 2.0, eps: float = 1e-3,
-                        no_obj_weight: float = 0.1) -> torch.Tensor:
+                        no_obj_weight: float = 0.3) -> torch.Tensor:
     """Unified Focal-IoU: IoU itself as the confidence measure.
 
     Formula:  L = (1 − IoU_c)^(γ+1)  per class c
@@ -174,11 +174,14 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
       γ=1  →  quadratic:  (1−IoU)²
       γ=2  →  cubic:      (1−IoU)³  — strong focus on hard classes
 
-    Advantages over focal_CE + IoU:
-      · Single formula, no focal_w / iou_w coefficients to tune
-      · Directly optimises the evaluation metric (IoU)
-      · Focal weighting is grounded in the same geometric quantity
-      · No CE term means no pixel-level class_weight vector needed
+    Why no_obj_weight is still needed (despite focal self-regulation):
+      Theoretically, if the model outputs prob≈0 for an absent class:
+        inter=0, union≈0 → IoU=ε/ε=1 → loss=0  (no penalty, automatic)
+      In practice, softmax over 151 classes gives each absent class
+      ≈1/151×H×W≈332 prediction units, so IoU≈ε/332≈0 and loss≈1.
+      → ~148 absent classes still dominate gradient without no_obj_weight.
+      The focal mechanism already provides partial relief, so this value
+      can be set higher (0.3) than in non-focal losses (0.01–0.05).
     """
     B, C, H, W = logits.shape
     probs = F.softmax(logits, dim=1)                                  # (B, C, H, W)
@@ -194,7 +197,9 @@ def pure_focal_iou_loss(logits: torch.Tensor, target: torch.Tensor,
     # Focal-IoU core: (1 − IoU)^(γ+1)
     loss  = (1 - iou).pow(1 + gamma)                                  # (B, C)
 
-    # Present classes → weight 1.0, absent → no_obj_weight
+    # Present classes → weight 1.0, absent → no_obj_weight.
+    # Focal already down-weights well-predicted absent classes as training
+    # progresses, so no_obj_weight can be higher than in non-focal losses.
     present = (tgt_flat.sum(-1) > 0).float()
     weight  = present + no_obj_weight * (1.0 - present)
 
