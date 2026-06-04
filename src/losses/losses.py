@@ -278,6 +278,64 @@ def attention_guide_loss(attn: torch.Tensor, target: torch.Tensor,
     return dice.mean()
 
 
+def attention_exclusivity_loss(attn: torch.Tensor, target: torch.Tensor,
+                                num_classes: int,
+                                guide_size: int = 14,
+                                eps: float = 1e-3) -> torch.Tensor:
+    """Winner-takes-all: each attention channel specialises for at most one class.
+
+    For every channel k, its "winner" is the class with the highest IoU.
+    We then penalise that channel for overlapping with every OTHER class.
+
+    Non-winner IoU → 0  means the channel only responds to one class concept.
+
+    Paired with attention_guide_loss this creates a stable competition:
+      guide_loss     : winner   SHOULD match its class mask  (pull toward GT)
+      exclusivity_loss: non-winners SHOULD NOT match any mask (push away from others)
+
+    After training the assignment matrix  channel_k → class_c  can be read off
+    by averaging per-channel winner classes on the val set, allowing attention
+    maps to be used as standalone class-specific encoders.
+
+    Gradient design:
+      Winner selection uses torch.no_grad() → the selector is a constant mask.
+      Gradients flow only through the non-winner IoU terms, pushing those
+      channel-class IoUs toward 0 without touching the winner channel.
+    """
+    B, K, _, _ = attn.shape
+
+    attn_s = F.adaptive_avg_pool2d(attn, (guide_size, guide_size))   # (B, K, g, g)
+    tgt_s  = F.interpolate(
+        target.float().unsqueeze(1), (guide_size, guide_size), mode='nearest'
+    ).squeeze(1).long()                                               # (B, g, g)
+    L = guide_size * guide_size
+
+    gt_f  = F.one_hot(tgt_s, num_classes).permute(0, 3, 1, 2).float().view(B, num_classes, L)
+    atn_f = attn_s.view(B, K, L)
+
+    present = gt_f.sum(-1) > 0   # (B, C)
+    present[:, 0] = False         # skip background
+    if not present.any():
+        return torch.zeros(1, device=attn.device).squeeze()
+
+    # IoU(channel k, class c) — full gradient for the loss term
+    inter      = torch.bmm(gt_f, atn_f.transpose(1, 2))              # (B, C, K)
+    union      = gt_f.sum(-1, keepdim=True) + atn_f.sum(-1).unsqueeze(1) - inter
+    iou_m      = (inter + eps) / (union + eps)                        # (B, C, K)
+    iou_m      = iou_m * present.float().unsqueeze(-1)               # mask absent
+    iou_per_ch = iou_m.permute(0, 2, 1)                              # (B, K, C)
+
+    # Winner mask — detached so selection carries no gradient
+    with torch.no_grad():
+        best      = iou_per_ch.max(dim=-1, keepdim=True).values      # (B, K, 1)
+        winner    = (iou_per_ch == best).float()                      # (B, K, C)
+
+    # Non-winner overlap: what each channel incorrectly covers
+    non_winner_iou = iou_per_ch * (1.0 - winner)                     # (B, K, C)
+    denom = (1.0 - winner).sum().clamp(min=1)
+    return non_winner_iou.sum() / denom
+
+
 # ── Attention regulariser (class-agnostic) ────────────────────────────────────
 
 def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:

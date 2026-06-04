@@ -16,5 +16,6 @@
   "num_classes": 151,
   "absent_weight": 0.2,
   "attn_guide_weight": 0.5,
+  "attn_exclusive_weight": 0.3,
   "resume": false
 }

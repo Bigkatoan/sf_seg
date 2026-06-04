@@ -7,6 +7,7 @@ from .losses import (
     focal_iou_loss,
     pure_focal_iou_loss,
     attention_guide_loss,
+    attention_exclusivity_loss,
     combine_losses,
     mse_loss,
     diversity_loss,
