@@ -278,7 +278,8 @@ def train(args):
 
     model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
                    encoder_stride=args.encoder_stride, num_classes=num_classes,
-                   decoder_type=args.decoder_type).to(device)
+                   decoder_type=args.decoder_type,
+                   encoder_pretrained=args.encoder_pretrained).to(device)
     print(f"Model params: {model.get_num_parameters():,}  |  "
           f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  device={device}")
     if device.type == 'cuda':
@@ -523,6 +524,8 @@ def parse_args():
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
+    p.add_argument("--encoder-pretrained", default=None,
+                   help="Path to enc_best.pt from pretrain_encoder.py")
     p.add_argument("--resume",           default=None)
     p.add_argument("--image-size",       type=int,   default=None)
     p.add_argument("--log-dir",          default=None)
@@ -546,7 +549,7 @@ def merge_config(args):
         absent_weight=0.2, attn_guide_weight=0.0, attn_exclusive_weight=0.0,
         decoder_type="dense", sparse_weight=0.0, class_diverse=True,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
-        loss_type="ce_iou", resume=None, image_size=224,
+        loss_type="ce_iou", resume=None, image_size=224, encoder_pretrained=None,
     )
     for key, default in defaults.items():
         cli = getattr(args, key, None)

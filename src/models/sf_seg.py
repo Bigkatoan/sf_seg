@@ -112,7 +112,8 @@ class sf_seg(nn.Module):
 
     def __init__(self, num_channels: int = 32, focus_size: int = 32,
                  encoder_stride: int = 2, num_classes: int = 1,
-                 decoder_type: str = "dense"):
+                 decoder_type: str = "dense",
+                 encoder_pretrained: str | None = None):
         super().__init__()
         self.num_classes    = num_classes
         self.encoder_stride = encoder_stride   # kept for API compat
@@ -123,6 +124,9 @@ class sf_seg(nn.Module):
         self.head_small  = attention_head(C, focus_size=max(2, focus_size // 8))
         self.head_medium = attention_head(C, focus_size=max(4, focus_size // 2))
         self.head_large  = attention_head(C, focus_size=focus_size)
+
+        if encoder_pretrained:
+            self._load_pretrained_encoder(encoder_pretrained)
 
         # ── Decoder ──────────────────────────────────────────────────────────
         self.blend_up_sm  = nn.Sequential(
@@ -212,6 +216,20 @@ class sf_seg(nn.Module):
         attn_guide = F.interpolate(attn_guide, size=(H, W),
                                    mode='bilinear', align_corners=False)
         return logits, attn_guide, attn_l
+
+    def _load_pretrained_encoder(self, path: str) -> None:
+        ckpt = torch.load(path, map_location='cpu')
+        nc   = ckpt.get('num_channels')
+        C    = self.head_large.enc1[0].out_channels
+        if nc and nc != C:
+            raise ValueError(
+                f"Pretrained encoder num_channels={nc} != model num_channels={C}")
+        for head in (self.head_small, self.head_medium, self.head_large):
+            head.enc1.load_state_dict(ckpt['enc1'])
+            head.enc2.load_state_dict(ckpt['enc2'])
+        epoch = ckpt.get('epoch', '?')
+        acc   = ckpt.get('val_acc', 0.0)
+        print(f"Loaded pretrained encoder from {path}  (epoch={epoch}, val_acc={acc:.4f})")
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
