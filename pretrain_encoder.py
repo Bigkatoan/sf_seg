@@ -63,7 +63,8 @@ class SfSegClassifier(nn.Module):
         self.head = ClsHead(C_out, num_classes)
 
     def forward(self, x):
-        features, _ = self.backbone.extract_features(x)
+        # full_res=False: stop at d_lg (H/2,W/2), skip upsample — saves 4× memory
+        features, _ = self.backbone.extract_features(x, full_res=False)
         return self.head(features)
 
 
@@ -114,7 +115,7 @@ def train(args):
         def make_wds(tar_list, transform, shuffle_buf=5000):
             return (
                 wds.WebDataset([str(p) for p in tar_list],
-                               resampled=False, shardshuffle=True)
+                               resampled=False, shardshuffle=500)
                 .shuffle(shuffle_buf)
                 .decode('pil')
                 .to_tuple('jpg', 'cls')
@@ -284,7 +285,7 @@ def main():
     p.add_argument('--image-size',     type=int, default=128,
                    help='Training crop size — match sf_seg image_size (default: 128)')
     p.add_argument('--epochs',         type=int, default=50)
-    p.add_argument('--batch-size',     type=int, default=512)
+    p.add_argument('--batch-size',     type=int, default=256)
     p.add_argument('--epoch-size',     type=int, default=1281167,
                    help='Images per epoch for WebDataset (default: 1281167 = full ImageNet train)')
     p.add_argument('--lr',             type=float, default=1e-3)

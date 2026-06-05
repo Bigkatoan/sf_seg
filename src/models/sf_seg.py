@@ -178,11 +178,12 @@ class sf_seg(nn.Module):
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
-    def extract_features(self, x: torch.Tensor):
+    def extract_features(self, x: torch.Tensor, full_res: bool = True):
         """Run full pipeline up to pre_masks. Returns (features, attn_l).
 
-        features : (B, C//2, H, W)  — input to self.masks, used for pretraining
-        attn_l   : (B, C,   H/2, W/2) — large-head attention maps
+        full_res=True  : features (B, C//2, H, W)   — used during segmentation forward
+        full_res=False : features (B, C//2, H/2,W/2) — used for pretraining (no upsample,
+                         saves 4× memory; ClsHead uses GAP so size doesn't matter)
         """
         H, W = x.shape[2], x.shape[3]
         x_small  = F.interpolate(x, size=(max(H // 16, 2), max(W // 16, 2)),
@@ -207,6 +208,9 @@ class sf_seg(nn.Module):
             d_lg = self.fuse_med_lg(fused)
         else:
             d_lg = self._refine(F.relu(self._routing(self._dw(fused))))
+
+        if not full_res:
+            return d_lg, attn_l   # (B, C//2, H/2, W/2) — skip upsample
 
         d_up = self.pre_masks(
             F.interpolate(d_lg, size=(H, W), mode='bilinear', align_corners=False))
