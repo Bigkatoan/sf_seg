@@ -1,8 +1,8 @@
 {
   "data_root": "data",
   "epochs": 200,
-  "batch_size": 32,
-  "lr": 0.0001,
+  "batch_size": 16,
+  "lr": 0.001,
   "num_workers": 8,
   "log_dir": "logs",
   "output_dir": "outputs",
@@ -15,9 +15,9 @@
   "diversity_weight": 0.1,
   "num_classes": 151,
   "absent_weight": 0.2,
-  "attn_guide_weight": 0.5,
-  "attn_exclusive_weight": 0.3,
+  "attn_guide_weight": 0.0,
+  "attn_exclusive_weight": 0.0,
   "decoder_type": "dense",
   "class_diverse": true,
-  "resume": true
+  "resume": false
 }
