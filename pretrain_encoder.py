@@ -95,21 +95,59 @@ def train(args):
     ])
 
     data_root = Path(args.data).expanduser()
-    train_dir = data_root / 'train'
-    val_dir   = data_root / 'val'
-    if not train_dir.exists():
-        train_dir = data_root
-
-    train_ds = ImageFolder(str(train_dir), transform=train_tf)
-    val_ds   = ImageFolder(str(val_dir), transform=val_tf) if val_dir.exists() else None
-    num_classes = args.num_classes or len(train_ds.classes)
+    wds_train = sorted(data_root.glob('train-*.tar'))
+    wds_val   = sorted(data_root.glob('val-*.tar'))
 
     kw = dict(num_workers=args.num_workers, pin_memory=device.type == 'cuda',
               persistent_workers=args.num_workers > 0,
-              prefetch_factor=2 if args.num_workers > 0 else None)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  **kw)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, **kw) \
-                   if val_ds else None
+              prefetch_factor=4 if args.num_workers > 0 else None)
+
+    if wds_train:
+        # ── WebDataset (fast sequential reads) ────────────────────────────────
+        import webdataset as wds
+        import json as _json
+
+        cls_file    = data_root / 'classes.json'
+        num_classes = args.num_classes or (
+            len(_json.load(open(cls_file))) if cls_file.exists() else 1000)
+
+        def make_wds(tar_list, transform, shuffle_buf=5000):
+            return (
+                wds.WebDataset([str(p) for p in tar_list],
+                               resampled=False, shardshuffle=True)
+                .shuffle(shuffle_buf)
+                .decode('pil')
+                .to_tuple('jpg', 'cls')
+                .map_tuple(transform, lambda c: int(c))
+                .batched(args.batch_size, partial=False)
+            )
+
+        train_ds     = make_wds(wds_train, train_tf)
+        train_loader = DataLoader(train_ds, batch_size=None, **kw)
+        n_train      = sum(1 for _ in wds.WebDataset(
+                           [str(p) for p in wds_train]).decode())  \
+                       if args.epoch_size == 0 else args.epoch_size
+        val_ds = make_wds(wds_val, val_tf, shuffle_buf=0) if wds_val else None
+        val_loader = DataLoader(val_ds, batch_size=None, **kw) if val_ds else None
+
+        logging.info(f"WebDataset: {len(wds_train)} train shards  "
+                     f"{len(wds_val)} val shards  |  {num_classes} classes")
+    else:
+        # ── ImageFolder fallback ───────────────────────────────────────────────
+        train_dir = data_root / 'train'
+        val_dir   = data_root / 'val'
+        if not train_dir.exists():
+            train_dir = data_root
+        train_ds    = ImageFolder(str(train_dir), transform=train_tf)
+        val_ds      = ImageFolder(str(val_dir), transform=val_tf) \
+                      if (data_root / 'val').exists() else None
+        num_classes = args.num_classes or len(train_ds.classes)
+        n_train     = len(train_ds)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True, **kw)
+        val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
+                                  shuffle=False, **kw) if val_ds else None
+        logging.info(f"ImageFolder: {n_train} train  |  {num_classes} classes")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     backbone = sf_seg(num_channels=args.num_channels,
@@ -160,7 +198,8 @@ def train(args):
         model.train()
         tot_loss = correct = seen = 0
         t0  = time.time()
-        bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
+        bar = tqdm(train_loader, total=n_train // args.batch_size,
+                   desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for imgs, labels in bar:
             imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             with autocast('cuda', enabled=device.type == 'cuda'):
@@ -245,7 +284,9 @@ def main():
     p.add_argument('--image-size',     type=int, default=128,
                    help='Training crop size — match sf_seg image_size (default: 128)')
     p.add_argument('--epochs',         type=int, default=50)
-    p.add_argument('--batch-size',     type=int, default=256)
+    p.add_argument('--batch-size',     type=int, default=512)
+    p.add_argument('--epoch-size',     type=int, default=1281167,
+                   help='Images per epoch for WebDataset (default: 1281167 = full ImageNet train)')
     p.add_argument('--lr',             type=float, default=1e-3)
     p.add_argument('--gamma',          type=float, default=2.0)
     p.add_argument('--num-workers',    type=int, default=8)
