@@ -62,27 +62,36 @@ class SegmentationDataset(Dataset):
         img  = Image.open(img_p).convert('RGB')
         mask = Image.open(mask_p).convert('L')
         sz   = self.image_size
-        img  = img.resize((sz, sz), Image.BILINEAR)
-        mask = mask.resize((sz, sz), Image.NEAREST)
 
         if self.augment:
+            # RandomResizedCrop: scale 50-100%, aspect 3/4-4/3 — identical crop on img & mask
+            w, h = img.size
+            scale  = random.uniform(0.5, 1.0)
+            ratio  = random.uniform(0.75, 1.333)
+            crop_h = max(1, int(h * scale))
+            crop_w = max(1, int(crop_h * ratio))
+            crop_w = min(crop_w, w)
+            crop_h = min(crop_h, h)
+            top    = random.randint(0, max(0, h - crop_h))
+            left   = random.randint(0, max(0, w - crop_w))
+            img    = TF.resized_crop(img,  top, left, crop_h, crop_w, (sz, sz),
+                                     interpolation=TF.InterpolationMode.BILINEAR)
+            mask   = TF.resized_crop(mask, top, left, crop_h, crop_w, (sz, sz),
+                                     interpolation=TF.InterpolationMode.NEAREST)
+
             if random.random() > 0.5:
                 img, mask = TF.hflip(img), TF.hflip(mask)
-            if random.random() > 0.5:
-                angle = random.uniform(-15.0, 15.0)
-                img  = TF.rotate(img,  angle, interpolation=TF.InterpolationMode.BILINEAR, fill=0)
-                mask = TF.rotate(mask, angle, interpolation=TF.InterpolationMode.NEAREST,  fill=0)
-            if random.random() > 0.5:
-                d = int(sz * 0.1)
-                tx, ty = random.randint(-d, d), random.randint(-d, d)
-                img  = TF.affine(img,  0, [tx, ty], 1.0, 0, TF.InterpolationMode.BILINEAR, fill=0)
-                mask = TF.affine(mask, 0, [tx, ty], 1.0, 0, TF.InterpolationMode.NEAREST,  fill=0)
+
+            # Color jitter (image only — no label noise)
             if random.random() > 0.5:
                 img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
             if random.random() > 0.5:
                 img = TF.adjust_contrast(img,   random.uniform(0.7, 1.3))
             if random.random() > 0.5:
                 img = TF.adjust_saturation(img, random.uniform(0.8, 1.2))
+        else:
+            img  = img.resize((sz, sz),  Image.BILINEAR)
+            mask = mask.resize((sz, sz), Image.NEAREST)
 
         img_t  = TF.to_tensor(img)
         if self.num_classes > 1:
