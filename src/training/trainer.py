@@ -71,12 +71,12 @@ class SegmentationDataset(Dataset):
 
             # Gaussian noise (sigma tunable via noise_aug.py)
             if random.random() > 0.5:
-                sigma = random.uniform(0.01, 0.05)
+                sigma = random.uniform(0.01, 0.04)
                 img_t = (img_t + torch.randn_like(img_t) * sigma).clamp(0.0, 1.0)
 
             # Brightness / contrast (image-only, no label noise)
             if random.random() > 0.5:
-                img_t = (img_t * random.uniform(0.75, 1.25)).clamp(0.0, 1.0)
+                img_t = (img_t * random.uniform(0.80, 1.20)).clamp(0.0, 1.0)
             if random.random() > 0.5:
                 mean  = img_t.mean()
                 img_t = ((img_t - mean) * random.uniform(0.8, 1.2) + mean).clamp(0.0, 1.0)
