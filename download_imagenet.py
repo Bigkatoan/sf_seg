@@ -23,11 +23,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from PIL import Image
 from tqdm import tqdm
 
 HF_REPO   = 'ILSVRC/imagenet-1k'
@@ -74,61 +76,76 @@ def _save_one(task):
 
 def phase2_convert(cache_dir: Path, out_root: Path,
                    split: str, workers: int, batch_size: int = 500):
-    import datasets
+    import pyarrow.parquet as pq
+
+    # Load class names from dataset_info.json
+    info_path = cache_dir / 'dataset_info.json'
+    if info_path.exists():
+        info = json.load(open(info_path))
+        class_names = info['features']['label']['names']
+    else:
+        # Fallback: read from first parquet file
+        shards = sorted(cache_dir.glob(f'data/{split}-*.parquet'))
+        schema = pq.read_schema(shards[0])
+        raise RuntimeError("dataset_info.json not found — cannot get class names")
 
     checkpoint_path = out_root / f'.done_{split}.json'
-    done: set[int] = set()
+    done_shards: set[str] = set()
     if checkpoint_path.exists():
-        done = set(json.load(open(checkpoint_path)))
-        print(f"   resuming {split}: {len(done)} samples already saved")
+        done_shards = set(json.load(open(checkpoint_path)))
 
-    print(f"\n── Phase 2: converting {split} → {out_root / split}")
-    ds = datasets.load_dataset(
-        str(cache_dir),
-        split=split,
-        trust_remote_code=True,
-    )
-
-    class_names: list[str] = ds.features['label'].names   # synset IDs
+    shards    = sorted(cache_dir.glob(f'data/{split}-*.parquet'))
     split_dir = out_root / split
-    total     = len(ds)
-    skipped   = len(done)
-    newly     = 0
+    total_saved = 0
 
-    bar   = tqdm(total=total, initial=skipped, desc=split, unit='img')
-    batch = []
+    print(f"\n── Phase 2: converting {split} ({len(shards)} shards) → {split_dir}")
 
-    def flush(batch):
-        nonlocal newly
+    for shard_path in shards:
+        shard_name = shard_path.name
+        if shard_name in done_shards:
+            print(f"   skip  {shard_name} (already done)")
+            continue
+
+        table  = pq.read_table(shard_path, columns=['image', 'label'])
+        n      = len(table)
+        images = table['image'].to_pylist()
+        labels = table['label'].to_pylist()
+
+        batch = []
+        for row_i, (img_data, label_int) in enumerate(zip(images, labels)):
+            label_id = class_names[label_int]
+            fname    = f"{shard_name[:-8]}_{row_i:06d}.JPEG"   # strip .parquet
+            out_dir  = split_dir / label_id
+
+            # img_data may be bytes or dict {'bytes': ..., 'path': ...}
+            raw = img_data if isinstance(img_data, bytes) else img_data.get('bytes', b'')
+            try:
+                img = Image.open(io.BytesIO(raw))
+            except Exception:
+                continue
+            batch.append((row_i, img, label_id, out_dir, fname))
+
+        # Save batch with thread pool
+        newly = 0
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_save_one, t): t[0] for t in batch}
-            for f in as_completed(futs):
-                idx, was_done = f.result()
-                done.add(idx)
+            bar  = tqdm(as_completed(futs), total=n,
+                        desc=f"  {shard_name}", unit='img', leave=False)
+            for f in bar:
+                _, was_done = f.result()
                 if not was_done:
                     newly += 1
-                bar.update(1)
-        # Checkpoint after each batch
+
+        total_saved += newly
+
+        # Mark shard done and delete parquet to free space
+        done_shards.add(shard_name)
         with open(checkpoint_path, 'w') as fp:
-            json.dump(sorted(done), fp)
-        batch.clear()
+            json.dump(sorted(done_shards), fp)
 
-    for i, item in enumerate(ds):
-        if i in done:
-            continue
-        label_id = class_names[item['label']]
-        fname    = f"{split}_{i:08d}.JPEG"
-        out_dir  = split_dir / label_id
-        batch.append((i, item['image'], label_id, out_dir, fname))
-
-        if len(batch) >= batch_size:
-            flush(batch)
-
-    if batch:
-        flush(batch)
-
-    bar.close()
-    print(f"   {split}: {newly} new images saved  ({len(done)}/{total} total)")
+        shard_size_mb = shard_path.stat().st_size / 1024**2
+        shard_path.unlink()
+        print(f"   done  {shard_name}  ({newly}/{n} imgs)  deleted {shard_size_mb:.0f} MB")
 
     # Write class list for reference
     class_map = {name: idx for idx, name in enumerate(class_names)}
