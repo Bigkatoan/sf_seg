@@ -63,35 +63,29 @@ class SegmentationDataset(Dataset):
         mask = Image.open(mask_p).convert('L')
         sz   = self.image_size
 
+        img  = img.resize((sz, sz),  Image.BILINEAR)
+        mask = mask.resize((sz, sz), Image.NEAREST)
+
         if self.augment:
-            # RandomResizedCrop: scale 50-100%, aspect 3/4-4/3 — identical crop on img & mask
-            w, h = img.size
-            scale  = random.uniform(0.5, 1.0)
-            ratio  = random.uniform(0.75, 1.333)
-            crop_h = max(1, int(h * scale))
-            crop_w = max(1, int(crop_h * ratio))
-            crop_w = min(crop_w, w)
-            crop_h = min(crop_h, h)
-            top    = random.randint(0, max(0, h - crop_h))
-            left   = random.randint(0, max(0, w - crop_w))
-            img    = TF.resized_crop(img,  top, left, crop_h, crop_w, (sz, sz),
-                                     interpolation=TF.InterpolationMode.BILINEAR)
-            mask   = TF.resized_crop(mask, top, left, crop_h, crop_w, (sz, sz),
-                                     interpolation=TF.InterpolationMode.NEAREST)
+            img_t = TF.to_tensor(img).float()          # (3, H, W) in [0, 1]
 
+            # Gaussian noise (sigma tunable via noise_aug.py)
             if random.random() > 0.5:
-                img, mask = TF.hflip(img), TF.hflip(mask)
+                sigma = random.uniform(0.01, 0.05)
+                img_t = (img_t + torch.randn_like(img_t) * sigma).clamp(0.0, 1.0)
 
-            # Color jitter (image only — no label noise)
+            # Brightness / contrast (image-only, no label noise)
             if random.random() > 0.5:
-                img = TF.adjust_brightness(img, random.uniform(0.7, 1.3))
+                img_t = (img_t * random.uniform(0.75, 1.25)).clamp(0.0, 1.0)
             if random.random() > 0.5:
-                img = TF.adjust_contrast(img,   random.uniform(0.7, 1.3))
-            if random.random() > 0.5:
-                img = TF.adjust_saturation(img, random.uniform(0.8, 1.2))
-        else:
-            img  = img.resize((sz, sz),  Image.BILINEAR)
-            mask = mask.resize((sz, sz), Image.NEAREST)
+                mean  = img_t.mean()
+                img_t = ((img_t - mean) * random.uniform(0.8, 1.2) + mean).clamp(0.0, 1.0)
+
+            if self.num_classes > 1:
+                mask_t = torch.from_numpy(np.array(mask)).long()
+            else:
+                mask_t = (TF.to_tensor(mask) > 0.5).float()
+            return img_t, mask_t
 
         img_t  = TF.to_tensor(img)
         if self.num_classes > 1:
