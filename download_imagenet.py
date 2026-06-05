@@ -74,20 +74,47 @@ def _save_one(task):
     return i, False             # newly saved
 
 
+def _load_class_names(cache_dir: Path) -> list[str]:
+    """Return list of 1000 synset IDs ordered by label int.
+
+    Tries, in order:
+      1. classes.py  (ILSVRC/imagenet-1k has this)
+      2. dataset_info.json
+      3. label column dictionary in first parquet shard
+    """
+    import importlib.util
+
+    classes_py = cache_dir / 'classes.py'
+    if classes_py.exists():
+        spec = importlib.util.spec_from_file_location('_imagenet_classes', classes_py)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return list(mod.IMAGENET2012_CLASSES.keys())
+
+    info_path = cache_dir / 'dataset_info.json'
+    if info_path.exists():
+        info = json.load(open(info_path))
+        return info['features']['label']['names']
+
+    # Last resort: read dictionary encoding from parquet metadata
+    import pyarrow.parquet as pq
+    shards = sorted(cache_dir.glob('data/train-*.parquet')) or \
+             sorted(cache_dir.glob('data/val-*.parquet'))
+    if not shards:
+        raise RuntimeError("No parquet shards found — run without --skip-download first")
+    schema = pq.read_schema(shards[0])
+    label_field = schema.field('label')
+    if hasattr(label_field.type, 'dictionary'):
+        return label_field.type.dictionary.to_pylist()
+    raise RuntimeError("Cannot determine class names from cache")
+
+
 def phase2_convert(cache_dir: Path, out_root: Path,
                    split: str, workers: int, batch_size: int = 500):
     import pyarrow.parquet as pq
 
-    # Load class names from dataset_info.json
-    info_path = cache_dir / 'dataset_info.json'
-    if info_path.exists():
-        info = json.load(open(info_path))
-        class_names = info['features']['label']['names']
-    else:
-        # Fallback: read from first parquet file
-        shards = sorted(cache_dir.glob(f'data/{split}-*.parquet'))
-        schema = pq.read_schema(shards[0])
-        raise RuntimeError("dataset_info.json not found — cannot get class names")
+    # Load class names (synset IDs ordered by label int)
+    class_names = _load_class_names(cache_dir)
 
     checkpoint_path = out_root / f'.done_{split}.json'
     done_shards: set[str] = set()
