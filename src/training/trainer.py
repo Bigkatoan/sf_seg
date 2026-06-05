@@ -204,7 +204,7 @@ def save_val_sample(model, dataset, device, out_dir, epoch, cat_names=None):
         smooth  = F.avg_pool2d(logits, kernel_size=5, stride=1, padding=2)
         probs   = torch.softmax(smooth[0], dim=0)
         conf, pred_idx = probs.max(dim=0)
-        pred_idx[conf < 0.4] = 0
+        pred_idx[conf < 0.1] = 0
 
         pal        = _make_palette(model.num_classes)
         gt_pil     = Image.fromarray(pal[mask_t.numpy().astype(np.int32)])
