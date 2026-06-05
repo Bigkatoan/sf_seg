@@ -1,41 +1,20 @@
-"""pretrain_encoder.py — Pretrain the attention_head encoder on an image classification task.
+"""pretrain_encoder.py — Pretrain the full sf_seg backbone on ImageNet classification.
 
-The encoder (enc1 + enc2) from attention_head is extracted, a classification
-head is attached, and the whole thing is trained with focal CE on any
-ImageFolder-compatible dataset (ImageNet, Places365, iNaturalist, etc.).
+Architecture:
+    sf_seg.extract_features(x)         →  (B, C//2, H, W)   [backbone — will be kept]
+        ↓
+    CNN reduction + GAP + MLP          →  (B, num_classes)   [cls head — discarded after]
 
-After pretraining, only the encoder weights are saved. Load them into sf_seg
-via the --encoder-pretrained argument to trainer.py.
+After training, the backbone state dict (everything except self.masks) is saved.
+Load into sf_seg via --encoder-pretrained / "encoder_pretrained" in config.json.
 
 Usage:
-    # ImageNet (folder structure: train/classname/img.jpg)
-    python pretrain_encoder.py --data /path/to/imagenet --num-classes 1000
-
-    # Any ImageFolder dataset
-    python pretrain_encoder.py --data /path/to/dataset --num-classes 100 --epochs 30
-
-    # Resume
-    python pretrain_encoder.py --data /path/to/imagenet --resume checkpoints/enc_last.pt
-
-Output:
-    checkpoints/enc_best.pt  — best val-acc encoder weights
-    checkpoints/enc_last.pt  — latest checkpoint (for resume)
-
-The saved file contains:
-    {
-        "enc1": state_dict,    # Conv(3→C, 3×3, stride=2) + ReLU
-        "enc2": state_dict,    # Conv(C→2C, 3×3)
-        "num_channels": C,
-        "epoch": N,
-        "val_acc": float,
-    }
-Load into sf_seg with:
-    model = sf_seg(num_channels=128, ..., encoder_pretrained="checkpoints/enc_best.pt")
+    python pretrain_encoder.py --data ~/data/imagenet --num-classes 1000
+    python pretrain_encoder.py --data ~/data/imagenet --resume checkpoints/enc_last.pt
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import time
 from pathlib import Path
@@ -49,42 +28,46 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
+from src.models.sf_seg import sf_seg
 
-# ── Encoder (same as attention_head's enc1 + enc2) ────────────────────────────
 
-class Encoder(nn.Module):
-    def __init__(self, num_channels: int = 128):
+# ── Classification head (discarded after pretraining) ─────────────────────────
+
+class ClsHead(nn.Module):
+    """Small CNN + MLP attached to sf_seg.extract_features output (B, C//2, H, W)."""
+
+    def __init__(self, in_channels: int, num_classes: int):
         super().__init__()
-        C = num_channels
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(3, C, 3, padding=1, stride=2),
-            nn.ReLU(inplace=True),
+        C = in_channels
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C, C, 3, stride=2, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(C, C, 3, stride=2, padding=1), nn.ReLU(inplace=True),
         )
-        self.enc2 = nn.Conv2d(C, C * 2, 3, padding=1)
-
-    def forward(self, x):
-        return self.enc2(self.enc1(x))   # (B, 2C, H/2, W/2)
-
-
-class EncoderClassifier(nn.Module):
-    def __init__(self, num_channels: int = 128, num_classes: int = 1000):
-        super().__init__()
-        self.encoder = Encoder(num_channels)
-        C = num_channels
-        self.head = nn.Sequential(
-            nn.ReLU(inplace=True),
+        self.mlp = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(C * 2, C),
+            nn.Linear(C, C),
             nn.ReLU(inplace=True),
             nn.Linear(C, num_classes),
         )
 
     def forward(self, x):
-        return self.head(self.encoder(x))
+        return self.mlp(self.cnn(x))
 
 
-# ── Focal CE loss ──────────────────────────────────────────────────────────────
+class SfSegClassifier(nn.Module):
+    def __init__(self, backbone: sf_seg, num_classes: int):
+        super().__init__()
+        self.backbone = backbone
+        C_out = backbone.pre_masks[0].out_channels   # C//2
+        self.head = ClsHead(C_out, num_classes)
+
+    def forward(self, x):
+        features, _ = self.backbone.extract_features(x)
+        return self.head(features)
+
+
+# ── Loss ──────────────────────────────────────────────────────────────────────
 
 def focal_ce(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0):
     ce = F.cross_entropy(logits, target, reduction='none')
@@ -92,13 +75,13 @@ def focal_ce(logits: torch.Tensor, target: torch.Tensor, gamma: float = 2.0):
     return ((1 - pt) ** gamma * ce).mean()
 
 
-# ── Training loop ──────────────────────────────────────────────────────────────
+# ── Training ──────────────────────────────────────────────────────────────────
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    sz = args.image_size
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    sz = args.image_size
     train_tf = T.Compose([
         T.RandomResizedCrop(sz, scale=(0.4, 1.0)),
         T.RandomHorizontalFlip(),
@@ -111,14 +94,14 @@ def train(args):
         T.ToTensor(),
     ])
 
-    train_dir = Path(args.data) / 'train'
-    val_dir   = Path(args.data) / 'val'
+    data_root = Path(args.data).expanduser()
+    train_dir = data_root / 'train'
+    val_dir   = data_root / 'val'
     if not train_dir.exists():
-        train_dir = Path(args.data)           # flat ImageFolder at root
-        val_dir   = None
+        train_dir = data_root
 
     train_ds = ImageFolder(str(train_dir), transform=train_tf)
-    val_ds   = ImageFolder(str(val_dir),   transform=val_tf) if (val_dir and val_dir.exists()) else None
+    val_ds   = ImageFolder(str(val_dir), transform=val_tf) if val_dir.exists() else None
     num_classes = args.num_classes or len(train_ds.classes)
 
     kw = dict(num_workers=args.num_workers, pin_memory=device.type == 'cuda',
@@ -128,17 +111,20 @@ def train(args):
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, **kw) \
                    if val_ds else None
 
-    logging.info(f"Dataset: {len(train_ds)} train  "
-                 f"{'/ ' + str(len(val_ds)) + ' val' if val_ds else '(no val split)'}  "
-                 f"| {num_classes} classes  |  device={device}")
-
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = EncoderClassifier(num_channels=args.num_channels,
-                              num_classes=num_classes).to(device)
-    total = sum(p.numel() for p in model.parameters())
-    enc   = sum(p.numel() for p in model.encoder.parameters())
-    logging.info(f"Params: total={total:,}  encoder={enc:,}  head={total-enc:,}")
+    backbone = sf_seg(num_channels=args.num_channels,
+                      focus_size=args.focus_size,
+                      num_classes=1)          # num_classes=1 dummy — masks layer unused
+    model = SfSegClassifier(backbone, num_classes).to(device)
 
+    backbone_params = sum(p.numel() for p in backbone.parameters())
+    head_params     = sum(p.numel() for p in model.head.parameters())
+    logging.info(f"Backbone params: {backbone_params:,}  |  "
+                 f"Cls head params: {head_params:,}  |  device={device}")
+    if device.type == 'cuda':
+        logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # ── Optimiser ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     warmup_ep = min(5, args.epochs // 10)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -146,15 +132,16 @@ def train(args):
         schedulers=[
             torch.optim.lr_scheduler.LinearLR(optimizer, 0.1, 1.0, warmup_ep),
             torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.01),
+                optimizer, T_max=max(1, args.epochs - warmup_ep),
+                eta_min=args.lr * 0.01),
         ],
         milestones=[warmup_ep])
-    scaler = GradScaler('cuda', enabled=device.type == 'cuda')
-
+    scaler   = GradScaler('cuda', enabled=device.type == 'cuda')
     ckpt_dir = Path(args.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_acc  = 0.0
-    start_ep  = 1
+
+    best_acc = 0.0
+    start_ep = 1
 
     # ── Resume ────────────────────────────────────────────────────────────────
     if args.resume:
@@ -171,8 +158,8 @@ def train(args):
     # ── Epoch loop ────────────────────────────────────────────────────────────
     for epoch in range(start_ep, args.epochs + 1):
         model.train()
-        total_loss = correct = seen = 0
-        t0 = time.time()
+        tot_loss = correct = seen = 0
+        t0  = time.time()
         bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for imgs, labels in bar:
             imgs, labels = imgs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -187,15 +174,14 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
 
-            b = imgs.size(0)
-            correct     += (logits.argmax(1) == labels).sum().item()
-            total_loss  += loss.item() * b
-            seen        += b
+            b        = imgs.size(0)
+            correct  += (logits.argmax(1) == labels).sum().item()
+            tot_loss += loss.item() * b
+            seen     += b
             bar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{correct/seen:.4f}")
 
-        train_acc  = correct / seen
-        train_loss = total_loss / seen
-        elapsed    = time.time() - t0
+        train_acc = correct / seen
+        elapsed   = time.time() - t0
 
         # ── Val ───────────────────────────────────────────────────────────────
         val_acc = 0.0
@@ -213,33 +199,34 @@ def train(args):
 
         lr = scheduler.get_last_lr()[0]
         scheduler.step()
-
         logging.info(
             f"Epoch {epoch}/{args.epochs}  lr={lr:.2e}  "
-            f"train loss={train_loss:.4f} acc={train_acc:.4f}  "
+            f"train loss={tot_loss/seen:.4f} acc={train_acc:.4f}  "
             f"val acc={val_acc:.4f}  ({elapsed:.0f}s)")
 
-        # ── Save ──────────────────────────────────────────────────────────────
-        enc_state = {
-            'enc1': model.encoder.enc1.state_dict(),
-            'enc2': model.encoder.enc2.state_dict(),
-            'num_channels': args.num_channels,
-            'epoch': epoch,
-            'val_acc': val_acc,
+        # ── Save backbone (masks layer excluded) ──────────────────────────────
+        backbone_sd = {k: v for k, v in backbone.state_dict().items()
+                       if not k.startswith('masks.')}
+        enc_ckpt = {
+            'backbone':      backbone_sd,
+            'num_channels':  args.num_channels,
+            'focus_size':    args.focus_size,
+            'epoch':         epoch,
+            'val_acc':       val_acc,
         }
-        full_ckpt = dict(
-            **enc_state,
-            model_state_dict=model.state_dict(),
-            optimizer_state_dict=optimizer.state_dict(),
-            scheduler_state_dict=scheduler.state_dict(),
-            best_val_acc=best_acc,
-        )
+        full_ckpt = {
+            **enc_ckpt,
+            'model_state_dict':     model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_acc':         best_acc,
+        }
         torch.save(full_ckpt, ckpt_dir / 'enc_last.pt')
 
         if val_acc > best_acc or (not val_loader and epoch == args.epochs):
             best_acc = val_acc
-            torch.save(enc_state, ckpt_dir / 'enc_best.pt')
-            logging.info(f"  → new best encoder saved (val_acc={val_acc:.4f})")
+            torch.save(enc_ckpt, ckpt_dir / 'enc_best.pt')
+            logging.info(f"  → best backbone saved  val_acc={val_acc:.4f}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -247,33 +234,31 @@ def train(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--data',            required=True,
-                   help='Root of ImageFolder dataset (must have train/ subdir or be flat)')
-    p.add_argument('--num-classes',     type=int, default=None,
-                   help='Override number of classes (default: inferred from folder names)')
-    p.add_argument('--num-channels',    type=int, default=128,
-                   help='Must match num_channels in sf_seg config (default: 128)')
-    p.add_argument('--epochs',          type=int, default=50)
-    p.add_argument('--batch-size',      type=int, default=256)
-    p.add_argument('--lr',              type=float, default=1e-3)
-    p.add_argument('--gamma',           type=float, default=2.0,
-                   help='Focal loss gamma (default: 2.0)')
-    p.add_argument('--image-size',      type=int, default=128,
+    p.add_argument('--data',           required=True,
+                   help='ImageFolder root (must contain train/ subdir or be flat)')
+    p.add_argument('--num-classes',    type=int, default=None,
+                   help='Override num classes (default: inferred from folder count)')
+    p.add_argument('--num-channels',   type=int, default=128,
+                   help='Must match num_channels in config.json (default: 128)')
+    p.add_argument('--focus-size',     type=int, default=32,
+                   help='Must match focus_size in config.json (default: 32)')
+    p.add_argument('--image-size',     type=int, default=128,
                    help='Training crop size — match sf_seg image_size (default: 128)')
-    p.add_argument('--num-workers',     type=int, default=8)
-    p.add_argument('--checkpoint-dir',  default='checkpoints')
-    p.add_argument('--resume',          default=None,
-                   help='Path to enc_last.pt to resume')
-    p.add_argument('--cpu',             action='store_true')
+    p.add_argument('--epochs',         type=int, default=50)
+    p.add_argument('--batch-size',     type=int, default=256)
+    p.add_argument('--lr',             type=float, default=1e-3)
+    p.add_argument('--gamma',          type=float, default=2.0)
+    p.add_argument('--num-workers',    type=int, default=8)
+    p.add_argument('--checkpoint-dir', default='checkpoints')
+    p.add_argument('--resume',         default=None)
+    p.add_argument('--cpu',            action='store_true')
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(message)s',
-                        datefmt='%H:%M:%S',
-                        handlers=[
-                            logging.StreamHandler(),
-                            logging.FileHandler('checkpoints/pretrain.log'),
-                        ])
+                        format='%(asctime)s %(message)s', datefmt='%H:%M:%S',
+                        handlers=[logging.StreamHandler(),
+                                  logging.FileHandler(
+                                      Path(args.checkpoint_dir) / 'pretrain.log')])
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     train(args)
 

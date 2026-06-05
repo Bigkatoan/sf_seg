@@ -178,26 +178,26 @@ class sf_seg(nn.Module):
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor):
-        H, W = x.shape[2], x.shape[3]
+    def extract_features(self, x: torch.Tensor):
+        """Run full pipeline up to pre_masks. Returns (features, attn_l).
 
-        # Resize to three scales
+        features : (B, C//2, H, W)  — input to self.masks, used for pretraining
+        attn_l   : (B, C,   H/2, W/2) — large-head attention maps
+        """
+        H, W = x.shape[2], x.shape[3]
         x_small  = F.interpolate(x, size=(max(H // 16, 2), max(W // 16, 2)),
                                   mode='bilinear', align_corners=False)
         x_medium = F.interpolate(x, size=(H // 4, W // 4),
                                   mode='bilinear', align_corners=False)
 
-        # Attention at each scale (independent)
-        a_small,  _      = self.head_small(x_small)           # (B, C, H/32, W/32)
-        a_medium, _      = self.head_medium(x_medium)         # (B, C, H/8,  W/8)
-        a_large,  attn_l = self.head_large(x)                 # (B, C, H/2,  W/2)
+        a_small,  _      = self.head_small(x_small)
+        a_medium, _      = self.head_medium(x_medium)
+        a_large,  attn_l = self.head_large(x)
 
-        # Decoder: bottom-up
         a_s_up = self.blend_up_sm(
             F.interpolate(a_small, size=a_medium.shape[2:],
                           mode='bilinear', align_corners=False))
         d_med  = self.fuse_sm_med(torch.cat([a_s_up, a_medium], dim=1))
-
         d_m_up = self.blend_up_med(
             F.interpolate(d_med, size=a_large.shape[2:],
                           mode='bilinear', align_corners=False))
@@ -208,9 +208,14 @@ class sf_seg(nn.Module):
         else:
             d_lg = self._refine(F.relu(self._routing(self._dw(fused))))
 
-        d_up   = self.pre_masks(
+        d_up = self.pre_masks(
             F.interpolate(d_lg, size=(H, W), mode='bilinear', align_corners=False))
-        logits = self.masks(d_up)
+        return d_up, attn_l
+
+    def forward(self, x: torch.Tensor):
+        H, W    = x.shape[2], x.shape[3]
+        d_up, attn_l = self.extract_features(x)
+        logits  = self.masks(d_up)
 
         attn_guide = attn_l.amax(dim=1, keepdim=True)
         attn_guide = F.interpolate(attn_guide, size=(H, W),
@@ -223,13 +228,24 @@ class sf_seg(nn.Module):
         C    = self.head_large.enc1[0].out_channels
         if nc and nc != C:
             raise ValueError(
-                f"Pretrained encoder num_channels={nc} != model num_channels={C}")
-        for head in (self.head_small, self.head_medium, self.head_large):
-            head.enc1.load_state_dict(ckpt['enc1'])
-            head.enc2.load_state_dict(ckpt['enc2'])
+                f"Pretrained num_channels={nc} != model num_channels={C}")
+
+        backbone_sd = ckpt.get('backbone')
+        if backbone_sd is not None:
+            # Full backbone checkpoint (from pretrain_encoder.py v2)
+            missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
+            missing = [k for k in missing if not k.startswith('masks.')]
+            if missing:
+                print(f"[warn] missing keys: {missing}")
+        else:
+            # Legacy: only enc1/enc2 per head
+            for head in (self.head_small, self.head_medium, self.head_large):
+                head.enc1.load_state_dict(ckpt['enc1'])
+                head.enc2.load_state_dict(ckpt['enc2'])
+
         epoch = ckpt.get('epoch', '?')
         acc   = ckpt.get('val_acc', 0.0)
-        print(f"Loaded pretrained encoder from {path}  (epoch={epoch}, val_acc={acc:.4f})")
+        print(f"Loaded pretrained backbone from {path}  (epoch={epoch}, val_acc={acc:.4f})")
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
