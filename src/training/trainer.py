@@ -161,10 +161,10 @@ def seg_loss(logits, masks, loss_type, criterion, num_classes,
             return pure_focal_iou_loss(logits, masks, absent_weight=absent_weight)
         if loss_type == "focal_iou":
             return focal_iou_loss(logits, masks,
-                                  class_weights=class_weights,
+                                  class_weights=None,
                                   no_obj_weight=no_obj_weight)
         if loss_type == "focal":
-            return focal_loss(logits, masks, weight=class_weights)
+            return focal_loss(logits, masks, weight=None)
         if loss_type == "ce_iou":
             return ce_iou_loss(logits, masks,
                                class_weights=class_weights,
@@ -308,7 +308,7 @@ def train(args):
         cat_names = json.load(open(cat_map)).get("idx_to_name", {})
 
     class_weights = None
-    if num_classes > 1:
+    if num_classes > 1 and args.loss_type not in ("focal", "focal_iou", "pure_focal_iou"):
         class_weights = compute_class_weights(
             data_root / 'masks' / 'train', num_classes,
             cache_path=data_root / 'class_freq.json').to(device)
