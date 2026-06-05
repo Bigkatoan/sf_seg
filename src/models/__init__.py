@@ -1,4 +1,5 @@
 """Model architectures."""
-from .sf_seg import sf_seg, attention_head
+from . import sf_seg
+from . import sf_seg_r18
 
-__all__ = ["sf_seg", "attention_head"]
+__all__ = ["sf_seg", "sf_seg_r18"]

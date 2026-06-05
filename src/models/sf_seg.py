@@ -3,16 +3,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _gn(C: int) -> nn.GroupNorm:
+    for g in [8, 4, 2, 1]:
+        if C % g == 0:
+            return nn.GroupNorm(g, C)
+
+
+# ── ResNet-style basic block ──────────────────────────────────────────────────
+
+class BasicBlock(nn.Module):
+    """
+    ResNet BasicBlock: Conv-GN-GELU → Conv-GN + residual shortcut.
+
+    stride=2  : downsample spatially, shortcut uses 1×1 projection.
+    in_c != out_c : shortcut uses 1×1 projection to match channels.
+    """
+    def __init__(self, in_c: int, out_c: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, stride=stride, padding=1, bias=False),
+            _gn(out_c),
+            nn.GELU(),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
+            _gn(out_c),
+        )
+        need_proj = (stride != 1 or in_c != out_c)
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_c, out_c, 1, stride=stride, bias=False),
+            _gn(out_c),
+        ) if need_proj else nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.shortcut(x) + self.conv2(self.conv1(x)))
+
+
 # ── Sparse attention (clamped softmax) ───────────────────────────────────────
 
 def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
-    """
-    Budget-constrained softmax: each value in [0,1], sum = k per channel.
-
-    Closed-form solution via Lagrangian duality.
-    Only topk(k) needed instead of full sort: O(k log k) vs O(L log L).
-    All CUDA ops, no Python loop.
-    """
+    """Budget-constrained softmax: each value in [0,1], sum = k per channel."""
     L     = score.shape[-1]
     int_k = int(k)
     p     = F.softmax(score, dim=-1) * k
@@ -21,93 +54,77 @@ def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
     top_sorted = torch.sort(top_vals, dim=-1, descending=True).values
     cumsum     = top_sorted.cumsum(dim=-1)
 
-    j     = torch.arange(1, int_k + 1, device=score.device, dtype=p.dtype)
-    lam_j = (j - cumsum) / (L - j).clamp(min=1e-9)
-
-    valid    = top_sorted - 1.0 >= lam_j
-    j_sat    = valid.long().sum(dim=-1, keepdim=True)
+    j      = torch.arange(1, int_k + 1, device=score.device, dtype=p.dtype)
+    lam_j  = (j - cumsum) / (L - j).clamp(min=1e-9)
+    valid  = top_sorted - 1.0 >= lam_j
+    j_sat  = valid.long().sum(dim=-1, keepdim=True)
     lam_star = torch.gather(lam_j, dim=-1, index=(j_sat - 1).clamp(min=0))
     lam_star = lam_star * (j_sat > 0).to(p.dtype)
 
     return (p - lam_star).clamp(0.0, 1.0)
 
 
-# ── Single-scale attention head ───────────────────────────────────────────────
+# ── Attention head (on backbone features) ────────────────────────────────────
 
 class attention_head(nn.Module):
     """
-    One attention head operating at a fixed spatial scale.
+    Sparse-focus attention operating on shared backbone features.
 
-    Input  : x (B, 3, H, W) — already resized to target scale by sf_seg.
-    Encoder: Conv(3→C, stride=2) → Conv(C→2C) → split score | features.
-    Attention: clamped_softmax, budget k = min(focus_size², H'×W'-1).
-               k is clamped per-forward so the same focus_size is safe across
-               all three scales without overflow.
-    Blend  : 1×1 conv after attn×features — mixes channels that were
-             independently weighted by attention, enabling cross-channel
-             interaction before entering the decoder.
-    Output : attended (B, C, H/2, W/2),  attn (B, C, H/2, W/2).
+    Input  : (B, C, H, W) — feature map from one backbone stage (not raw RGB).
+    Score  : DWConv(3×3) captures local spatial context before scoring,
+             then 1×1 conv projects to 2C and splits into score | features.
+    Attn   : clamped_softmax → sparse weights, budget = focus_size².
+    Output : channel_mix(attn × features),  attn
     """
 
     def __init__(self, num_channels: int, focus_size: int):
         super().__init__()
         C = num_channels
         self.focus_size = focus_size
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(3, C, 3, padding=1, stride=2),
-            nn.ReLU(inplace=True),
+        self.proj = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1, groups=C, bias=False),  # depthwise 3×3
+            nn.Conv2d(C, C * 2, 1, bias=False),                    # pointwise → score|feats
+            _gn(C * 2),
         )
-        self.enc2        = nn.Conv2d(C, C * 2, 3, padding=1)
-        self.channel_mix = nn.Sequential(        # cross-channel blend after attention
-            nn.Conv2d(C, C, 1),
-            nn.ReLU(inplace=True),
+        self.channel_mix = nn.Sequential(
+            nn.Conv2d(C, C, 1, bias=False),
+            nn.GELU(),
         )
 
     def forward(self, x: torch.Tensor):
-        enc2_out        = self.enc2(self.enc1(x))          # (B, 2C, H/2, W/2)
-        score, features = enc2_out.chunk(2, dim=1)
-
-        B, C, Hh, Ww = score.shape
-        k    = min(self.focus_size * self.focus_size, Hh * Ww - 1)
-        attn = _clamped_softmax(score.view(B, C, Hh * Ww), float(k))
-        attn = attn.view(B, C, Hh, Ww)
-
-        attended = self.channel_mix(attn * features)       # (B, C, H/2, W/2)
-        return attended, attn
+        score, features = self.proj(x).chunk(2, dim=1)    # each (B, C, H, W)
+        B, C, H, W = score.shape
+        k    = min(self.focus_size ** 2, H * W - 1)
+        attn = _clamped_softmax(score.view(B, C, H * W), float(k)).view(B, C, H, W)
+        return self.channel_mix(attn * features), attn
 
 
-# ── Multi-scale model ─────────────────────────────────────────────────────────
+# ── Multi-scale segmentation model ───────────────────────────────────────────
 
 class sf_seg(nn.Module):
     """
-    Multi-scale Sparse-Focus Segmentation.
+    Multi-scale Sparse-Focus Segmentation with ResNet backbone.
 
-    Three independent attention heads receive the image at three resolutions.
-    Outputs are fused bottom-up (coarse→fine) in a UNet-style decoder.
-    No shared weights between heads — each scale learns its own attention
-    pattern without interference.
+    Backbone (shared, ResNet-style BasicBlocks with GN + GELU):
+    ┌────────┬──────────────────────────────────┬────────────────┐
+    │ Layer  │ Blocks                           │ Output         │
+    ├────────┼──────────────────────────────────┼────────────────┤
+    │ stem   │ Conv(3→C//2, 3×3, s=2) + GN+GELU│ (C//2, H/2)   │
+    │ stage1 │ BasicBlock(C//2→C, s=2)          │                │
+    │        │ BasicBlock(C→C)                  │ (C,    H/4)  ←─ head_large  │
+    │ stage2 │ BasicBlock(C→C, s=2)             │                │
+    │        │ BasicBlock(C→C)                  │ (C,    H/8)  ←─ head_medium │
+    │ stage3 │ BasicBlock(C→C, s=2)             │                │
+    │        │ BasicBlock(C→C)                  │ (C,    H/16) ←─ head_small  │
+    └────────┴──────────────────────────────────┴────────────────┘
 
-    Scales (default image_size=224, encoder_stride=2 inside each head):
-    ┌──────────────┬─────────────┬──────────────────┬──────────────┐
-    │ Head         │ Input       │ Attention space   │ Coverage k/L │
-    ├──────────────┼─────────────┼──────────────────┼──────────────┤
-    │ head_small   │ H/16 (14²)  │ H/32 × W/32 (7²) │ ~33%  global │
-    │ head_medium  │ H/4  (56²)  │ H/8  × W/8 (28²) │ ~33%  mid    │
-    │ head_large   │ H    (224²) │ H/2  × W/2 (112²)│  ~8%  local  │
-    └──────────────┴─────────────┴──────────────────┴──────────────┘
+    Attention heads: lightweight DW+PW projection on backbone features
+    → clamped softmax → attn × features → channel_mix.
 
-    Decoder (bottom-up):
-      a_small  (C, 7,   7)
-        ↓ upsample ×4 → blend_up_sm (C→C, 3×3)          adapt to 28×28 space
-        cat[↑, a_medium] → fuse_sm_med (2×conv)  →  d_med (C, 28,  28)
-        ↓ upsample ×4 → blend_up_med (C→C, 3×3)          adapt to 112×112 space
-        cat[↑, a_large]  → fuse_med_lg (2×conv)  →  d_lg  (C//2, 112, 112)
-        ↓ upsample ×2 → pre_masks (C//2→C//2, 3×3)       final blend
-        → masks (1×1)  →  logits (num_classes, H, W)
-
-    blend_up_sm / blend_up_med: learned projections applied after bilinear
-    upsample — they adapt stretched features to the target resolution space
-    before concatenation (same principle as FPN lateral connections).
+    Decoder (same bottom-up UNet structure as 8749cd1, GELU instead of ReLU):
+    a_small → upsample → blend_up_sm → cat(a_medium) → fuse_sm_med → d_med
+    d_med   → upsample → blend_up_med → cat(a_large) → fuse_med_lg → d_lg
+    d_lg    → upsample → pre_masks → masks → logits
     """
 
     def __init__(self, num_channels: int = 32, focus_size: int = 32,
@@ -116,192 +133,161 @@ class sf_seg(nn.Module):
                  encoder_pretrained: str | None = None):
         super().__init__()
         self.num_classes    = num_classes
-        self.encoder_stride = encoder_stride   # kept for API compat
+        self.encoder_stride = encoder_stride
         self.decoder_type   = decoder_type
         C = num_channels
 
-        # ── Three independent attention heads ─────────────────────────────────
+        # ── Shared ResNet backbone ─────────────────────────────────────────────
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, C // 2, 3, stride=2, padding=1, bias=False),
+            _gn(C // 2),
+            nn.GELU(),
+        )
+        self.stage1 = nn.Sequential(               # H/4  → head_large
+            BasicBlock(C // 2, C, stride=2),
+            BasicBlock(C, C),
+        )
+        self.stage2 = nn.Sequential(               # H/8  → head_medium
+            BasicBlock(C, C, stride=2),
+            BasicBlock(C, C),
+        )
+        self.stage3 = nn.Sequential(               # H/16 → head_small
+            BasicBlock(C, C, stride=2),
+            BasicBlock(C, C),
+        )
+
+        # ── Attention heads ────────────────────────────────────────────────────
         self.head_small  = attention_head(C, focus_size=max(2, focus_size // 8))
         self.head_medium = attention_head(C, focus_size=max(4, focus_size // 2))
         self.head_large  = attention_head(C, focus_size=focus_size)
 
+        # ── Decoder ───────────────────────────────────────────────────────────
+        self.blend_up_sm  = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+        )
+        self.blend_up_med = nn.Sequential(
+            nn.Conv2d(C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+        )
+        self.fuse_sm_med = nn.Sequential(
+            nn.Conv2d(C + C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1, bias=False),     _gn(C), nn.GELU(),
+        )
+        self.fuse_med_lg = nn.Sequential(
+            nn.Conv2d(C + C, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+        )
+        self.pre_masks = nn.Sequential(
+            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+        )
+        out_ch = num_classes if num_classes > 1 else 1
+        self.masks = nn.Conv2d(C // 2, out_ch, kernel_size=1)
+
         if encoder_pretrained:
             self._load_pretrained_encoder(encoder_pretrained)
 
-        # ── Decoder ──────────────────────────────────────────────────────────
-        self.blend_up_sm  = nn.Sequential(
-            nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
-        )
-        self.blend_up_med = nn.Sequential(
-            nn.Conv2d(C, C, 3, padding=1), nn.ReLU(inplace=True),
-        )
-        self.fuse_sm_med = nn.Sequential(
-            nn.Conv2d(C + C, C, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(C, C, 3, padding=1),     nn.ReLU(inplace=True),
-        )
+    # ── Backbone ──────────────────────────────────────────────────────────────
 
-        # ── fuse_med_lg: dense vs sparse ─────────────────────────────────────
-        if decoder_type == "dense":
-            # All 2C input channels mix freely into C//2 output channels.
-            self.fuse_med_lg = nn.Sequential(
-                nn.Conv2d(C + C, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-                nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-            )
-            self._routing = None
+    def _encode(self, x: torch.Tensor):
+        """Return backbone features at H/4, H/8, H/16."""
+        f  = self.stem(x)
+        f_l = self.stage1(f)
+        f_m = self.stage2(f_l)
+        f_s = self.stage3(f_m)
+        return f_l, f_m, f_s
 
-        else:  # "sparse"
-            # Factored: depthwise spatial + sparse pointwise routing.
-            #
-            # Dense:  Conv2d(2C→C//2, 3×3)  — every input channel talks to every output
-            # Sparse: Depthwise(2C, 3×3)    — spatial per-channel  (no cross-channel mix)
-            #       + Conv1×1(2C→C//2)      — channel routing       (L1 → sparsity)
-            #       + Conv2d(C//2, 3×3)     — local spatial refine
-            #
-            # The 1×1 routing weight W ∈ R^(C//2 × 2C) is the object of interest:
-            # after training, W[i, j] ≈ 0 means output feature i ignores input channel j.
-            # Visualising W reveals which attention channels own which output features.
-            self._dw     = nn.Sequential(
-                nn.Conv2d(C + C, C + C, 3, padding=1, groups=C + C),
-                nn.ReLU(inplace=True),
-            )
-            self._routing = nn.Conv2d(C + C, C // 2, 1, bias=False)
-            self._refine  = nn.Sequential(
-                nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-            )
-
-        # ── Final prediction ──────────────────────────────────────────────────
-        self.pre_masks = nn.Sequential(
-            nn.Conv2d(C // 2, C // 2, 3, padding=1), nn.ReLU(inplace=True),
-        )
-        out_ch     = num_classes if num_classes > 1 else 1
-        self.masks = nn.Conv2d(C // 2, out_ch, kernel_size=1)
-
-    # ── Forward ──────────────────────────────────────────────────────────────
+    # ── Forward ───────────────────────────────────────────────────────────────
 
     def extract_features(self, x: torch.Tensor, full_res: bool = True):
-        """Run full pipeline up to pre_masks. Returns (features, attn_l).
+        """Run backbone + attention + decoder up to pre_masks.
 
-        full_res=True  : features (B, C//2, H, W)   — used during segmentation forward
-        full_res=False : features (B, C//2, H/2,W/2) — used for pretraining (no upsample,
-                         saves 4× memory; ClsHead uses GAP so size doesn't matter)
+        full_res=False : stop at d_lg (H/4) — used by pretrain_encoder.py.
         """
         H, W = x.shape[2], x.shape[3]
-        x_small  = F.interpolate(x, size=(max(H // 16, 2), max(W // 16, 2)),
-                                  mode='bilinear', align_corners=False)
-        x_medium = F.interpolate(x, size=(H // 4, W // 4),
-                                  mode='bilinear', align_corners=False)
 
-        a_small,  _      = self.head_small(x_small)
-        a_medium, _      = self.head_medium(x_medium)
-        a_large,  attn_l = self.head_large(x)
+        f_l, f_m, f_s = self._encode(x)
+        a_large,  attn_l = self.head_large(f_l)    # (B, C, H/4,  W/4)
+        a_medium, _      = self.head_medium(f_m)   # (B, C, H/8,  W/8)
+        a_small,  _      = self.head_small(f_s)    # (B, C, H/16, W/16)
 
+        # Bottom-up decoder
         a_s_up = self.blend_up_sm(
             F.interpolate(a_small, size=a_medium.shape[2:],
                           mode='bilinear', align_corners=False))
         d_med  = self.fuse_sm_med(torch.cat([a_s_up, a_medium], dim=1))
+
         d_m_up = self.blend_up_med(
             F.interpolate(d_med, size=a_large.shape[2:],
                           mode='bilinear', align_corners=False))
-        fused  = torch.cat([d_m_up, a_large], dim=1)
-
-        if self.decoder_type == "dense":
-            d_lg = self.fuse_med_lg(fused)
-        else:
-            d_lg = self._refine(F.relu(self._routing(self._dw(fused))))
+        d_lg   = self.fuse_med_lg(torch.cat([d_m_up, a_large], dim=1))
 
         if not full_res:
-            return d_lg, attn_l   # (B, C//2, H/2, W/2) — skip upsample
+            return d_lg, attn_l   # (B, C//2, H/4, W/4)
 
         d_up = self.pre_masks(
             F.interpolate(d_lg, size=(H, W), mode='bilinear', align_corners=False))
         return d_up, attn_l
 
     def forward(self, x: torch.Tensor):
-        H, W    = x.shape[2], x.shape[3]
+        H, W = x.shape[2], x.shape[3]
         d_up, attn_l = self.extract_features(x)
-        logits  = self.masks(d_up)
+        logits = self.masks(d_up)
 
         attn_guide = attn_l.amax(dim=1, keepdim=True)
         attn_guide = F.interpolate(attn_guide, size=(H, W),
                                    mode='bilinear', align_corners=False)
         return logits, attn_guide, attn_l
 
-    def _load_pretrained_encoder(self, path: str) -> None:
-        ckpt = torch.load(path, map_location='cpu')
-        nc   = ckpt.get('num_channels')
-        C    = self.head_large.enc1[0].out_channels
-        if nc and nc != C:
-            raise ValueError(
-                f"Pretrained num_channels={nc} != model num_channels={C}")
-
-        backbone_sd = ckpt.get('backbone')
-        if backbone_sd is not None:
-            # Full backbone checkpoint (from pretrain_encoder.py v2)
-            missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
-            missing = [k for k in missing if not k.startswith('masks.')]
-            if missing:
-                print(f"[warn] missing keys: {missing}")
-        else:
-            # Legacy: only enc1/enc2 per head
-            for head in (self.head_small, self.head_medium, self.head_large):
-                head.enc1.load_state_dict(ckpt['enc1'])
-                head.enc2.load_state_dict(ckpt['enc2'])
-
-        epoch = ckpt.get('epoch', '?')
-        acc   = ckpt.get('val_acc', 0.0)
-        print(f"Loaded pretrained backbone from {path}  (epoch={epoch}, val_acc={acc:.4f})")
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def routing_sparsity_loss(self) -> torch.Tensor | None:
-        """L1 norm of routing weights (sparse variant only).
-        Add to total loss with a small weight to encourage channel specialisation.
-        Returns None for dense variant.
-        """
-        if self._routing is None:
-            return None
-        return self._routing.weight.abs().mean()
-
-    def routing_weight_stats(self) -> dict:
-        """Sparsity diagnostics for the routing matrix (sparse variant only).
-        Useful for monitoring how many channels are truly specialised.
-        Returns empty dict for dense variant.
-        """
-        if self._routing is None:
-            return {}
-        W = self._routing.weight.detach().abs()  # (C//2, 2C, 1, 1) → squeeze
-        W = W.squeeze(-1).squeeze(-1)            # (C//2, 2C)
-        return {
-            "routing_mean":     W.mean().item(),
-            "routing_sparsity": (W < 1e-3).float().mean().item(),  # fraction near-zero
-            "routing_max":      W.max().item(),
-        }
+    def _load_pretrained_encoder(self, path: str) -> None:
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        nc   = ckpt.get('num_channels')
+        C    = self.stem[0].out_channels * 2
+        if nc and nc != C:
+            raise ValueError(f"Pretrained num_channels={nc} != model num_channels={C}")
+        backbone_sd = ckpt.get('backbone')
+        if backbone_sd is None:
+            print("[warn] no 'backbone' key in checkpoint, skipping")
+            return
+        missing, _ = self.load_state_dict(backbone_sd, strict=False)
+        missing = [k for k in missing if not k.startswith('masks.')]
+        if missing:
+            print(f"[warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        print(f"Loaded backbone from {path}  "
+              f"(epoch={ckpt.get('epoch','?')}, val_acc={ckpt.get('val_acc',0):.4f})")
 
 
 def main():
-    print("sf_seg — Multi-scale Sparse-Focus Segmentation\n")
-    model = sf_seg(num_channels=64, focus_size=32, encoder_stride=2, num_classes=81)
+    print("sf_seg — ResNet backbone + GELU\n")
+    model = sf_seg(num_channels=128, focus_size=28, num_classes=151)
     x     = torch.randn(2, 3, 224, 224)
     logits, attn_guide, attn = model(x)
 
-    print(f"Parameters  : {model.get_num_parameters():,}")
-    print(f"Output      : logits {tuple(logits.shape)}")
-    print(f"Attn guide  : {tuple(attn_guide.shape)}")
-    print()
+    total = model.get_num_parameters()
+    bb    = sum(p.numel() for m in [model.stem, model.stage1, model.stage2, model.stage3]
+                for p in m.parameters())
+    heads = sum(p.numel() for m in [model.head_small, model.head_medium, model.head_large]
+                for p in m.parameters())
+    print(f"Total params  : {total:,}")
+    print(f"  backbone    : {bb:,}  (ResNet BasicBlocks)")
+    print(f"  attn heads  : {heads:,}")
+    print(f"  decoder+cls : {total - bb - heads:,}")
+    print(f"Logits        : {tuple(logits.shape)}")
 
-    rows = [
-        ("head_small",  max(224//16,2), max(224//16,2)//2, model.head_small.focus_size),
-        ("head_medium", 224//4,         224//8,             model.head_medium.focus_size),
-        ("head_large",  224,            224//2,             model.head_large.focus_size),
-    ]
-    print(f"{'Head':<14} {'Input':>9} {'Attn space':>12} {'k':>6} {'L':>8} {'k/L':>7}")
-    print("-" * 58)
-    for name, inp, attn_size, fs in rows:
-        L = attn_size * attn_size
-        k = min(fs * fs, L - 1)
-        print(f"{name:<14} {inp:>4}×{inp:<4} {attn_size:>4}×{attn_size:<4}  "
-              f"{k:>6} {L:>8} {100*k/L:>6.1f}%")
+    print(f"\n{'Head':<14} {'Feature level':>14} {'focus_size':>12} {'coverage':>10}")
+    print("-" * 54)
+    for name, head, hw in [
+        ("head_large",  model.head_large,  (224//4)**2),
+        ("head_medium", model.head_medium, (224//8)**2),
+        ("head_small",  model.head_small,  (224//16)**2),
+    ]:
+        fs = head.focus_size
+        k  = min(fs**2, hw - 1)
+        print(f"{name:<14} {'H/' + str(224 // (hw**0.5).__int__()):>14} "
+              f"{fs:>12} {k/hw:>9.1%}")
 
 
 if __name__ == "__main__":

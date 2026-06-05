@@ -24,11 +24,18 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import torchvision.transforms.functional as TF
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TB_AVAILABLE = True
+except ImportError:
+    _TB_AVAILABLE = False
+
 from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
                          multiclass_iou_loss, ce_iou_loss,
                          focal_loss, focal_iou_loss, pure_focal_iou_loss,
                          attention_guide_loss, attention_exclusivity_loss)
-from src.models import sf_seg
+from src.models import sf_seg as _sf_seg_custom
+from src.models import sf_seg_r18 as _sf_seg_r18
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -263,24 +270,16 @@ def train(args):
               prefetch_factor=2 if args.num_workers > 0 else None,
               persistent_workers=args.num_workers > 0)
 
-    if args.class_diverse and num_classes > 1:
-        from src.dataloaders.sampler import build_class_index, ClassDiverseBatchSampler
-        class_idx = build_class_index(
-            data_root / 'masks' / 'train', num_classes,
-            cache_path=data_root / 'class_index.json')
-        batch_sampler = ClassDiverseBatchSampler(
-            class_idx, len(train_ds), args.batch_size, drop_last=True)
-        train_loader = DataLoader(train_ds, batch_sampler=batch_sampler, **kw)
-    else:
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **kw)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **kw)
 
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **kw)
 
-    model = sf_seg(num_channels=args.num_channels, focus_size=args.focus_size,
-                   encoder_stride=args.encoder_stride, num_classes=num_classes,
-                   decoder_type=args.decoder_type,
-                   encoder_pretrained=args.encoder_pretrained).to(device)
-    print(f"Model params: {model.get_num_parameters():,}  |  "
+    _model_cls = _sf_seg_r18.sf_seg if args.backbone == "resnet18" else _sf_seg_custom.sf_seg
+    model = _model_cls(num_channels=args.num_channels, focus_size=args.focus_size,
+                       encoder_stride=args.encoder_stride, num_classes=num_classes,
+                       decoder_type=args.decoder_type,
+                       encoder_pretrained=args.encoder_pretrained).to(device)
+    print(f"Backbone: {args.backbone}  |  params: {model.get_num_parameters():,}  |  "
           f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  device={device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -302,6 +301,20 @@ def train(args):
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, handlers=[
         logging.FileHandler(log_dir / 'train.log'), logging.StreamHandler()])
+
+    tb_writer = None
+    if _TB_AVAILABLE:
+        tb_dir = log_dir / 'tensorboard' / args.backbone
+        tb_writer = SummaryWriter(log_dir=str(tb_dir))
+        logging.info(f"TensorBoard → tensorboard --logdir {log_dir / 'tensorboard'}")
+        try:
+            dummy = torch.zeros(1, 3, args.image_size, args.image_size, device=device)
+            tb_writer.add_graph(model, dummy)
+            logging.info("Model graph pushed to TensorBoard")
+        except Exception as e:
+            logging.warning(f"add_graph failed: {e}")
+    else:
+        logging.warning("TensorBoard not available — pip install tensorboard")
 
     cat_names = None
     cat_map = data_root / "cat_to_idx.json"
@@ -330,6 +343,47 @@ def train(args):
     best_val  = float("inf")
     best_path = ckpt_dir / "sf_seg_best.pt"
     last_path = ckpt_dir / "sf_seg_last.pt"
+
+    # ── TensorBoard image helper ───────────────────────────────────────────────
+    # Grab one fixed val batch for consistent visualization across epochs
+    _tb_imgs, _tb_masks = None, None
+    for _b, _m in val_loader:
+        _tb_imgs  = _b[:4].to(device)   # max 4 samples
+        _tb_masks = _m[:4].to(device)
+        break
+
+    def _tb_log_images(writer, model, epoch, num_classes, device):
+        """Log image / GT / pred / attention to TensorBoard."""
+        if writer is None or _tb_imgs is None:
+            return
+        model.eval()
+        with torch.no_grad():
+            logits, _, attn = model(_tb_imgs)
+
+        imgs_cpu = _tb_imgs.cpu().float()
+
+        # Predicted class per pixel (argmax for multi-class, sigmoid>0.5 for binary)
+        if num_classes > 1:
+            pred_idx = logits.argmax(dim=1).cpu().float() / max(num_classes - 1, 1)
+            gt_idx   = _tb_masks.cpu().float() / max(num_classes - 1, 1)
+        else:
+            pred_idx = (torch.sigmoid(logits) > 0.5).cpu().float().squeeze(1)
+            gt_idx   = _tb_masks.cpu().float()
+
+        # Clamp images to [0,1] (denormalize if needed)
+        imgs_show = imgs_cpu.clamp(0, 1)
+
+        writer.add_images("Val/image",    imgs_show,              epoch)
+        writer.add_images("Val/gt_mask",  gt_idx.unsqueeze(1),    epoch)
+        writer.add_images("Val/pred",     pred_idx.unsqueeze(1),  epoch)
+
+        # Attention map: mean across channels, upsampled to input resolution
+        H, W = _tb_imgs.shape[2], _tb_imgs.shape[3]
+        attn_mean = attn.cpu().float().mean(dim=1, keepdim=True)
+        attn_mean = F.interpolate(attn_mean, size=(H, W), mode='bilinear', align_corners=False)
+        attn_norm = (attn_mean - attn_mean.amin(dim=[2,3], keepdim=True)) / \
+                    (attn_mean.amax(dim=[2,3], keepdim=True) - attn_mean.amin(dim=[2,3], keepdim=True) + 1e-8)
+        writer.add_images("Val/attn_head_large", attn_norm, epoch)
 
     # ── Resume ─────────────────────────────────────────────────────────────────
     start_epoch = 1
@@ -474,6 +528,20 @@ def train(args):
                         vl['loss'], vl['seg'],             vl['acc'], vl_miou])
         csv_file.flush()
 
+        # ── TensorBoard scalars ────────────────────────────────────────────────
+        if tb_writer is not None:
+            tb_writer.add_scalar("Loss/train",      tr['loss'],   epoch)
+            tb_writer.add_scalar("Loss/val",        vl['loss'],   epoch)
+            tb_writer.add_scalar("SegLoss/train",   tr['seg'],    epoch)
+            tb_writer.add_scalar("DivLoss/train",   tr['div'],    epoch)
+            tb_writer.add_scalar("mIoU/train",      tr_miou,      epoch)
+            tb_writer.add_scalar("mIoU/val",        vl_miou,      epoch)
+            tb_writer.add_scalar("Accuracy/train",  tr['acc'],    epoch)
+            tb_writer.add_scalar("Accuracy/val",    vl['acc'],    epoch)
+            tb_writer.add_scalar("LR",              lr,           epoch)
+            if epoch == 1 or epoch % 5 == 0:
+                _tb_log_images(tb_writer, model, epoch, num_classes, device)
+
         # Checkpoint
         try:
             improved = vseen and vl['loss'] < best_val
@@ -497,6 +565,8 @@ def train(args):
             logging.warning(f"Sample save failed: {e}")
 
     csv_file.close()
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -524,6 +594,9 @@ def parse_args():
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
                             "focal", "focal_iou", "pure_focal_iou"])
+    p.add_argument("--backbone",          default=None,
+                   choices=["custom", "resnet18"],
+                   help="Backbone type: custom (default) or resnet18 (ImageNet pretrained)")
     p.add_argument("--encoder-pretrained", default=None,
                    help="Path to enc_best.pt from pretrain_encoder.py")
     p.add_argument("--resume",           default=None)
@@ -547,9 +620,10 @@ def merge_config(args):
         num_channels=64, focus_size=32, encoder_stride=2,
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
         absent_weight=0.2, attn_guide_weight=0.0, attn_exclusive_weight=0.0,
-        decoder_type="dense", sparse_weight=0.0, class_diverse=True,
+        decoder_type="dense", sparse_weight=0.0, class_diverse=False,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224, encoder_pretrained=None,
+        backbone="custom",
     )
     for key, default in defaults.items():
         cli = getattr(args, key, None)
