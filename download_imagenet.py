@@ -96,8 +96,9 @@ def write_class_map(class_names: list[str], out_root: Path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--out',        required=True,
-                    help='Output directory for ImageFolder dataset')
+    ap.add_argument('--out',        default=str(Path.home() / 'data' / 'imagenet'),
+                    help='Output directory for ImageFolder dataset '
+                         '(default: ~/data/imagenet)')
     ap.add_argument('--split',      default='both',
                     choices=['train', 'val', 'both'],
                     help='Which split to download (default: both)')
@@ -116,8 +117,14 @@ def main():
         os.environ['HF_DATASETS_CACHE'] = args.cache_dir
         os.environ['HF_HOME']           = args.cache_dir
 
-    out_root = Path(args.out)
-    out_root.mkdir(parents=True, exist_ok=True)
+    out_root = Path(args.out).expanduser()
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        print(f"[error] No permission to create {out_root}")
+        print(f"  Use a path inside your home dir, e.g.:")
+        print(f"    python download_imagenet.py --out ~/data/imagenet")
+        return
 
     try:
         import datasets  # noqa: F401
