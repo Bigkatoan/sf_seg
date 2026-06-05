@@ -2,8 +2,8 @@
 
 Requires:
     pip install datasets huggingface_hub pillow tqdm
-    huggingface-cli login          # one-time, needs HF account with imagenet-1k access
-    # Accept terms at: https://huggingface.co/datasets/imagenet-1k
+    huggingface-cli login          # one-time, needs HF account with ILSVRC/imagenet-1k access
+    # Accept terms at: https://huggingface.co/datasets/ILSVRC/imagenet-1k
 
 Output structure (compatible with torchvision.datasets.ImageFolder):
     <out>/
@@ -52,7 +52,7 @@ def download_split(split: str, out_root: Path, workers: int, max_samples: int | 
     from datasets import load_dataset
 
     print(f"\n── Downloading {split} split ──────────────────────────────")
-    ds = load_dataset('imagenet-1k', split=split, trust_remote_code=True,
+    ds = load_dataset('ILSVRC/imagenet-1k', split=split, trust_remote_code=True,
                       streaming=False)
 
     # Build class name list (wordnet synset IDs)
