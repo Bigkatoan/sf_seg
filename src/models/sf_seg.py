@@ -242,6 +242,12 @@ class sf_seg(nn.Module):
     def get_num_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def routing_sparsity_loss(self):
+        return None
+
+    def routing_weight_stats(self):
+        return {}
+
     def _load_pretrained_encoder(self, path: str) -> None:
         ckpt = torch.load(path, map_location='cpu', weights_only=False)
         nc   = ckpt.get('num_channels')
