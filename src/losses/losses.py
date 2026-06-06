@@ -423,16 +423,20 @@ def edge_corner_loss(logits: torch.Tensor, target: torch.Tensor,
             corner = F.max_pool2d(corner, k, stride=1, padding=dilate)
 
         # Spatial weight: background = 1, edge = 1+edge_weight, corner = addl corner_weight
+        # Clamp to max=20 to prevent extreme scaling that causes NaN under AMP
         w = (1.0
              + edge_weight   * edge.squeeze(1)
-             + corner_weight * corner.squeeze(1))                     # (B,H,W)
+             + corner_weight * corner.squeeze(1)).clamp(max=20.0)     # (B,H,W)
 
-    # Per-pixel focal loss
-    ce    = F.cross_entropy(logits.float(), target, reduction='none') # (B,H,W)
-    pt    = torch.exp(-ce)
+    # Per-pixel focal loss — always in float32 to avoid float16 overflow
+    logits_f = logits.float()
+    ce    = F.cross_entropy(logits_f, target, reduction='none')       # (B,H,W)
+    ce    = torch.nan_to_num(ce, nan=0.0, posinf=100.0, neginf=0.0)
+    pt    = torch.exp(-ce.clamp(max=100.0))
     focal = (1.0 - pt).pow(gamma) * ce
 
-    return (focal * w).sum() / w.sum().clamp(min=1.0)
+    result = (focal * w).sum() / w.sum().clamp(min=1.0)
+    return torch.nan_to_num(result, nan=0.0)
 
 
 if __name__ == "__main__":

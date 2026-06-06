@@ -494,7 +494,8 @@ def train(args):
                 logging.warning(
                     f"Non-finite loss ({loss.item():.4f}) at epoch {epoch} "
                     f"seg={s.item():.4f} div={d.item():.4f} "
-                    f"guide={g.item():.4f} excl={e.item():.4f} — skipping batch")
+                    f"guide={g.item():.4f} excl={e.item():.4f} "
+                    f"boundary={bd.item():.4f} — skipping batch")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
