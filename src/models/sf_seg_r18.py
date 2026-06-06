@@ -22,19 +22,23 @@ def _gn(C: int) -> nn.GroupNorm:
 
 
 def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
+    """Always in float32 — 1e-9 underflows to 0 in float16 → div-by-zero NaN."""
+    orig_dtype = score.dtype
+    score = score.float()
+
     L     = score.shape[-1]
     int_k = int(k)
     p     = F.softmax(score, dim=-1) * k
     top_vals   = torch.topk(p, k=int_k, dim=-1).values
     top_sorted = torch.sort(top_vals, dim=-1, descending=True).values
     cumsum     = top_sorted.cumsum(dim=-1)
-    j      = torch.arange(1, int_k + 1, device=score.device, dtype=p.dtype)
-    lam_j  = (j - cumsum) / (L - j).clamp(min=1e-9)
-    valid  = top_sorted - 1.0 >= lam_j
-    j_sat  = valid.long().sum(dim=-1, keepdim=True)
+    j        = torch.arange(1, int_k + 1, device=score.device, dtype=torch.float32)
+    lam_j    = (j - cumsum) / (L - j).clamp(min=1e-6)
+    valid    = top_sorted - 1.0 >= lam_j
+    j_sat    = valid.long().sum(dim=-1, keepdim=True)
     lam_star = torch.gather(lam_j, dim=-1, index=(j_sat - 1).clamp(min=0))
-    lam_star = lam_star * (j_sat > 0).to(p.dtype)
-    return (p - lam_star).clamp(0.0, 1.0)
+    lam_star = lam_star * (j_sat > 0).float()
+    return (p - lam_star).clamp(0.0, 1.0).to(orig_dtype)
 
 
 class attention_head(nn.Module):
