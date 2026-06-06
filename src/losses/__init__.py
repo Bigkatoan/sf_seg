@@ -11,6 +11,7 @@ from .losses import (
     combine_losses,
     mse_loss,
     diversity_loss,
+    edge_corner_loss,
 )
 
 __all__ = [
@@ -23,4 +24,7 @@ __all__ = [
     "combine_losses",
     "mse_loss",
     "diversity_loss",
+    "attention_guide_loss",
+    "attention_exclusivity_loss",
+    "edge_corner_loss",
 ]
