@@ -86,17 +86,18 @@ def multiclass_iou_loss(logits: torch.Tensor, target: torch.Tensor,
                     loss (IoU≈0 even though the class simply isn't in the image).
     """
     B, C, H, W = logits.shape
-    probs = F.softmax(logits, dim=1)                                # (B, C, H, W)
+    # float32 — F.softmax in float16 overflows for large logit ranges (AMP)
+    probs = F.softmax(logits.float(), dim=1)                        # (B, C, H, W)
 
-    target_onehot = F.one_hot(target, num_classes=C)                # (B, H, W, C)
-    target_onehot = target_onehot.permute(0, 3, 1, 2).float()      # (B, C, H, W)
+    target_onehot = F.one_hot(target.clamp(0, C - 1), num_classes=C)   # (B, H, W, C)
+    target_onehot = target_onehot.permute(0, 3, 1, 2).float()          # (B, C, H, W)
 
     pred_flat   = probs.view(B, C, -1)           # (B, C, H*W)
     target_flat = target_onehot.view(B, C, -1)   # (B, C, H*W)
 
     inter = (pred_flat * target_flat).sum(dim=-1)                   # (B, C)
     union = pred_flat.sum(dim=-1) + target_flat.sum(dim=-1) - inter
-    iou   = (inter + eps) / (union + eps)                           # (B, C)
+    iou   = (inter + eps) / (union + eps).clamp(min=eps)            # (B, C)
 
     # Per-sample, per-class presence flag: 1 if class appears, 0 if absent
     present = (target_flat.sum(dim=-1) > 0).float()                 # (B, C)
@@ -137,8 +138,8 @@ def focal_loss(logits: torch.Tensor, target: torch.Tensor,
     gamma=0  → plain cross-entropy
     gamma=2  → standard focal (recommended for severe class imbalance)
     """
-    ce = F.cross_entropy(logits, target, weight=weight, reduction='none')  # (B,H,W)
-    pt = torch.exp(-ce)                                                    # model confidence
+    ce = F.cross_entropy(logits.float(), target, weight=weight, reduction='none')  # (B,H,W)
+    pt = torch.exp(-ce.clamp(max=100.0))                               # model confidence
     return ((1 - pt) ** gamma * ce).mean()
 
 
@@ -247,7 +248,7 @@ def attention_guide_loss(attn: torch.Tensor, target: torch.Tensor,
     ).squeeze(1).long()                                               # (B, g, g)
     L = guide_size * guide_size
 
-    gt_oh  = F.one_hot(tgt_s, num_classes).permute(0, 3, 1, 2).float()
+    gt_oh  = F.one_hot(tgt_s.clamp(0, num_classes - 1), num_classes).permute(0, 3, 1, 2).float()
     gt_f   = gt_oh.view(B, num_classes, L)                           # (B, C, L)
     atn_f  = attn_s.view(B, C_attn, L)                              # (B, K, L)
 
@@ -264,7 +265,7 @@ def attention_guide_loss(attn: torch.Tensor, target: torch.Tensor,
     topk_maps = torch.gather(atn_exp, 2, idx).mean(2)               # (B, C, L)
 
     # Normalise to [0,1] for comparison with binary GT mask
-    mx        = topk_maps.amax(-1, keepdim=True).clamp(min=eps)
+    mx        = topk_maps.amax(-1, keepdim=True).clamp(min=1e-6)
     topk_norm = (topk_maps / mx).clamp(0, 1)                        # (B, C, L)
 
     # Dice loss — only for present foreground classes (skip background idx=0)
@@ -312,7 +313,7 @@ def attention_exclusivity_loss(attn: torch.Tensor, target: torch.Tensor,
     ).squeeze(1).long()                                               # (B, g, g)
     L = guide_size * guide_size
 
-    gt_f  = F.one_hot(tgt_s, num_classes).permute(0, 3, 1, 2).float().view(B, num_classes, L)
+    gt_f  = F.one_hot(tgt_s.clamp(0, num_classes - 1), num_classes).permute(0, 3, 1, 2).float().view(B, num_classes, L)
     atn_f = attn_s.view(B, K, L)
 
     present = gt_f.sum(-1) > 0   # (B, C)

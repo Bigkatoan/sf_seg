@@ -468,26 +468,27 @@ def train(args):
                 logits, _, attn = model(imgs)
                 s = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
                              args.no_obj_weight, class_weights, args.absent_weight)
+                zero = logits.new_tensor(0.0)
                 d = args.diversity_weight * diversity_loss(attn) if args.diversity_weight > 0 \
-                    else torch.tensor(0., device=device)
+                    else zero
                 g = args.attn_guide_weight * attention_guide_loss(
                         attn, masks, num_classes) \
                     if args.attn_guide_weight > 0 and num_classes > 1 \
-                    else torch.tensor(0., device=device)
+                    else zero
                 e = args.attn_exclusive_weight * attention_exclusivity_loss(
                         attn, masks, num_classes) \
                     if args.attn_exclusive_weight > 0 and num_classes > 1 \
-                    else torch.tensor(0., device=device)
+                    else zero
                 sp_raw = model.routing_sparsity_loss()
                 sp = args.sparse_weight * sp_raw \
                      if args.sparse_weight > 0 and sp_raw is not None \
-                     else torch.tensor(0., device=device)
+                     else zero
                 bd = args.boundary_weight * edge_corner_loss(
                         logits, masks,
                         edge_weight=args.edge_weight,
                         corner_weight=args.corner_weight) \
                      if args.boundary_weight > 0 and num_classes > 1 \
-                     else torch.tensor(0., device=device)
+                     else zero
                 loss = s + d + g + e + sp + bd
 
             if not torch.isfinite(loss):
