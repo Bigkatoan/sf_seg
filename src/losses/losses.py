@@ -138,8 +138,11 @@ def focal_loss(logits: torch.Tensor, target: torch.Tensor,
     gamma=0  → plain cross-entropy
     gamma=2  → standard focal (recommended for severe class imbalance)
     """
-    ce = F.cross_entropy(logits.float(), target, weight=weight, reduction='none')  # (B,H,W)
-    pt = torch.exp(-ce.clamp(max=100.0))                               # model confidence
+    C   = logits.shape[1]
+    tgt = target.clamp(0, C - 1)   # guard against ADE20K ignore pixels (255)
+    ce  = F.cross_entropy(logits.float(), tgt, weight=weight, reduction='none')
+    ce  = ce.clamp(max=100.0)
+    pt  = torch.exp(-ce)
     return ((1 - pt) ** gamma * ce).mean()
 
 

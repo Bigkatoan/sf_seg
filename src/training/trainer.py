@@ -374,7 +374,7 @@ def train(args):
     csv_file = open(csv_path, 'w', newline='')
     csv_w    = csv.writer(csv_file)
     csv_w.writerow(['epoch',
-                    'train_loss', 'train_seg', 'train_boundary', 'train_guide',
+                    'train_loss', 'train_seg', 'train_guide',
                     'train_excl', 'train_div', 'train_acc', 'train_miou',
                     'val_loss',   'val_seg',   'val_acc',   'val_miou'])
 
@@ -462,7 +462,7 @@ def train(args):
 
         # Train
         model.train()
-        tr   = dict(loss=0., seg=0., boundary=0., guide=0., excl=0., div=0., acc=0.)
+        tr   = dict(loss=0., seg=0., guide=0., excl=0., div=0., acc=0.)
         seen = 0
         conf_tr = torch.zeros(num_classes, num_classes, dtype=torch.long, device=device)
         bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
@@ -503,16 +503,15 @@ def train(args):
                     update_confusion_matrix(conf_tr, pred, masks)
                 else:
                     acc = ((torch.sigmoid(logits) > 0.5).float() == masks).float().mean().item()
-            tr['loss']     += loss.item()              * b
-            tr['seg']      += parts['seg'].item()      * b
-            tr['boundary'] += parts['boundary'].item() * b
-            tr['guide']    += parts['guide'].item()    * b
-            tr['excl']     += parts['excl'].item()     * b
-            tr['div']      += parts['div'].item()      * b
-            tr['acc']      += acc * b
+            tr['loss']  += loss.item()             * b
+            tr['seg']   += parts['seg'].item()     * b
+            tr['guide'] += parts['guide'].item()   * b
+            tr['excl']  += parts['excl'].item()    * b
+            tr['div']   += parts['div'].item()     * b
+            tr['acc']   += acc * b
             seen += b
             bar.set_postfix(loss=f"{loss.item():.4f}", seg=f"{parts['seg'].item():.4f}",
-                            bd=f"{parts['boundary'].item():.4f}", acc=f"{acc:.4f}")
+                            guide=f"{parts['guide'].item():.4f}", acc=f"{acc:.4f}")
 
         tr = {k: v / seen for k, v in tr.items()}
         tr_miou, _ = miou_from_confusion(conf_tr.cpu()) if num_classes > 1 else (0., None)
@@ -561,26 +560,25 @@ def train(args):
                             f" mean={rs['routing_mean']:.4f}")
         logging.info(
             f"Epoch {epoch}/{args.epochs} | lr={lr:.2e} | "
-            f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} bd={tr['boundary']:.4f} "
+            f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} "
             f"guide={tr['guide']:.4f} excl={tr['excl']:.4f} div={tr['div']:.4f} "
             f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} | "
             f"val   loss={vl['loss']:.4f} seg={vl['seg']:.4f} "
             f"acc={vl['acc']:.4f} mIoU={vl_miou:.4f}" + cls_info + routing_info)
         csv_w.writerow([epoch,
-                        tr['loss'], tr['seg'], tr['boundary'], tr['guide'],
+                        tr['loss'], tr['seg'], tr['guide'],
                         tr['excl'], tr['div'], tr['acc'], tr_miou,
                         vl['loss'], vl['seg'], vl['acc'], vl_miou])
         csv_file.flush()
 
         # ── TensorBoard scalars ────────────────────────────────────────────────
         if tb_writer is not None:
-            tb_writer.add_scalar("Loss/train",        tr['loss'],     epoch)
-            tb_writer.add_scalar("Loss/val",          vl['loss'],     epoch)
-            tb_writer.add_scalar("SegLoss/train",     tr['seg'],      epoch)
-            tb_writer.add_scalar("BoundaryLoss/train",tr['boundary'], epoch)
-            tb_writer.add_scalar("GuideLoss/train",   tr['guide'],    epoch)
-            tb_writer.add_scalar("ExclLoss/train",    tr['excl'],     epoch)
-            tb_writer.add_scalar("DivLoss/train",     tr['div'],      epoch)
+            tb_writer.add_scalar("Loss/train",      tr['loss'],   epoch)
+            tb_writer.add_scalar("Loss/val",        vl['loss'],   epoch)
+            tb_writer.add_scalar("SegLoss/train",   tr['seg'],    epoch)
+            tb_writer.add_scalar("GuideLoss/train", tr['guide'],  epoch)
+            tb_writer.add_scalar("ExclLoss/train",  tr['excl'],   epoch)
+            tb_writer.add_scalar("DivLoss/train",   tr['div'],    epoch)
             tb_writer.add_scalar("mIoU/train",        tr_miou,        epoch)
             tb_writer.add_scalar("mIoU/val",          vl_miou,        epoch)
             tb_writer.add_scalar("Accuracy/train",    tr['acc'],      epoch)
