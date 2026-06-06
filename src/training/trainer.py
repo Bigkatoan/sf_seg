@@ -33,7 +33,8 @@ except ImportError:
 from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
                          multiclass_iou_loss, ce_iou_loss,
                          focal_loss, focal_iou_loss, pure_focal_iou_loss,
-                         attention_guide_loss, attention_exclusivity_loss)
+                         attention_guide_loss, attention_exclusivity_loss,
+                         edge_corner_loss)
 from src.models import sf_seg as _sf_seg_custom
 from src.models import sf_seg_r18 as _sf_seg_r18
 
@@ -481,7 +482,13 @@ def train(args):
                 sp = args.sparse_weight * sp_raw \
                      if args.sparse_weight > 0 and sp_raw is not None \
                      else torch.tensor(0., device=device)
-                loss = s + d + g + e + sp
+                bd = args.boundary_weight * edge_corner_loss(
+                        logits, masks,
+                        edge_weight=args.edge_weight,
+                        corner_weight=args.corner_weight) \
+                     if args.boundary_weight > 0 and num_classes > 1 \
+                     else torch.tensor(0., device=device)
+                loss = s + d + g + e + sp + bd
 
             if not torch.isfinite(loss):
                 logging.warning(
@@ -628,7 +635,10 @@ def parse_args():
     p.add_argument("--attn-guide-weight",     type=float, default=None)
     p.add_argument("--attn-exclusive-weight", type=float, default=None)
     p.add_argument("--decoder-type",   default=None, choices=["dense", "sparse"])
-    p.add_argument("--sparse-weight",  type=float, default=None)
+    p.add_argument("--sparse-weight",   type=float, default=None)
+    p.add_argument("--boundary-weight", type=float, default=None)
+    p.add_argument("--edge-weight",     type=float, default=None)
+    p.add_argument("--corner-weight",   type=float, default=None)
     p.add_argument("--class-diverse",  action="store_true", default=None)
     p.add_argument("--loss-type",        default=None,
                    choices=["iou", "bce", "bce_iou", "combine", "mse", "ce", "ce_iou",
@@ -660,6 +670,7 @@ def merge_config(args):
         diversity_weight=0.1, num_classes=81, no_obj_weight=0.01,
         absent_weight=0.2, attn_guide_weight=0.0, attn_exclusive_weight=0.0,
         decoder_type="dense", sparse_weight=0.0, class_diverse=False,
+        boundary_weight=0.3, edge_weight=4.0, corner_weight=6.0,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, image_size=224, encoder_pretrained=None,
         backbone="custom",

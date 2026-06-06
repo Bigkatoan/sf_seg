@@ -20,5 +20,8 @@
   "decoder_type": "dense",
   "class_diverse": false,
   "resume": false,
-  "backbone": "resnet18"
+  "backbone": "resnet18",
+  "boundary_weight": 0.3,
+  "edge_weight": 4.0,
+  "corner_weight": 6.0
 }

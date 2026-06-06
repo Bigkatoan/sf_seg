@@ -361,6 +361,80 @@ def diversity_loss(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return (off_diag ** 2).sum(dim=[1, 2]).mean() / (C * (C - 1))
 
 
+# ── Boundary-aware loss (edge + corner) ──────────────────────────────────────
+
+def _edge_map(target: torch.Tensor) -> torch.Tensor:
+    """Binary edge map: pixels where the class label changes (Laplacian on GT)."""
+    t      = target.float().unsqueeze(1)                              # (B,1,H,W)
+    kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                           dtype=torch.float32, device=target.device).view(1, 1, 3, 3)
+    return (F.conv2d(t, kernel, padding=1).abs() > 0).float()        # (B,1,H,W) binary
+
+
+def _corner_map(target: torch.Tensor) -> torch.Tensor:
+    """Soft corner map: |Sobel_x| × |Sobel_y| on GT, normalised to [0,1].
+
+    High values where two edges meet at an angle — class boundary corners.
+    """
+    t  = target.float().unsqueeze(1)                                  # (B,1,H,W)
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                       dtype=torch.float32, device=target.device).view(1, 1, 3, 3)
+    ky = kx.transpose(2, 3).contiguous()
+    gx = F.conv2d(t, kx, padding=1).abs()
+    gy = F.conv2d(t, ky, padding=1).abs()
+    c  = gx * gy
+    return c / c.amax(dim=[2, 3], keepdim=True).clamp(min=1e-8)      # (B,1,H,W) in [0,1]
+
+
+def edge_corner_loss(logits: torch.Tensor, target: torch.Tensor,
+                     edge_weight: float = 4.0,
+                     corner_weight: float = 6.0,
+                     gamma: float = 2.0,
+                     dilate: int = 2) -> torch.Tensor:
+    """Focal CE weighted by spatial importance at class boundaries and corners.
+
+    Penalises the model more heavily where it matters most for visual quality:
+      edge pixels   — where the class label changes
+      corner pixels — where two boundaries meet (highest curvature)
+
+    Strategy:
+      1. Extract edge map  (Laplacian on GT → binary)
+      2. Extract corner map (|Sobel_x| × |Sobel_y| on GT → soft [0,1])
+      3. Dilate both maps by `dilate` pixels (gives the model some slack)
+      4. Build spatial weight map: w = 1 + edge_weight*E + corner_weight*C
+      5. Per-pixel focal CE, scaled by w, normalised by total weight
+
+    Args:
+        logits       : (B, C, H, W) raw model output
+        target       : (B, H, W)   integer class labels
+        edge_weight  : additive multiplier at boundary pixels
+        corner_weight: additive multiplier at corner pixels
+        gamma        : focal exponent (0 = plain CE, 2 = standard focal)
+        dilate       : dilation radius for edge/corner maps
+    """
+    # Structural maps from GT (no gradient — GT is constant)
+    with torch.no_grad():
+        edge   = _edge_map(target)    # (B,1,H,W) binary
+        corner = _corner_map(target)  # (B,1,H,W) soft
+
+        if dilate > 0:
+            k      = 2 * dilate + 1
+            edge   = F.max_pool2d(edge,   k, stride=1, padding=dilate)
+            corner = F.max_pool2d(corner, k, stride=1, padding=dilate)
+
+        # Spatial weight: background = 1, edge = 1+edge_weight, corner = addl corner_weight
+        w = (1.0
+             + edge_weight   * edge.squeeze(1)
+             + corner_weight * corner.squeeze(1))                     # (B,H,W)
+
+    # Per-pixel focal loss
+    ce    = F.cross_entropy(logits.float(), target, reduction='none') # (B,H,W)
+    pt    = torch.exp(-ce)
+    focal = (1.0 - pt).pow(gamma) * ce
+
+    return (focal * w).sum() / w.sum().clamp(min=1.0)
+
+
 if __name__ == "__main__":
     # smoke tests
     # binary
