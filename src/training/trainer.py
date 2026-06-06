@@ -74,19 +74,58 @@ class SegmentationDataset(Dataset):
         mask = mask.resize((sz, sz), Image.NEAREST)
 
         if self.augment:
+            # ── Spatial augmentation (image + mask together) ──────────────────
+            # Random horizontal flip
+            if random.random() > 0.5:
+                img  = TF.hflip(img)
+                mask = TF.hflip(mask)
+
+            # Random resized crop: scale [0.5, 2.0] → crop → resize to sz
+            # Simulates viewing the same scene at different distances
+            scale  = random.uniform(0.5, 2.0)
+            crop_w = int(sz / scale)
+            crop_h = int(sz / scale)
+            # Pad if crop size exceeds image size
+            pad_w  = max(0, crop_w - sz)
+            pad_h  = max(0, crop_h - sz)
+            if pad_w > 0 or pad_h > 0:
+                img  = TF.pad(img,  [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
+                              fill=0)
+                mask = TF.pad(mask, [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
+                              fill=0)
+            iw, ih = img.size
+            x0 = random.randint(0, max(0, iw - crop_w))
+            y0 = random.randint(0, max(0, ih - crop_h))
+            img  = TF.resized_crop(img,  y0, x0, crop_h, crop_w, (sz, sz), Image.BILINEAR)
+            mask = TF.resized_crop(mask, y0, x0, crop_h, crop_w, (sz, sz), Image.NEAREST)
+
             img_t = TF.to_tensor(img).float()          # (3, H, W) in [0, 1]
 
-            # Gaussian noise (sigma tunable via noise_aug.py)
+            # ── Photometric augmentation (image only) ─────────────────────────
+            # Color jitter: brightness, contrast, saturation, hue
             if random.random() > 0.5:
-                sigma = random.uniform(0.01, 0.04)
+                img_t = TF.adjust_brightness(img_t, random.uniform(0.6, 1.4))
+            if random.random() > 0.5:
+                img_t = TF.adjust_contrast(img_t, random.uniform(0.6, 1.4))
+            if random.random() > 0.5:
+                img_t = TF.adjust_saturation(img_t, random.uniform(0.6, 1.4))
+            if random.random() > 0.5:
+                img_t = TF.adjust_hue(img_t, random.uniform(-0.1, 0.1))
+            img_t = img_t.clamp(0.0, 1.0)
+
+            # Gaussian noise
+            if random.random() > 0.5:
+                sigma = random.uniform(0.005, 0.03)
                 img_t = (img_t + torch.randn_like(img_t) * sigma).clamp(0.0, 1.0)
 
-            # Brightness / contrast (image-only, no label noise)
-            if random.random() > 0.5:
-                img_t = (img_t * random.uniform(0.80, 1.20)).clamp(0.0, 1.0)
-            if random.random() > 0.5:
-                mean  = img_t.mean()
-                img_t = ((img_t - mean) * random.uniform(0.8, 1.2) + mean).clamp(0.0, 1.0)
+            # Random erasing (Cutout) — forces context-based reasoning
+            if random.random() > 0.7:
+                _, H, W = img_t.shape
+                rh = random.randint(H // 8, H // 4)
+                rw = random.randint(W // 8, W // 4)
+                ry = random.randint(0, H - rh)
+                rx = random.randint(0, W - rw)
+                img_t[:, ry:ry+rh, rx:rx+rw] = 0.0
 
             if self.num_classes > 1:
                 mask_t = torch.from_numpy(np.array(mask)).long()
@@ -284,7 +323,7 @@ def train(args):
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     warmup_ep    = min(5, args.epochs // 10)          # 5-epoch linear warmup
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep)

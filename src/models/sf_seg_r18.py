@@ -139,10 +139,12 @@ class sf_seg(nn.Module):
         )
         self.fuse_sm_med = nn.Sequential(
             nn.Conv2d(C + C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+            nn.Dropout2d(0.1),
             nn.Conv2d(C, C, 3, padding=1, bias=False),     _gn(C), nn.GELU(),
         )
         self.fuse_med_lg = nn.Sequential(
             nn.Conv2d(C + C, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+            nn.Dropout2d(0.1),
             nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
         )
         self.pre_masks = nn.Sequential(
