@@ -1,11 +1,14 @@
 """sf_loss — unified training loss for sf_seg.
 
 Shared tensors (computed once per step):
-    probs       softmax(logits)          used by: seg IoU
     ce_raw      CE per pixel (no_reduce) used by: seg focal CE
     attn_s      pool(attn, guide_size²)  used by: guide, excl
     gt_f        one_hot(target_14)       used by: guide, excl
     iou_m_ng    no-grad BMM(gt_f, atn_f) used by: guide winner + excl winner mask
+
+Note: probs (softmax) is NOT computed at full resolution — _seg_term downsamples
+logits to 56×56 before softmax, reducing peak memory from ~2 GB to ~120 MB
+(B=32, C=151). Focal CE still uses full-resolution ce_raw.
 
 Note: boundary/edge term removed — it showed near-zero contribution (bd≈0)
 while adding instability. Attention guide+excl losses already supervise
@@ -56,23 +59,36 @@ def _safe(t: torch.Tensor) -> torch.Tensor:
 
 # ── Term implementations ──────────────────────────────────────────────────────
 
-def _seg_term(target: torch.Tensor, probs: torch.Tensor,
+def _seg_term(target: torch.Tensor, logits: torch.Tensor,
               ce_raw: torch.Tensor, cfg: SFLossConfig,
-              eps: float = 1e-3) -> torch.Tensor:
+              iou_size: int = 56, eps: float = 1e-3) -> torch.Tensor:
     """focal_w * focal_CE  +  iou_w * soft_IoU(no_obj_weight).
 
-    Replicates focal_iou_loss exactly while reusing shared probs + ce_raw.
+    Focal CE uses full-resolution ce_raw (cheap, BxHxW).
+    Soft IoU downsamples logits to iou_size before softmax — avoids allocating
+    a (B, C, H, W) fp32 probs tensor which is ~2 GB for B=32, C=151, H=W=224.
     """
-    B, C = probs.shape[:2]
+    B, C, H, W = logits.shape
 
-    # Focal CE — ce_raw clamped before BOTH exp and multiplication
+    # Focal CE — full resolution (ce_raw is BxHxW, cheap)
     ce_c  = ce_raw.clamp(max=100.0)
     pt    = torch.exp(-ce_c)
     f_ce  = _safe(((1.0 - pt) ** cfg.focal_gamma * ce_c).mean())
 
-    # Soft IoU — reuses shared probs (no second softmax needed)
-    tgt_oh    = F.one_hot(target.clamp(0, C - 1), C).permute(0, 3, 1, 2).float()
-    pred_flat = probs.view(B, C, -1)
+    # Soft IoU — downsampled to iou_size×iou_size (16× smaller memory for 224→56)
+    # pool logits first then softmax avoids large fp32 intermediate
+    s = min(iou_size, H, W)
+    if H != s or W != s:
+        logits_s = F.adaptive_avg_pool2d(logits.float(), (s, s))
+        tgt_s    = F.interpolate(target.float().unsqueeze(1), (s, s),
+                                 mode="nearest").squeeze(1).long().clamp(0, C - 1)
+    else:
+        logits_s = logits.float()
+        tgt_s    = target.clamp(0, C - 1)
+
+    probs_s   = F.softmax(logits_s, dim=1)
+    tgt_oh    = F.one_hot(tgt_s, C).permute(0, 3, 1, 2).float()
+    pred_flat = probs_s.view(B, C, -1)
     tgt_flat  = tgt_oh.view(B, C, -1)
 
     inter   = (pred_flat * tgt_flat).sum(-1)
@@ -179,8 +195,9 @@ def sf_loss(logits: torch.Tensor, attn: torch.Tensor,
     # Safety: clamp target before ALL indexing/CE — ADE20K has ignore pixels (255)
     tgt = target.clamp(0, C - 1)
 
-    # ── Shared: softmax + per-pixel CE (always float32) ───────────────────────
-    probs  = F.softmax(logits.float(), dim=1)
+    # ── Shared: per-pixel CE (full resolution, always float32) ───────────────
+    # probs NOT computed here — _seg_term computes downsampled probs for IoU
+    # to avoid allocating a (B,C,H,W) fp32 tensor (~2 GB for B=32,C=151,HW=224)
     ce_raw = F.cross_entropy(logits.float(), tgt, reduction="none")
 
     # ── Shared: attn + target downsampled to guide_size × guide_size ──────────
@@ -206,7 +223,7 @@ def sf_loss(logits: torch.Tensor, attn: torch.Tensor,
                     / (union_ng + 1e-3).clamp(min=1e-3)).clamp(0.0, 1.0)
 
     # ── Loss terms ─────────────────────────────────────────────────────────────
-    s = _seg_term(tgt, probs, ce_raw, cfg)
+    s = _seg_term(tgt, logits, ce_raw, cfg)
 
     if cfg.guide_weight > 0 or cfg.excl_weight > 0:
         g_raw, e_raw = _attn_term(attn_s, gt_f, atn_f, iou_m_ng, cfg)
