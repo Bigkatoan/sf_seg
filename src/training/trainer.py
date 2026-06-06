@@ -199,6 +199,13 @@ def compute_class_weights(masks_dir: Path, num_classes: int,
     return torch.from_numpy(weights).float()
 
 
+# ── Multi-GPU helper ─────────────────────────────────────────────────────────
+
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    """Return bare model, stripping nn.DataParallel wrapper if present."""
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
 # ── Loss dispatcher ───────────────────────────────────────────────────────────
 
 def seg_loss(logits, masks, loss_type, criterion, num_classes,
@@ -319,10 +326,18 @@ def train(args):
                        encoder_stride=args.encoder_stride, num_classes=num_classes,
                        decoder_type=args.decoder_type,
                        encoder_pretrained=args.encoder_pretrained).to(device)
-    print(f"Backbone: {args.backbone}  |  params: {model.get_num_parameters():,}  |  "
-          f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  device={device}")
+
+    num_gpus = torch.cuda.device_count() if device.type == 'cuda' else 1
+    if num_gpus > 1:
+        model = torch.nn.DataParallel(model, device_ids=list(range(num_gpus)))
+        logging.info(f"DataParallel: {num_gpus} GPUs — "
+                     + ", ".join(torch.cuda.get_device_name(i) for i in range(num_gpus)))
+
+    print(f"Backbone: {args.backbone}  |  params: {_unwrap(model).get_num_parameters():,}  |  "
+          f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  "
+          f"GPUs={num_gpus}  |  device={device}")
     if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU0: {torch.cuda.get_device_name(0)}")
 
     optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     warmup_ep    = min(5, args.epochs // 10)          # 5-epoch linear warmup
@@ -441,7 +456,7 @@ def train(args):
                     if ckpt.get("num_classes", 1) != num_classes:
                         logging.warning("Checkpoint num_classes mismatch — skipping resume")
                     else:
-                        model.load_state_dict(ckpt["model_state_dict"])
+                        _unwrap(model).load_state_dict(ckpt["model_state_dict"])
                         try: optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                         except Exception: pass
                         try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -450,7 +465,7 @@ def train(args):
                         best_val    = ckpt.get("best_val_loss", best_val)
                         logging.info(f"Resumed from {fp}, epoch {start_epoch}")
                 else:
-                    model.load_state_dict(ckpt)
+                    _unwrap(model).load_state_dict(ckpt)
             except Exception as e:
                 logging.warning(f"Resume failed: {e}")
         else:
@@ -555,7 +570,7 @@ def train(args):
         lr = scheduler.get_last_lr()[0]; scheduler.step()
         routing_info = ""
         if args.decoder_type == "sparse":
-            rs = model.routing_weight_stats()
+            rs = _unwrap(model).routing_weight_stats()
             routing_info = (f" | routing sparsity={rs['routing_sparsity']:.2%}"
                             f" mean={rs['routing_mean']:.4f}")
         logging.info(
@@ -585,13 +600,13 @@ def train(args):
             tb_writer.add_scalar("Accuracy/val",      vl['acc'],      epoch)
             tb_writer.add_scalar("LR",                lr,             epoch)
             if epoch == 1 or epoch % 5 == 0:
-                _tb_log_images(tb_writer, model, epoch, num_classes, device)
+                _tb_log_images(tb_writer, _unwrap(model), epoch, num_classes, device)
 
         # Checkpoint
         try:
             improved = vseen and vl['loss'] < best_val
             if improved: best_val = vl['loss']
-            ckpt = dict(epoch=epoch, model_state_dict=model.state_dict(),
+            ckpt = dict(epoch=epoch, model_state_dict=_unwrap(model).state_dict(),
                         optimizer_state_dict=optimizer.state_dict(),
                         scheduler_state_dict=scheduler.state_dict(),
                         best_val_loss=best_val, num_channels=args.num_channels,
@@ -605,7 +620,7 @@ def train(args):
             logging.warning(f"Checkpoint save failed: {e}")
 
         try:
-            save_val_sample(model, val_ds, device, out_dir, epoch, cat_names)
+            save_val_sample(_unwrap(model), val_ds, device, out_dir, epoch, cat_names)
         except Exception as e:
             logging.warning(f"Sample save failed: {e}")
 
