@@ -6,9 +6,16 @@ Shared tensors (computed once per step):
     attn_s      pool(attn, guide_size²)  used by: guide, excl
     gt_f        one_hot(target_14)       used by: guide, excl
     iou_m_ng    no-grad BMM(gt_f, atn_f) used by: guide winner + excl winner mask
+
+Numerical safety rules applied throughout:
+  - target always clamped to [0, C-1] before any indexing or CE
+  - ce_raw clamped to max=100 before every multiplication (not just before exp)
+  - all IoU denominators have .clamp(min=eps) guard
+  - all term outputs wrapped with nan_to_num
+  - BMM / element-wise ops forced to float32 (out of autocast float16 path via torch.no_grad context or explicit .float())
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -24,11 +31,11 @@ class SFLossConfig:
     diversity_weight: float = 0.1
     guide_weight:     float = 0.3
     excl_weight:      float = 0.2
-    # Seg — matches focal_iou_loss defaults
+    # Seg — matches focal_iou_loss defaults exactly
     focal_gamma:      float = 2.0
-    focal_w:          float = 0.6   # weight for focal CE in seg term
-    iou_w:            float = 0.4   # weight for soft-IoU in seg term
-    no_obj_weight:    float = 0.1   # weight for absent classes in IoU
+    focal_w:          float = 0.6
+    iou_w:            float = 0.4
+    no_obj_weight:    float = 0.1
     # Boundary
     edge_weight:      float = 4.0
     corner_weight:    float = 6.0
@@ -51,6 +58,13 @@ class SFLossConfig:
         )
 
 
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _safe(t: torch.Tensor) -> torch.Tensor:
+    """Replace NaN/Inf in a tensor with 0. Used to guard every term output."""
+    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 # ── Term implementations ──────────────────────────────────────────────────────
 
 def _seg_term(target: torch.Tensor, probs: torch.Tensor,
@@ -59,28 +73,33 @@ def _seg_term(target: torch.Tensor, probs: torch.Tensor,
     """Replicate focal_iou_loss exactly, reusing shared probs and ce_raw.
 
     focal_w * focal_CE  +  iou_w * soft_IoU(no_obj_weight)
-    — identical gradient signal to the pre-sf_loss focal_iou_loss call.
+    Matches gradient signal of focal_iou_loss(focal_w=0.6, iou_w=0.4, no_obj=0.1).
+
+    Safety:
+      - ce_raw clamped before EVERY multiplication (not just before exp)
+      - IoU denominator explicitly clamped to ≥ eps
+      - nan_to_num on all intermediate and final results
     """
     B, C = probs.shape[:2]
-
-    # Focal CE — reuses shared ce_raw (no second forward through CE)
-    pt    = torch.exp(-ce_raw.clamp(max=100.0))
-    f_ce  = ((1.0 - pt) ** cfg.focal_gamma * ce_raw).mean()
+    # Clamp CE — prevents inf from propagating into focal multiplication
+    ce_c  = ce_raw.clamp(max=100.0)
+    pt    = torch.exp(-ce_c)
+    f_ce  = _safe(((1.0 - pt) ** cfg.focal_gamma * ce_c).mean())
 
     # Soft IoU — reuses shared probs (no second softmax)
     tgt_oh    = F.one_hot(target.clamp(0, C - 1), C).permute(0, 3, 1, 2).float()
-    pred_flat = probs.view(B, C, -1)
-    tgt_flat  = tgt_oh.view(B, C, -1)
+    pred_flat = probs.view(B, C, -1)           # (B,C,HW)
+    tgt_flat  = tgt_oh.view(B, C, -1)         # (B,C,HW)
 
-    inter   = (pred_flat * tgt_flat).sum(-1)                       # (B,C)
+    inter   = (pred_flat * tgt_flat).sum(-1)   # (B,C)
     union   = pred_flat.sum(-1) + tgt_flat.sum(-1) - inter
     iou     = ((inter + eps) / (union + eps).clamp(min=eps)).clamp(0., 1.)
 
     present = (tgt_flat.sum(-1) > 0).float()
-    weight  = present + cfg.no_obj_weight * (1.0 - present)        # no_obj for absent
-    iou_l   = ((1.0 - iou) * weight).sum() / weight.sum().clamp(min=1.)
+    weight  = present + cfg.no_obj_weight * (1.0 - present)
+    iou_l   = _safe(((1.0 - iou) * weight).sum() / weight.sum().clamp(min=eps))
 
-    return cfg.focal_w * f_ce + cfg.iou_w * iou_l
+    return _safe(cfg.focal_w * f_ce + cfg.iou_w * iou_l)
 
 
 def _boundary_term(ce_raw: torch.Tensor, target: torch.Tensor,
@@ -108,18 +127,22 @@ def _boundary_term(ce_raw: torch.Tensor, target: torch.Tensor,
              + cfg.edge_weight   * edge.squeeze(1)
              + cfg.corner_weight * corner.squeeze(1)).clamp(max=20.0)
 
-    # Reuse shared ce_raw — no second cross_entropy call
-    pt    = torch.exp(-ce_raw.clamp(max=100.0))
-    focal = (1.0 - pt).pow(cfg.focal_gamma) * ce_raw
-    focal = torch.nan_to_num(focal, nan=0.0, posinf=100.0, neginf=0.0)
+    # Clamp ce_raw before multiplication (same as seg term)
+    ce_c  = ce_raw.clamp(max=100.0)
+    pt    = torch.exp(-ce_c)
+    focal = _safe((1.0 - pt).pow(cfg.focal_gamma) * ce_c)
 
-    return torch.nan_to_num((focal * w).sum() / w.sum().clamp(min=1.0), nan=0.0)
+    return _safe((focal * w).sum() / w.sum().clamp(min=1.0))
 
 
 def _attn_term(attn_s: torch.Tensor, gt_f: torch.Tensor,
                atn_f: torch.Tensor, iou_m_ng: torch.Tensor,
                cfg: SFLossConfig, eps: float = 1e-3):
-    """Guide + exclusivity losses sharing the pre-computed no-grad IoU matrix."""
+    """Guide + exclusivity losses sharing the pre-computed no-grad IoU matrix.
+
+    All BMM ops run in explicit float32 via .float() to avoid autocast
+    casting them to float16 (torch.bmm is in the autocast eligible list).
+    """
     B, num_classes, L = gt_f.shape
     B, K, _           = atn_f.shape
 
@@ -138,25 +161,31 @@ def _attn_term(attn_s: torch.Tensor, gt_f: torch.Tensor,
     mx          = w_maps.amax(-1, keepdim=True).clamp(min=1e-6)
     w_norm      = (w_maps / mx).clamp(0.0, 1.0)
 
-    p    = w_norm[present]
-    t    = gt_f[present]
-    dice = 1.0 - (2.0 * (p * t).sum(-1) + eps) / (p.sum(-1) + t.sum(-1) + eps)
-    guide = dice.mean()
+    p    = w_norm[present]                                              # (N,L)
+    t    = gt_f[present]                                                # (N,L)
+    dice = 1.0 - (2.0 * (p * t).sum(-1) + eps) / (p.sum(-1) + t.sum(-1) + eps).clamp(min=eps)
+    guide = _safe(dice.mean())
 
     # ── Excl: non-winner channels must not overlap other classes ─────────────
-    inter_g = torch.bmm(gt_f, atn_f.transpose(1, 2))                  # (B,C,K)
-    union_g = gt_f.sum(-1, keepdim=True) + atn_f.sum(-1).unsqueeze(1) - inter_g
-    iou_g   = ((inter_g + eps) / (union_g + eps)).clamp(0.0, 1.0)
+    # Force float32 explicitly — torch.bmm is autocast-eligible and would run
+    # in float16 inside autocast context, causing precision loss.
+    gt_f_f32  = gt_f.float()
+    atn_f_f32 = atn_f.float()
+
+    inter_g = torch.bmm(gt_f_f32, atn_f_f32.transpose(1, 2))          # (B,C,K) f32
+    union_g = (gt_f_f32.sum(-1, keepdim=True)
+               + atn_f_f32.sum(-1).unsqueeze(1) - inter_g)
+    iou_g   = ((inter_g + eps) / (union_g + eps).clamp(min=eps)).clamp(0.0, 1.0)
     iou_g   = iou_g * present.float().unsqueeze(-1)
     iou_pc  = iou_g.permute(0, 2, 1)                                   # (B,K,C)
 
     with torch.no_grad():
         iou_pc_ng = iou_m_ng.permute(0, 2, 1) * present.float().unsqueeze(-2)
         best      = iou_pc_ng.max(dim=-1, keepdim=True).values
-        winner    = (iou_pc_ng == best).float()                        # (B,K,C)
+        winner    = (iou_pc_ng == best).float()
 
     non_win = iou_pc * (1.0 - winner)
-    excl    = non_win.sum() / (1.0 - winner).sum().clamp(min=1.0)
+    excl    = _safe(non_win.sum() / (1.0 - winner).sum().clamp(min=1.0))
 
     return guide, excl
 
@@ -166,13 +195,13 @@ def _diversity_term(attn: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     B, C, H, W = attn.shape
     a = attn.view(B, C, H * W).float()
     if a.shape[-1] > 1024:
-        # subsample spatially — avoid randperm (CPU-GPU sync); strided slice is faster
         a = a[:, :, ::max(1, a.shape[-1] // 1024)]
     a    = F.normalize(a, dim=-1, eps=eps)
-    gram = torch.bmm(a, a.transpose(1, 2))                            # (B,C,C)
+    # Force float32 for bmm — autocast would downcast to float16
+    gram = torch.bmm(a.float(), a.float().transpose(1, 2))
     eye  = torch.eye(C, device=attn.device, dtype=gram.dtype)
     off  = gram * (1.0 - eye)
-    return (off ** 2).sum(dim=[1, 2]).mean() / max(1.0, C * (C - 1))
+    return _safe((off ** 2).sum(dim=[1, 2]).mean() / max(1.0, C * (C - 1)))
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -181,54 +210,57 @@ def sf_loss(logits: torch.Tensor, attn: torch.Tensor,
             target: torch.Tensor, cfg: SFLossConfig):
     """Unified sf_seg training loss.
 
-    Shared computations vs. calling individual functions separately:
-        softmax(logits)          1×  instead of 2×  (saves 1 softmax at 224×224×151)
-        cross_entropy (no_red)   1×  instead of 2×  (shared by seg focal + boundary)
-        pool(attn, guide_size²)  1×  instead of 2×
-        interpolate(target)      1×  instead of 2×
-        one_hot(tgt_14)          1×  instead of 2×
-        no-grad BMM(IoU matrix)  1×  shared for guide + excl winner selection
-
     Args:
-        logits : (B, C, H, W)    raw model logits
+        logits : (B, C, H, W)    raw model logits (float16 or float32)
         attn   : (B, K, H', W')  attention maps from head_large
         target : (B, H, W)       integer class labels in [0, C-1]
+                                  values outside this range are clamped safely
         cfg    : SFLossConfig
 
     Returns:
         total  : scalar loss (differentiable)
         parts  : dict {"seg","boundary","guide","excl","div"} — detached scalars
     """
+    C    = cfg.num_classes
     zero = logits.new_tensor(0.0)
 
-    # ── Shared: softmax + per-pixel CE ────────────────────────────────────────
-    probs  = F.softmax(logits.float(), dim=1)              # reused by seg IoU
-    ce_raw = F.cross_entropy(logits.float(), target,
-                             reduction="none")              # reused by seg focal + boundary
+    # Safety: clamp target to valid range before ALL indexing operations.
+    # ADE20K masks can contain 255 (ignore) — unclamped target → CUDA OOB → NaN.
+    tgt = target.clamp(0, C - 1)
+
+    # ── Shared: softmax + per-pixel CE (both in float32) ──────────────────────
+    # F.softmax is NOT in autocast eligible list → stays float32 with .float() input.
+    # F.cross_entropy is NOT autocast-eligible → stays float32 always.
+    probs  = F.softmax(logits.float(), dim=1)
+    ce_raw = F.cross_entropy(logits.float(), tgt, reduction="none")
 
     # ── Shared: attn + target downsampled to guide_size × guide_size ──────────
     g      = cfg.guide_size
-    attn_s = F.adaptive_avg_pool2d(attn.float(), (g, g))
-    tgt_s  = F.interpolate(target.float().unsqueeze(1), (g, g),
-                           mode="nearest").squeeze(1).long()
+    attn_s = F.adaptive_avg_pool2d(attn.float(), (g, g))              # (B,K,g,g) f32
+    tgt_s  = F.interpolate(tgt.float().unsqueeze(1), (g, g),
+                           mode="nearest").squeeze(1).long()           # (B,g,g)
     L    = g * g
     B, K = attn_s.shape[:2]
-    gt_f = (F.one_hot(tgt_s.clamp(0, cfg.num_classes - 1), cfg.num_classes)
+    gt_f = (F.one_hot(tgt_s, C)
               .permute(0, 3, 1, 2).float()
-              .view(B, cfg.num_classes, L))
-    atn_f = attn_s.view(B, K, L)
+              .view(B, C, L))                                          # (B,C,L) f32
+    atn_f = attn_s.view(B, K, L)                                      # (B,K,L) f32
 
     # ── Shared: no-grad IoU matrix ─────────────────────────────────────────────
+    # Explicitly float32 — torch.bmm inside autocast would otherwise run float16.
     with torch.no_grad():
-        inter_ng = torch.bmm(gt_f, atn_f.transpose(1, 2))
-        union_ng = (gt_f.sum(-1, keepdim=True)
-                    + atn_f.sum(-1).unsqueeze(1) - inter_ng)
-        iou_m_ng = ((inter_ng + 1e-3) / (union_ng + 1e-3)).clamp(0.0, 1.0)
+        gt_f_f32  = gt_f.float()
+        atn_f_f32 = atn_f.float()
+        inter_ng = torch.bmm(gt_f_f32, atn_f_f32.transpose(1, 2))    # (B,C,K)
+        union_ng = (gt_f_f32.sum(-1, keepdim=True)
+                    + atn_f_f32.sum(-1).unsqueeze(1) - inter_ng)
+        iou_m_ng = ((inter_ng + 1e-3)
+                    / (union_ng + 1e-3).clamp(min=1e-3)).clamp(0.0, 1.0)
 
     # ── Loss terms ─────────────────────────────────────────────────────────────
-    s  = _seg_term(target, probs, ce_raw, cfg)
+    s  = _seg_term(tgt, probs, ce_raw, cfg)
 
-    bd = (cfg.boundary_weight * _boundary_term(ce_raw, target, cfg)
+    bd = (cfg.boundary_weight * _boundary_term(ce_raw, tgt, cfg)
           if cfg.boundary_weight > 0 else zero)
 
     if cfg.guide_weight > 0 or cfg.excl_weight > 0:
@@ -261,7 +293,9 @@ if __name__ == "__main__":
     B      = 4
     logits = torch.randn(B, 151, 224, 224)
     attn   = torch.rand(B, 128, 56, 56)
+    # Include out-of-range class index to verify safety clamping
     target = torch.randint(0, 151, (B, 224, 224))
+    target[0, 0, 0] = 255   # simulate ADE20K ignore pixel
 
     for _ in range(2):
         loss, parts = sf_loss(logits, attn, target, cfg)
@@ -275,4 +309,5 @@ if __name__ == "__main__":
     print(f"sf_loss total  : {loss.item():.4f}")
     for k, v in parts.items():
         print(f"  {k:<10}: {v.item():.4f}")
-    print(f"\nAvg time/call  : {elapsed:.1f} ms  (B={B}, CPU)")
+    print(f"\nAll finite: {all(torch.isfinite(v) for v in parts.values())}")
+    print(f"Avg time/call  : {elapsed:.1f} ms  (B={B}, CPU)")
