@@ -34,7 +34,7 @@ from src.losses import (iou_loss, combine_losses, mse_loss, diversity_loss,
                          multiclass_iou_loss, ce_iou_loss,
                          focal_loss, focal_iou_loss, pure_focal_iou_loss,
                          attention_guide_loss, attention_exclusivity_loss,
-                         edge_corner_loss)
+                         edge_corner_loss, sf_loss, SFLossConfig)
 from src.models import sf_seg as _sf_seg_custom
 from src.models import sf_seg_r18 as _sf_seg_r18
 
@@ -336,6 +336,9 @@ def train(args):
 
     criterion = nn.BCELoss() if num_classes == 1 and args.loss_type in ("bce", "bce_iou") else None
 
+    # ── sf_loss config (built once, used every step) ───────────────────────────
+    sf_cfg = SFLossConfig.from_args(args)
+
     # ── Logging setup ──────────────────────────────────────────────────────────
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -371,8 +374,9 @@ def train(args):
     csv_file = open(csv_path, 'w', newline='')
     csv_w    = csv.writer(csv_file)
     csv_w.writerow(['epoch',
-                    'train_loss', 'train_seg', 'train_div', 'train_acc', 'train_miou',
-                    'val_loss',   'val_seg',                'val_acc',   'val_miou'])
+                    'train_loss', 'train_seg', 'train_boundary', 'train_guide',
+                    'train_excl', 'train_div', 'train_acc', 'train_miou',
+                    'val_loss',   'val_seg',   'val_acc',   'val_miou'])
 
     # ── Checkpoint dirs ────────────────────────────────────────────────────────
     out_dir  = Path(args.output_dir);     out_dir.mkdir(parents=True, exist_ok=True)
@@ -458,7 +462,7 @@ def train(args):
 
         # Train
         model.train()
-        tr   = dict(loss=0., seg=0., div=0., acc=0.)
+        tr   = dict(loss=0., seg=0., boundary=0., guide=0., excl=0., div=0., acc=0.)
         seen = 0
         conf_tr = torch.zeros(num_classes, num_classes, dtype=torch.long, device=device)
         bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
@@ -466,37 +470,21 @@ def train(args):
             imgs, masks = imgs.to(device, non_blocking=pin), masks.to(device, non_blocking=pin)
             with autocast('cuda', enabled=device.type == 'cuda'):
                 logits, _, attn = model(imgs)
-                s = seg_loss(logits, masks, args.loss_type, criterion, num_classes,
-                             args.no_obj_weight, class_weights, args.absent_weight)
-                zero = logits.new_tensor(0.0)
-                d = args.diversity_weight * diversity_loss(attn) if args.diversity_weight > 0 \
-                    else zero
-                g = args.attn_guide_weight * attention_guide_loss(
-                        attn, masks, num_classes) \
-                    if args.attn_guide_weight > 0 and num_classes > 1 \
-                    else zero
-                e = args.attn_exclusive_weight * attention_exclusivity_loss(
-                        attn, masks, num_classes) \
-                    if args.attn_exclusive_weight > 0 and num_classes > 1 \
-                    else zero
-                sp_raw = model.routing_sparsity_loss()
-                sp = args.sparse_weight * sp_raw \
-                     if args.sparse_weight > 0 and sp_raw is not None \
-                     else zero
-                bd = args.boundary_weight * edge_corner_loss(
-                        logits, masks,
-                        edge_weight=args.edge_weight,
-                        corner_weight=args.corner_weight) \
-                     if args.boundary_weight > 0 and num_classes > 1 \
-                     else zero
-                loss = s + d + g + e + sp + bd
+                if num_classes > 1:
+                    loss, parts = sf_loss(logits, attn, masks, sf_cfg)
+                else:
+                    loss = seg_loss(logits, masks, args.loss_type, criterion,
+                                    num_classes, args.no_obj_weight,
+                                    class_weights, args.absent_weight)
+                    parts = {"seg": loss.detach(), "boundary": logits.new_tensor(0.),
+                             "guide": logits.new_tensor(0.), "excl": logits.new_tensor(0.),
+                             "div": logits.new_tensor(0.)}
 
             if not torch.isfinite(loss):
                 logging.warning(
                     f"Non-finite loss ({loss.item():.4f}) at epoch {epoch} "
-                    f"seg={s.item():.4f} div={d.item():.4f} "
-                    f"guide={g.item():.4f} excl={e.item():.4f} "
-                    f"boundary={bd.item():.4f} — skipping batch")
+                    + "  ".join(f"{k}={v.item():.4f}" for k, v in parts.items())
+                    + " — skipping batch")
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -515,10 +503,16 @@ def train(args):
                     update_confusion_matrix(conf_tr, pred, masks)
                 else:
                     acc = ((torch.sigmoid(logits) > 0.5).float() == masks).float().mean().item()
-            tr['loss'] += loss.item() * b; tr['seg'] += s.item() * b
-            tr['div']  += d.item()    * b; tr['acc'] += acc * b; seen += b
-            bar.set_postfix(loss=f"{loss.item():.4f}", seg=f"{s.item():.4f}",
-                            div=f"{d.item():.4f}", acc=f"{acc:.4f}")
+            tr['loss']     += loss.item()              * b
+            tr['seg']      += parts['seg'].item()      * b
+            tr['boundary'] += parts['boundary'].item() * b
+            tr['guide']    += parts['guide'].item()    * b
+            tr['excl']     += parts['excl'].item()     * b
+            tr['div']      += parts['div'].item()      * b
+            tr['acc']      += acc * b
+            seen += b
+            bar.set_postfix(loss=f"{loss.item():.4f}", seg=f"{parts['seg'].item():.4f}",
+                            bd=f"{parts['boundary'].item():.4f}", acc=f"{acc:.4f}")
 
         tr = {k: v / seen for k, v in tr.items()}
         tr_miou, _ = miou_from_confusion(conf_tr.cpu()) if num_classes > 1 else (0., None)
@@ -567,26 +561,31 @@ def train(args):
                             f" mean={rs['routing_mean']:.4f}")
         logging.info(
             f"Epoch {epoch}/{args.epochs} | lr={lr:.2e} | "
-            f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} div={tr['div']:.4f} "
+            f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} bd={tr['boundary']:.4f} "
+            f"guide={tr['guide']:.4f} excl={tr['excl']:.4f} div={tr['div']:.4f} "
             f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} | "
             f"val   loss={vl['loss']:.4f} seg={vl['seg']:.4f} "
             f"acc={vl['acc']:.4f} mIoU={vl_miou:.4f}" + cls_info + routing_info)
         csv_w.writerow([epoch,
-                        tr['loss'], tr['seg'], tr['div'], tr['acc'], tr_miou,
-                        vl['loss'], vl['seg'],             vl['acc'], vl_miou])
+                        tr['loss'], tr['seg'], tr['boundary'], tr['guide'],
+                        tr['excl'], tr['div'], tr['acc'], tr_miou,
+                        vl['loss'], vl['seg'], vl['acc'], vl_miou])
         csv_file.flush()
 
         # ── TensorBoard scalars ────────────────────────────────────────────────
         if tb_writer is not None:
-            tb_writer.add_scalar("Loss/train",      tr['loss'],   epoch)
-            tb_writer.add_scalar("Loss/val",        vl['loss'],   epoch)
-            tb_writer.add_scalar("SegLoss/train",   tr['seg'],    epoch)
-            tb_writer.add_scalar("DivLoss/train",   tr['div'],    epoch)
-            tb_writer.add_scalar("mIoU/train",      tr_miou,      epoch)
-            tb_writer.add_scalar("mIoU/val",        vl_miou,      epoch)
-            tb_writer.add_scalar("Accuracy/train",  tr['acc'],    epoch)
-            tb_writer.add_scalar("Accuracy/val",    vl['acc'],    epoch)
-            tb_writer.add_scalar("LR",              lr,           epoch)
+            tb_writer.add_scalar("Loss/train",        tr['loss'],     epoch)
+            tb_writer.add_scalar("Loss/val",          vl['loss'],     epoch)
+            tb_writer.add_scalar("SegLoss/train",     tr['seg'],      epoch)
+            tb_writer.add_scalar("BoundaryLoss/train",tr['boundary'], epoch)
+            tb_writer.add_scalar("GuideLoss/train",   tr['guide'],    epoch)
+            tb_writer.add_scalar("ExclLoss/train",    tr['excl'],     epoch)
+            tb_writer.add_scalar("DivLoss/train",     tr['div'],      epoch)
+            tb_writer.add_scalar("mIoU/train",        tr_miou,        epoch)
+            tb_writer.add_scalar("mIoU/val",          vl_miou,        epoch)
+            tb_writer.add_scalar("Accuracy/train",    tr['acc'],      epoch)
+            tb_writer.add_scalar("Accuracy/val",      vl['acc'],      epoch)
+            tb_writer.add_scalar("LR",                lr,             epoch)
             if epoch == 1 or epoch % 5 == 0:
                 _tb_log_images(tb_writer, model, epoch, num_classes, device)
 

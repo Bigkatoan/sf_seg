@@ -1,4 +1,5 @@
 """Loss functions for semantic segmentation."""
+from .sf_loss import sf_loss, SFLossConfig
 from .losses import (
     iou_loss,
     multiclass_iou_loss,
@@ -15,6 +16,8 @@ from .losses import (
 )
 
 __all__ = [
+    "sf_loss",
+    "SFLossConfig",
     "iou_loss",
     "multiclass_iou_loss",
     "ce_iou_loss",
