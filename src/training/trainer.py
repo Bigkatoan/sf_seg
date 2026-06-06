@@ -12,7 +12,16 @@ import csv
 import json
 import logging
 import random
+import warnings
 from pathlib import Path
+
+# DataParallel in PyTorch 2.x emits a verbose backward-hook deprecation warning
+# on every backward pass. Suppress it — it is cosmetic and not actionable.
+warnings.filterwarnings(
+    "ignore",
+    message="Using a non-full backward hook",
+    category=UserWarning,
+)
 
 import numpy as np
 import torch
