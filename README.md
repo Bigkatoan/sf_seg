@@ -64,13 +64,13 @@ p = softmax(score) × k          # Σ=k, values may exceed 1
 attn = clamp(p − λ*, 0, 1)      # Σ=k, each value ∈ [0, 1]
 ```
 
-### Scale Table (`image_size=224`, `focus_size=28`, `C=128`)
+### Scale Table (`image_size=512`, `focus_size=64`, `C=128`)
 
 | Head | Feature level | Grid | k | L | Coverage |
 |:---|:---:|:---:|---:|---:|:---:|
-| `head_large` | H/4 | 56×56 | 784 | 3136 | 25% |
-| `head_medium` | H/8 | 28×28 | 196 | 784 | 25% |
-| `head_small` | H/16 | 14×14 | 9 | 196 | 4.6% |
+| `head_large` | H/4 | 128×128 | 4096 | 16384 | 25% |
+| `head_medium` | H/8 | 64×64 | 1024 | 4096 | 25% |
+| `head_small` | H/16 | 32×32 | 64 | 1024 | 6.3% |
 
 ---
 
@@ -230,12 +230,12 @@ Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`
 {
   "data_root":             "data",
   "epochs":                400,
-  "batch_size":            32,
+  "batch_size":            8,
   "lr":                    1e-4,
   "num_workers":           8,
-  "image_size":            224,
+  "image_size":            512,
   "num_channels":          128,
-  "focus_size":            28,
+  "focus_size":            64,
   "encoder_stride":        1,
   "num_classes":           151,
   "backbone":              "resnet18",
