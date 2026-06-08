@@ -230,9 +230,9 @@ Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`
 {
   "data_root":             "data",
   "epochs":                400,
-  "batch_size":            8,
+  "batch_size":            16,
   "lr":                    1e-4,
-  "num_workers":           8,
+  "num_workers":           4,
   "image_size":            512,
   "num_channels":          128,
   "focus_size":            64,
