@@ -191,7 +191,7 @@ Trains the full sf_seg feature pipeline (backbone + attention heads + decoder) a
 Supports both ImageFolder and WebDataset formats.
 
 ```bash
-python pretrain_encoder.py \
+python scripts/pretrain_encoder.py \
   --data /path/to/imagenet_wds \   # WebDataset shards (train-*.tar) or ImageFolder root
   --num-channels 128 \             # must match config.json
   --focus-size 28 \                # must match config.json
@@ -301,17 +301,26 @@ sf_seg/
 │   │   └── losses.py            # standalone loss functions
 │   ├── dataloaders/
 │   │   └── ade20k.py            # download + prepare ADE20K-150
-│   ├── training/
-│   │   └── trainer.py           # AMP, warmup, grad clip, mIoU, TensorBoard
-│   ├── visualization/
-│   │   ├── attention.py         # attention map visualisation
-│   │   └── evaluation.py        # evaluation utilities
-│   └── utils/
-│       └── benchmark.py         # latency benchmark (CUDA)
+│   └── training/
+│       └── trainer.py           # AMP, warmup, grad clip, mIoU, TensorBoard
+│
+├── scripts/
+│   ├── pretrain_encoder.py      # ImageNet backbone pretraining (custom backbone)
+│   ├── download_imagenet.py     # download ImageNet-1K via HuggingFace
+│   ├── pack_webdataset.py       # convert ImageFolder → WebDataset tar shards
+│   ├── noise_aug.py             # augmentation visualisation
+│   ├── benchmark.py             # latency benchmark (CUDA)
+│   ├── attention.py             # attention map visualisation
+│   ├── architecture.py          # architecture diagram
+│   └── evaluation.py            # evaluation utilities
+│
+├── docs/
+│   ├── architecture.png
+│   ├── architecture.svg
+│   └── sf_seg_methods.txt
 │
 ├── config.json                  # default hyperparameters
 ├── train.sh                     # launcher script
-├── pretrain_encoder.py          # ImageNet backbone pretraining (custom backbone)
-├── download_imagenet.py         # download ImageNet-1K via HuggingFace
-└── pack_webdataset.py           # convert ImageFolder → WebDataset tar shards
+├── setup.sh                     # venv setup
+└── requirements.txt
 ```
