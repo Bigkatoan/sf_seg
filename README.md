@@ -167,8 +167,11 @@ python -m src.dataloaders.ade20k --download
 ./train.sh
 
 # Select backbone explicitly
-python -m src.training.trainer --backbone custom    # custom (default)
-python -m src.training.trainer --backbone resnet18  # ImageNet pretrained
+python -m src.training.trainer --backbone custom    # custom GELU (default)
+python -m src.training.trainer --backbone resnet18  # ImageNet pretrained ResNet-18
+
+# Freeze ResNet-18 backbone — train only adapters + heads + decoder (~1.2M params)
+python -m src.training.trainer --backbone resnet18 --freeze-backbone
 
 # Override config values via CLI
 python -m src.training.trainer --epochs 200 --batch-size 16 --lr 3e-4
@@ -233,13 +236,18 @@ Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`
   "image_size":            224,
   "num_channels":          128,
   "focus_size":            28,
+  "encoder_stride":        1,
   "num_classes":           151,
   "backbone":              "custom",
+  "freeze_backbone":       false,
+  "encoder_pretrained":    null,
   "loss_type":             "focal_iou",
   "iou_w":                 0.5,
   "diversity_weight":      0.1,
+  "absent_weight":         0.2,
   "attn_guide_weight":     0.0,
   "attn_exclusive_weight": 0.0,
+  "decoder_type":          "dense",
   "resume":                false,
   "restart":               false,
   "aug_hflip":             true,
@@ -253,15 +261,26 @@ Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`
 
 All fields are overridable via CLI `--arg value`.
 
+| Key | Values | Notes |
+|---|---|---|
+| `backbone` | `custom` / `resnet18` | custom = GELU no-norm; resnet18 = ImageNet pretrained |
+| `freeze_backbone` | `false` / `true` | only applies to `resnet18`; freezes stem+layer1-3 |
+| `encoder_pretrained` | path or `null` | path to `enc_best.pt` from `pretrain_encoder.py` (custom only) |
+| `loss_type` | `focal_iou` / `focal` / `ce_iou` / `ce` | affects val loss only; train always uses `sf_loss` |
+| `iou_w` | float | soft-IoU weight in `L_seg`; `0` = pure focal CE |
+| `resume` | `false` / `"last"` / path | continue from checkpoint |
+| `restart` | `false` / `true` | load weights only, reset optimizer + scheduler |
+
 ---
 
 ## Training Pipeline
 
 | Component | Detail |
 |---|---|
-| Optimiser | Adam (`weight_decay=1e-4`) |
+| Optimiser | Adam (`weight_decay=1e-4`), only trainable params |
 | LR schedule | 5-epoch linear warmup → CosineAnnealingLR (`η_min = lr × 0.05`) |
-| Cosine restart | `restart: true` in config — loads model weights only, resets optimiser + scheduler |
+| Cosine restart | `restart: true` — loads weights only, resets optimiser + scheduler |
+| Freeze backbone | `freeze_backbone: true` — ResNet-18 stem+layer1-3 frozen; ~40-50% faster per step |
 | Gradient clipping | `clip_grad_norm(max_norm=1.0)` |
 | Mixed precision | AMP (`autocast` + `GradScaler`) |
 | Augmentation | hflip, resized-crop (scale 0.7–1.4), color jitter, cutout, shift (±10%) |
