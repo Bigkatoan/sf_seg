@@ -1,7 +1,7 @@
 {
   "data_root": "data",
-  "epochs": 400,
-  "batch_size": 16,
+  "epochs": 50,
+  "batch_size": 8,
   "lr": 1e-4,
   "num_workers": 4,
   "log_dir": "logs",
