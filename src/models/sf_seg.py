@@ -3,39 +3,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _gn(C: int) -> nn.GroupNorm:
-    for g in [8, 4, 2, 1]:
-        if C % g == 0:
-            return nn.GroupNorm(g, C)
-
-
 # ── ResNet-style basic block ──────────────────────────────────────────────────
 
 class BasicBlock(nn.Module):
     """
-    ResNet BasicBlock: Conv-GN-GELU → Conv-GN + residual shortcut.
+    ResNet BasicBlock: Conv-GELU → Conv + residual shortcut.
 
+    No normalization — bias=True on all convolutions.
     stride=2  : downsample spatially, shortcut uses 1×1 projection.
     in_c != out_c : shortcut uses 1×1 projection to match channels.
     """
     def __init__(self, in_c: int, out_c: int, stride: int = 1):
         super().__init__()
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_c, out_c, 3, stride=stride, padding=1, bias=False),
-            _gn(out_c),
+            nn.Conv2d(in_c, out_c, 3, stride=stride, padding=1, bias=True),
             nn.GELU(),
         )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(out_c, out_c, 3, padding=1, bias=False),
-            _gn(out_c),
-        )
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1, bias=True)
         need_proj = (stride != 1 or in_c != out_c)
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(in_c, out_c, 1, stride=stride, bias=False),
-            _gn(out_c),
-        ) if need_proj else nn.Identity()
+        self.shortcut = (
+            nn.Conv2d(in_c, out_c, 1, stride=stride, bias=True)
+            if need_proj else nn.Identity()
+        )
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -62,7 +51,7 @@ def _clamped_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
     cumsum     = top_sorted.cumsum(dim=-1)
 
     j        = torch.arange(1, int_k + 1, device=score.device, dtype=torch.float32)
-    lam_j    = (j - cumsum) / (L - j).clamp(min=1e-6)    # 1e-6 safe for float32
+    lam_j    = (j - cumsum) / (L - j).clamp(min=1e-6)
     valid    = top_sorted - 1.0 >= lam_j
     j_sat    = valid.long().sum(dim=-1, keepdim=True)
     lam_star = torch.gather(lam_j, dim=-1, index=(j_sat - 1).clamp(min=0))
@@ -89,12 +78,11 @@ class attention_head(nn.Module):
         C = num_channels
         self.focus_size = focus_size
         self.proj = nn.Sequential(
-            nn.Conv2d(C, C, 3, padding=1, groups=C, bias=False),  # depthwise 3×3
-            nn.Conv2d(C, C * 2, 1, bias=False),                    # pointwise → score|feats
-            _gn(C * 2),
+            nn.Conv2d(C, C, 3, padding=1, groups=C, bias=True),   # depthwise 3×3
+            nn.Conv2d(C, C * 2, 1, bias=True),                     # pointwise → score|feats
         )
         self.channel_mix = nn.Sequential(
-            nn.Conv2d(C, C, 1, bias=False),
+            nn.Conv2d(C, C, 1, bias=True),
             nn.GELU(),
         )
 
@@ -112,11 +100,11 @@ class sf_seg(nn.Module):
     """
     Multi-scale Sparse-Focus Segmentation with ResNet backbone.
 
-    Backbone (shared, ResNet-style BasicBlocks with GN + GELU):
+    Backbone (custom ResNet-style, GELU, no normalization):
     ┌────────┬──────────────────────────────────┬────────────────┐
     │ Layer  │ Blocks                           │ Output         │
     ├────────┼──────────────────────────────────┼────────────────┤
-    │ stem   │ Conv(3→C//2, 3×3, s=2) + GN+GELU│ (C//2, H/2)   │
+    │ stem   │ Conv(3→C//2, 3×3, s=2) + GELU   │ (C//2, H/2)   │
     │ stage1 │ BasicBlock(C//2→C, s=2)          │                │
     │        │ BasicBlock(C→C)                  │ (C,    H/4)  ←─ head_large  │
     │ stage2 │ BasicBlock(C→C, s=2)             │                │
@@ -128,7 +116,7 @@ class sf_seg(nn.Module):
     Attention heads: lightweight DW+PW projection on backbone features
     → clamped softmax → attn × features → channel_mix.
 
-    Decoder (same bottom-up UNet structure as 8749cd1, GELU instead of ReLU):
+    Decoder (UNet bottom-up, GELU, no normalization):
     a_small → upsample → blend_up_sm → cat(a_medium) → fuse_sm_med → d_med
     d_med   → upsample → blend_up_med → cat(a_large) → fuse_med_lg → d_lg
     d_lg    → upsample → pre_masks → masks → logits
@@ -144,10 +132,9 @@ class sf_seg(nn.Module):
         self.decoder_type   = decoder_type
         C = num_channels
 
-        # ── Shared ResNet backbone ─────────────────────────────────────────────
+        # ── Shared backbone ───────────────────────────────────────────────────
         self.stem = nn.Sequential(
-            nn.Conv2d(3, C // 2, 3, stride=2, padding=1, bias=False),
-            _gn(C // 2),
+            nn.Conv2d(3, C // 2, 3, stride=2, padding=1, bias=True),
             nn.GELU(),
         )
         self.stage1 = nn.Sequential(               # H/4  → head_large
@@ -170,21 +157,21 @@ class sf_seg(nn.Module):
 
         # ── Decoder ───────────────────────────────────────────────────────────
         self.blend_up_sm  = nn.Sequential(
-            nn.Conv2d(C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1, bias=True), nn.GELU(),
         )
         self.blend_up_med = nn.Sequential(
-            nn.Conv2d(C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1, bias=True), nn.GELU(),
         )
         self.fuse_sm_med = nn.Sequential(
-            nn.Conv2d(C + C, C, 3, padding=1, bias=False), _gn(C), nn.GELU(),
-            nn.Conv2d(C, C, 3, padding=1, bias=False),     _gn(C), nn.GELU(),
+            nn.Conv2d(C + C, C, 3, padding=1, bias=True), nn.GELU(),
+            nn.Conv2d(C, C, 3, padding=1, bias=True),     nn.GELU(),
         )
         self.fuse_med_lg = nn.Sequential(
-            nn.Conv2d(C + C, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
-            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+            nn.Conv2d(C + C, C // 2, 3, padding=1, bias=True), nn.GELU(),
+            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=True), nn.GELU(),
         )
         self.pre_masks = nn.Sequential(
-            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=False), _gn(C // 2), nn.GELU(),
+            nn.Conv2d(C // 2, C // 2, 3, padding=1, bias=True), nn.GELU(),
         )
         out_ch = num_classes if num_classes > 1 else 1
         self.masks = nn.Conv2d(C // 2, out_ch, kernel_size=1)
@@ -196,7 +183,7 @@ class sf_seg(nn.Module):
 
     def _encode(self, x: torch.Tensor):
         """Return backbone features at H/4, H/8, H/16."""
-        f  = self.stem(x)
+        f   = self.stem(x)
         f_l = self.stage1(f)
         f_m = self.stage2(f_l)
         f_s = self.stage3(f_m)
@@ -265,7 +252,7 @@ class sf_seg(nn.Module):
         if backbone_sd is None:
             print("[warn] no 'backbone' key in checkpoint, skipping")
             return
-        missing, _ = self.load_state_dict(backbone_sd, strict=False)
+        missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
         missing = [k for k in missing if not k.startswith('masks.')]
         if missing:
             print(f"[warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
@@ -274,7 +261,7 @@ class sf_seg(nn.Module):
 
 
 def main():
-    print("sf_seg — ResNet backbone + GELU\n")
+    print("sf_seg — custom backbone (GELU, no norm)\n")
     model = sf_seg(num_channels=128, focus_size=28, num_classes=151)
     x     = torch.randn(2, 3, 224, 224)
     logits, attn_guide, attn = model(x)
@@ -285,22 +272,11 @@ def main():
     heads = sum(p.numel() for m in [model.head_small, model.head_medium, model.head_large]
                 for p in m.parameters())
     print(f"Total params  : {total:,}")
-    print(f"  backbone    : {bb:,}  (ResNet BasicBlocks)")
+    print(f"  backbone    : {bb:,}")
     print(f"  attn heads  : {heads:,}")
     print(f"  decoder+cls : {total - bb - heads:,}")
     print(f"Logits        : {tuple(logits.shape)}")
-
-    print(f"\n{'Head':<14} {'Feature level':>14} {'focus_size':>12} {'coverage':>10}")
-    print("-" * 54)
-    for name, head, hw in [
-        ("head_large",  model.head_large,  (224//4)**2),
-        ("head_medium", model.head_medium, (224//8)**2),
-        ("head_small",  model.head_small,  (224//16)**2),
-    ]:
-        fs = head.focus_size
-        k  = min(fs**2, hw - 1)
-        print(f"{name:<14} {'H/' + str(224 // (hw**0.5).__int__()):>14} "
-              f"{fs:>12} {k/hw:>9.1%}")
+    print(f"Attn          : {tuple(attn.shape)}")
 
 
 if __name__ == "__main__":
