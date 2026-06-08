@@ -127,13 +127,21 @@ Total loss per training step:
 
 ```
 L = L_seg  +  diversity_weight × L_diversity
-           +  attn_guide_weight × L_guide
-           +  attn_exclusive_weight × L_exclusive
 ```
+
+`attn_guide_weight` and `attn_exclusive_weight` are available but set to 0 — empirical analysis showed L_guide converged to a fixed equilibrium (raw Dice ≈ 0.33) after 200 epochs, consuming ~19% of gradient budget without improvement. Removing both terms improved convergence speed.
 
 ### `L_seg` — Segmentation loss
 
-Default: **`focal_iou`** — focal cross-entropy (stable gradient via `p_c − 1(c==t)`) + soft IoU. Available options: `pure_focal_iou`, `ce_iou`, `focal`, `ce`, `iou`.
+**`focal_iou`** — focal cross-entropy + soft IoU (downsampled to 56×56 to save ~16× peak memory). Controlled by two weights in `SFLossConfig`:
+
+```
+L_seg = focal_w × focal_CE  +  iou_w × soft_IoU
+```
+
+Default: `focal_w=1.0`, `iou_w=0.5`. Set `iou_w=0` to disable soft IoU (pure focal CE).
+
+Available `loss_type` options: `pure_focal_iou`, `ce_iou`, `focal`, `ce`, `iou`.
 
 ### `L_diversity` — Attention Diversity
 
@@ -143,18 +151,6 @@ Penalises cosine similarity between attention channels via Gram matrix off-diago
 G = normalize(attn) @ normalize(attn)ᵀ        # (B, C, C)
 L_diversity = mean(off_diagonal(G)²) / C(C−1)
 ```
-
-### `L_guide` — IoU-Guided Attention Supervision
-
-Assigns each attention channel to its best-matching GT class (via IoU, detached), then trains that channel to match the class mask via Dice loss. Spatial downsampling to 14×14 keeps compute tractable.
-
-### `L_exclusive` — Winner-Takes-All Specialisation
-
-```
-L_exclusive = mean(non_winner IoU)    [winner selected via no_grad argmax]
-```
-
-Paired with `L_guide`: winner channels → match their class; non-winner channels → zero overlap with other classes. After training, each channel specialises for one class — attention maps become class-specific encoders.
 
 ---
 
@@ -182,8 +178,12 @@ python -m src.training.trainer --backbone resnet18  # ImageNet pretrained
 # CLI overrides
 python -m src.training.trainer --backbone resnet18 --epochs 100 --batch-size 16
 
-# Resume
+# Resume (continue from last checkpoint, preserving optimizer + scheduler state)
 python -m src.training.trainer --resume last
+
+# Cosine restart (load model weights only, reset optimizer + scheduler to new LR)
+# Set restart: true + new lr in config.json, then:
+python -m src.training.trainer --resume last --restart
 ```
 
 ### TensorBoard
@@ -210,13 +210,14 @@ Logged per epoch:
 {
   "data_root":             "data",
   "epochs":                200,
-  "batch_size":            16,
+  "batch_size":            32,
   "lr":                    3e-4,
   "num_workers":           8,
   "log_dir":               "logs",
   "output_dir":            "outputs",
   "checkpoint_dir":        "checkpoints",
   "loss_type":             "focal_iou",
+  "iou_w":                 0.5,
   "image_size":            224,
   "num_channels":          128,
   "focus_size":            28,
@@ -224,12 +225,19 @@ Logged per epoch:
   "num_classes":           151,
   "absent_weight":         0.2,
   "diversity_weight":      0.1,
-  "attn_guide_weight":     0.3,
-  "attn_exclusive_weight": 0.2,
+  "attn_guide_weight":     0.0,
+  "attn_exclusive_weight": 0.0,
   "decoder_type":          "dense",
   "class_diverse":         false,
-  "backbone":              "resnet18",
-  "resume":                false
+  "backbone":              "custom",
+  "resume":                false,
+  "restart":               false,
+  "aug_hflip":             true,
+  "aug_resized_crop":      true,
+  "aug_color_jitter":      true,
+  "aug_gaussian_noise":    true,
+  "aug_cutout":            true,
+  "aug_shift":             true
 }
 ```
 
@@ -239,12 +247,13 @@ Logged per epoch:
 
 | Component | Detail |
 |---|---|
-| Optimiser | Adam |
-| LR schedule | 5-epoch linear warmup → CosineAnnealingLR (→ lr × 0.01) |
+| Optimiser | Adam (weight_decay=1e-4) |
+| LR schedule | 5-epoch linear warmup → CosineAnnealingLR (η_min = lr × 0.05) |
+| Cosine restart | `restart=true` in config — loads model weights only, resets optimizer + scheduler |
 | Gradient clipping | `clip_grad_norm(max_norm=1.0)` |
 | Mixed precision | AMP (autocast + GradScaler) |
-| Augmentation | Noise (σ 0.01–0.04), brightness/contrast jitter |
-| Checkpointing | `sf_seg_best.pt` + `sf_seg_last.pt` with full optimizer + scheduler state |
+| Augmentation | hflip, resized-crop (scale 0.7–1.4), color jitter, gaussian noise, cutout, shift (±10%) |
+| Checkpointing | `sf_seg_best.pt` + `sf_seg_last.pt`; CSV log appends across restarts |
 
 ---
 

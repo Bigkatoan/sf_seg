@@ -50,10 +50,19 @@ class SegmentationDataset(Dataset):
     """
 
     def __init__(self, images_dir: Path, masks_dir: Path,
-                 image_size: int = 224, augment: bool = False, num_classes: int = 1):
-        self.image_size  = int(image_size)
-        self.augment     = augment
-        self.num_classes = num_classes
+                 image_size: int = 224, augment: bool = False, num_classes: int = 1,
+                 aug_hflip: bool = True, aug_resized_crop: bool = True,
+                 aug_color_jitter: bool = True, aug_gaussian_noise: bool = True,
+                 aug_cutout: bool = True, aug_shift: bool = True):
+        self.image_size       = int(image_size)
+        self.augment          = augment
+        self.num_classes      = num_classes
+        self.aug_hflip        = aug_hflip
+        self.aug_resized_crop = aug_resized_crop
+        self.aug_color_jitter = aug_color_jitter
+        self.aug_gaussian_noise = aug_gaussian_noise
+        self.aug_cutout       = aug_cutout
+        self.aug_shift        = aug_shift
         images_dir, masks_dir = Path(images_dir), Path(masks_dir)
         self.pairs = [
             (p, masks_dir / (p.stem + '.png'))
@@ -76,54 +85,59 @@ class SegmentationDataset(Dataset):
 
         if self.augment:
             # ── Spatial augmentation (image + mask together) ──────────────────
-            # Random horizontal flip
-            if random.random() > 0.5:
+            if self.aug_hflip and random.random() > 0.5:
                 img  = TF.hflip(img)
                 mask = TF.hflip(mask)
 
-            # Random resized crop: scale [0.5, 2.0] → crop → resize to sz
-            # Simulates viewing the same scene at different distances
-            scale  = random.uniform(0.5, 2.0)
-            crop_w = int(sz / scale)
-            crop_h = int(sz / scale)
-            # Pad if crop size exceeds image size
-            pad_w  = max(0, crop_w - sz)
-            pad_h  = max(0, crop_h - sz)
-            if pad_w > 0 or pad_h > 0:
-                img  = TF.pad(img,  [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
-                              fill=0)
-                mask = TF.pad(mask, [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
-                              fill=0)
-            iw, ih = img.size
-            x0 = random.randint(0, max(0, iw - crop_w))
-            y0 = random.randint(0, max(0, ih - crop_h))
-            img  = TF.resized_crop(img,  y0, x0, crop_h, crop_w, (sz, sz), Image.BILINEAR)
-            mask = TF.resized_crop(mask, y0, x0, crop_h, crop_w, (sz, sz), Image.NEAREST)
+            if self.aug_shift and random.random() > 0.5:
+                max_shift = int(sz * 0.1)
+                dx = random.randint(-max_shift, max_shift)
+                dy = random.randint(-max_shift, max_shift)
+                pad = [max(0, dx), max(0, dy), max(0, -dx), max(0, -dy)]  # L,T,R,B
+                img  = TF.pad(img,  pad, fill=0)
+                mask = TF.pad(mask, pad, fill=0)
+                img  = TF.crop(img,  max(0, -dy), max(0, -dx), sz, sz)
+                mask = TF.crop(mask, max(0, -dy), max(0, -dx), sz, sz)
+
+            if self.aug_resized_crop:
+                scale  = random.uniform(0.7, 1.4)
+                crop_w = int(sz / scale)
+                crop_h = int(sz / scale)
+                pad_w  = max(0, crop_w - sz)
+                pad_h  = max(0, crop_h - sz)
+                if pad_w > 0 or pad_h > 0:
+                    img  = TF.pad(img,  [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
+                                  fill=0)
+                    mask = TF.pad(mask, [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2],
+                                  fill=0)
+                iw, ih = img.size
+                x0 = random.randint(0, max(0, iw - crop_w))
+                y0 = random.randint(0, max(0, ih - crop_h))
+                img  = TF.resized_crop(img,  y0, x0, crop_h, crop_w, (sz, sz), Image.BILINEAR)
+                mask = TF.resized_crop(mask, y0, x0, crop_h, crop_w, (sz, sz), Image.NEAREST)
 
             img_t = TF.to_tensor(img).float()          # (3, H, W) in [0, 1]
 
             # ── Photometric augmentation (image only) ─────────────────────────
-            # Color jitter: brightness, contrast, saturation, hue
-            if random.random() > 0.5:
-                img_t = TF.adjust_brightness(img_t, random.uniform(0.6, 1.4))
-            if random.random() > 0.5:
-                img_t = TF.adjust_contrast(img_t, random.uniform(0.6, 1.4))
-            if random.random() > 0.5:
-                img_t = TF.adjust_saturation(img_t, random.uniform(0.6, 1.4))
-            if random.random() > 0.5:
-                img_t = TF.adjust_hue(img_t, random.uniform(-0.1, 0.1))
-            img_t = img_t.clamp(0.0, 1.0)
+            if self.aug_color_jitter:
+                if random.random() > 0.5:
+                    img_t = TF.adjust_brightness(img_t, random.uniform(0.75, 1.25))
+                if random.random() > 0.5:
+                    img_t = TF.adjust_contrast(img_t, random.uniform(0.75, 1.25))
+                if random.random() > 0.5:
+                    img_t = TF.adjust_saturation(img_t, random.uniform(0.75, 1.25))
+                if random.random() > 0.5:
+                    img_t = TF.adjust_hue(img_t, random.uniform(-0.05, 0.05))
+                img_t = img_t.clamp(0.0, 1.0)
 
-            # Gaussian noise
-            if random.random() > 0.5:
-                sigma = random.uniform(0.005, 0.03)
+            if self.aug_gaussian_noise and random.random() > 0.5:
+                sigma = random.uniform(0.005, 0.02)
                 img_t = (img_t + torch.randn_like(img_t) * sigma).clamp(0.0, 1.0)
 
-            # Random erasing (Cutout) — forces context-based reasoning
-            if random.random() > 0.7:
+            if self.aug_cutout and random.random() > 0.5:
                 _, H, W = img_t.shape
-                rh = random.randint(H // 8, H // 4)
-                rw = random.randint(W // 8, W // 4)
+                rh = random.randint(H // 10, H // 6)
+                rw = random.randint(W // 10, W // 6)
                 ry = random.randint(0, H - rh)
                 rx = random.randint(0, W - rw)
                 img_t[:, ry:ry+rh, rx:rx+rw] = 0.0
@@ -295,7 +309,10 @@ def train(args):
 
     train_ds = SegmentationDataset(
         data_root / 'images' / 'train', data_root / 'masks' / 'train',
-        image_size=args.image_size, augment=True, num_classes=num_classes)
+        image_size=args.image_size, augment=True, num_classes=num_classes,
+        aug_hflip=args.aug_hflip, aug_resized_crop=args.aug_resized_crop,
+        aug_color_jitter=args.aug_color_jitter, aug_gaussian_noise=args.aug_gaussian_noise,
+        aug_cutout=args.aug_cutout, aug_shift=args.aug_shift)
     val_ds = SegmentationDataset(
         data_root / 'images' / 'val', data_root / 'masks' / 'val',
         image_size=args.image_size, augment=False, num_classes=num_classes)
@@ -329,7 +346,7 @@ def train(args):
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep)
     cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.01)
+        optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.05)
     scheduler    = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_ep])
     scaler = GradScaler('cuda', enabled=device.type == 'cuda')
@@ -370,13 +387,15 @@ def train(args):
             data_root / 'masks' / 'train', num_classes,
             cache_path=data_root / 'class_freq.json').to(device)
 
-    csv_path = log_dir / 'train_log.csv'
-    csv_file = open(csv_path, 'w', newline='')
-    csv_w    = csv.writer(csv_file)
-    csv_w.writerow(['epoch',
-                    'train_loss', 'train_seg', 'train_guide',
-                    'train_excl', 'train_div', 'train_acc', 'train_miou',
-                    'val_loss',   'val_seg',   'val_acc',   'val_miou'])
+    csv_path    = log_dir / 'train_log.csv'
+    _csv_is_new = not csv_path.exists()
+    csv_file    = open(csv_path, 'a', newline='')
+    csv_w       = csv.writer(csv_file)
+    if _csv_is_new:
+        csv_w.writerow(['epoch',
+                        'train_loss', 'train_seg', 'train_guide',
+                        'train_excl', 'train_div', 'train_acc', 'train_miou',
+                        'val_loss',   'val_seg',   'val_acc',   'val_miou'])
 
     # ── Checkpoint dirs ────────────────────────────────────────────────────────
     out_dir  = Path(args.output_dir);     out_dir.mkdir(parents=True, exist_ok=True)
@@ -442,13 +461,15 @@ def train(args):
                         logging.warning("Checkpoint num_classes mismatch — skipping resume")
                     else:
                         model.load_state_dict(ckpt["model_state_dict"])
-                        try: optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                        except Exception: pass
-                        try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                        except Exception: pass
+                        if not getattr(args, "restart", False):
+                            try: optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                            except Exception: pass
+                            try: scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                            except Exception: pass
                         start_epoch = ckpt.get("epoch", 0) + 1
                         best_val    = ckpt.get("best_val_loss", best_val)
-                        logging.info(f"Resumed from {fp}, epoch {start_epoch}")
+                        mode        = "restarted" if getattr(args, "restart", False) else "resumed"
+                        logging.info(f"Weights {mode} from {fp}, epoch {start_epoch}, lr={args.lr:.1e}")
                 else:
                     model.load_state_dict(ckpt)
             except Exception as e:
@@ -648,11 +669,19 @@ def parse_args():
     p.add_argument("--encoder-pretrained", default=None,
                    help="Path to enc_best.pt from pretrain_encoder.py")
     p.add_argument("--resume",           default=None)
+    p.add_argument("--restart",          action="store_true", default=None,
+                   help="Load model weights only — reset optimizer+scheduler to new LR")
     p.add_argument("--image-size",       type=int,   default=None)
     p.add_argument("--log-dir",          default=None)
     p.add_argument("--output-dir",       default=None)
     p.add_argument("--checkpoint-dir",   default=None)
     p.add_argument("--cpu",              action="store_true")
+    p.add_argument("--aug-hflip",          type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--aug-resized-crop",   type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--aug-color-jitter",   type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--aug-gaussian-noise", type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--aug-cutout",         type=lambda x: x.lower() != "false", default=None)
+    p.add_argument("--aug-shift",          type=lambda x: x.lower() != "false", default=None)
     return p.parse_args()
 
 
@@ -671,8 +700,11 @@ def merge_config(args):
         decoder_type="dense", sparse_weight=0.0, class_diverse=False,
         boundary_weight=0.3, edge_weight=4.0, corner_weight=6.0,
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
-        loss_type="ce_iou", resume=None, image_size=224, encoder_pretrained=None,
+        loss_type="ce_iou", resume=None, restart=False, iou_w=0.5,
+        image_size=224, encoder_pretrained=None,
         backbone="custom",
+        aug_hflip=True, aug_resized_crop=True, aug_color_jitter=True,
+        aug_gaussian_noise=True, aug_cutout=True, aug_shift=True,
     )
     for key, default in defaults.items():
         cli = getattr(args, key, None)

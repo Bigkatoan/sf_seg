@@ -32,8 +32,8 @@ class SFLossConfig:
     excl_weight:      float = 0.2
     # Seg — matches focal_iou_loss defaults exactly
     focal_gamma:      float = 2.0
-    focal_w:          float = 0.6
-    iou_w:            float = 0.4
+    focal_w:          float = 1.0
+    iou_w:            float = 0.5
     no_obj_weight:    float = 0.1
     # Attention
     guide_size:       int   = 14
@@ -46,6 +46,7 @@ class SFLossConfig:
             guide_weight=getattr(args, "attn_guide_weight", 0.3),
             excl_weight=getattr(args, "attn_exclusive_weight", 0.2),
             focal_gamma=2.0,
+            iou_w=getattr(args, "iou_w", 0.5),
             no_obj_weight=getattr(args, "no_obj_weight", 0.1),
         )
 
