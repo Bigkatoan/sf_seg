@@ -336,12 +336,29 @@ def train(args):
                        encoder_stride=args.encoder_stride, num_classes=num_classes,
                        decoder_type=args.decoder_type,
                        encoder_pretrained=args.encoder_pretrained).to(device)
-    print(f"Backbone: {args.backbone}  |  params: {model.get_num_parameters():,}  |  "
+
+    # ── Freeze ResNet-18 backbone (optional) ──────────────────────────────────
+    if args.backbone == "resnet18" and getattr(args, "freeze_backbone", False):
+        for m in [model.r18_stem, model.r18_layer1, model.r18_layer2, model.r18_layer3]:
+            for p in m.parameters():
+                p.requires_grad = False
+        frozen_p    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.info(f"ResNet-18 backbone frozen — {frozen_p:,} frozen / {trainable_p:,} trainable")
+    else:
+        trainable_p = model.get_num_parameters()
+
+    total_p = model.get_num_parameters()
+    suffix  = f"  trainable: {trainable_p:,}" if trainable_p != total_p else ""
+    print(f"Backbone: {args.backbone}  |  params: {total_p:,}{suffix}  |  "
           f"num_classes={num_classes}  |  decoder={args.decoder_type}  |  device={device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    optimizer    = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Only pass requires_grad=True params to optimizer — frozen params excluded
+    optimizer    = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr, weight_decay=1e-4)
     warmup_ep    = min(5, args.epochs // 10)          # 5-epoch linear warmup
     warmup_sched = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep)
@@ -666,6 +683,8 @@ def parse_args():
     p.add_argument("--backbone",          default=None,
                    choices=["custom", "resnet18"],
                    help="Backbone type: custom (default) or resnet18 (ImageNet pretrained)")
+    p.add_argument("--freeze-backbone",  action="store_true", default=None,
+                   help="Freeze ResNet-18 backbone weights (only valid with --backbone resnet18)")
     p.add_argument("--encoder-pretrained", default=None,
                    help="Path to enc_best.pt from pretrain_encoder.py")
     p.add_argument("--resume",           default=None)
@@ -702,7 +721,7 @@ def merge_config(args):
         log_dir="logs", output_dir="outputs", checkpoint_dir="checkpoints",
         loss_type="ce_iou", resume=None, restart=False, iou_w=0.5,
         image_size=224, encoder_pretrained=None,
-        backbone="custom",
+        backbone="custom", freeze_backbone=False,
         aug_hflip=True, aug_resized_crop=True, aug_color_jitter=True,
         aug_gaussian_noise=True, aug_cutout=True, aug_shift=True,
     )

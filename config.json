@@ -23,13 +23,14 @@
   "restart": true,
   "iou_w": 0.5,
   "backbone": "custom",
+  "freeze_backbone": false,
   "boundary_weight": 0.3,
   "edge_weight": 4.0,
   "corner_weight": 6.0,
   "aug_hflip": true,
   "aug_resized_crop": true,
   "aug_color_jitter": true,
-  "aug_gaussian_noise": true,
+  "aug_gaussian_noise": false,
   "aug_cutout": true,
   "aug_shift": true
 }
