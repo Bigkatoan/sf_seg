@@ -238,8 +238,8 @@ Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`
   "focus_size":            28,
   "encoder_stride":        1,
   "num_classes":           151,
-  "backbone":              "custom",
-  "freeze_backbone":       false,
+  "backbone":              "resnet18",
+  "freeze_backbone":       true,
   "encoder_pretrained":    null,
   "loss_type":             "focal_iou",
   "iou_w":                 0.5,
@@ -300,7 +300,9 @@ sf_seg/
 │   │   ├── sf_loss.py           # unified loss: focal_CE + soft_IoU + diversity
 │   │   └── losses.py            # standalone loss functions
 │   ├── dataloaders/
-│   │   └── ade20k.py            # download + prepare ADE20K-150
+│   │   ├── ade20k.py            # download + prepare ADE20K-150
+│   │   ├── sampler.py           # distributed / weighted sampler
+│   │   └── utils.py             # dataloader utilities
 │   └── training/
 │       └── trainer.py           # AMP, warmup, grad clip, mIoU, TensorBoard
 │
