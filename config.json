@@ -13,15 +13,15 @@
   "epochs": 200,
   "num_workers": 4,
 
-  "lr": 2e-4,
-  "backbone_lr_factor": 0.1,
+  "lr": 1e-3,
+  "backbone_lr_factor": 1.0,
   "grad_clip": 5.0,
 
   "iou_w": 0.5,
   "iou_downsample": 4,
   "iou_warm_epochs": 10,
   "no_obj_weight": 0.1,
-  "boundary_weight": 3.0,
+  "boundary_weight": 1.0,
   "diversity_weight": 0.3,
   "edge_weight": 0.0,
   "attn_guide_weight": 0.0,
@@ -34,6 +34,8 @@
   "aug_hue": false,
   "aug_cutout": true,
   "aug_shift": true,
+
+  "class_aware_sampler": true,
 
   "vis_interval": 10,
   "vis_samples": 6,
