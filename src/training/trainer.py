@@ -177,14 +177,20 @@ class AllClassBatchSampler(torch.utils.data.Sampler):
 
     def __init__(self, class_to_images: dict[int, list[int]],
                  img_classes: dict[int, set[int]],
-                 dataset_size: int, batch_size: int, seed: int = 42):
+                 dataset_size: int, batch_size: int,
+                 accum_steps: int = 1, seed: int = 42):
         self.n           = dataset_size
         self.batch_size  = batch_size
+        self.accum_steps = accum_steps
         self.seed        = seed
         self.epoch       = 0
-        self.num_batches = max(1, dataset_size // batch_size)
         self.all_classes = sorted(c for c, imgs in class_to_images.items() if imgs)
         C = len(self.all_classes)
+
+        # Mỗi optimizer step = accum_steps mini-batches = batch_size × accum_steps ảnh
+        eff_bs           = batch_size * accum_steps
+        opt_steps        = max(1, dataset_size // eff_bs)
+        self.num_batches = opt_steps * accum_steps   # tổng mini-batches mỗi epoch
 
         # M[i, c] = True nếu image i chứa class c  (N×C bool, ~3 MB)
         self.M = np.zeros((dataset_size, C), dtype=bool)
@@ -196,10 +202,13 @@ class AllClassBatchSampler(torch.utils.data.Sampler):
         self.base_scores = self.M.sum(axis=1).astype(np.float32)
 
         min_imgs = min(len(v) for v in class_to_images.values() if v)
+        guaranteed = eff_bs >= 29
         logging.info(
-            f"AllClassBatchSampler: {C} classes  batch_size={batch_size}  "
-            f"num_batches={self.num_batches}  rarest_class={min_imgs} imgs  "
-            f"{'✓ all classes per batch' if batch_size >= 29 else '⚠ batch_size<29'}"
+            f"AllClassBatchSampler: {C} classes  "
+            f"batch_size={batch_size}  accum_steps={accum_steps}  "
+            f"effective_bs={eff_bs}  num_batches={self.num_batches}  "
+            f"rarest_class={min_imgs} imgs  "
+            f"{'✓ all 151 classes per optimizer step' if guaranteed else f'~{min(C, int(C*(1-(1-29/C)**accum_steps)))}/151 classes'}"
         )
 
     def set_epoch(self, epoch: int):
@@ -209,54 +218,60 @@ class AllClassBatchSampler(torch.utils.data.Sampler):
         return self.num_batches
 
     def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
-        N   = self.n
+        rng     = np.random.default_rng(self.seed + self.epoch)
+        N       = self.n
+        C       = len(self.all_classes)
+        accum   = self.accum_steps
+        eff_bs  = self.batch_size * accum
+        opt_steps = self.num_batches // accum
 
-        for _ in range(self.num_batches):
-            batch    = []
-            in_batch = np.zeros(N, dtype=bool)
+        for _ in range(opt_steps):
+            # ── Build cover for eff_bs = batch_size × accum_steps images ──
+            # Greedy set cover đảm bảo tất cả C class có trong eff_bs ảnh,
+            # sau đó chia đều thành accum mini-batches.
+            all_imgs = []
+            in_set   = np.zeros(N, dtype=bool)
+            scores   = self.base_scores.copy()
+            covered  = np.zeros(C, dtype=bool)
 
-            # score[i] = số class CHƯA COVER mà ảnh i có — cập nhật dần
-            scores       = self.base_scores.copy()
-            covered_mask = np.zeros(len(self.all_classes), dtype=bool)
-
-            # ── Phase 1: greedy set cover ─────────────────────────────────
-            while not covered_mask.all() and len(batch) < self.batch_size:
-                noisy           = scores + rng.uniform(0.0, 0.5, N)
-                noisy[in_batch] = -1.0
-                best            = int(noisy.argmax())
-
-                batch.append(best)
-                in_batch[best] = True
-
-                # Chỉ tính class THỰC SỰ MỚI được cover (tránh double-subtract)
-                newly = self.M[best] & ~covered_mask
+            # Phase 1: greedy cho đến khi cover hết C class hoặc đủ eff_bs ảnh
+            while not covered.all() and len(all_imgs) < eff_bs:
+                noisy          = scores + rng.uniform(0.0, 0.5, N)
+                noisy[in_set]  = -1.0
+                best           = int(noisy.argmax())
+                all_imgs.append(best)
+                in_set[best]   = True
+                newly          = self.M[best] & ~covered
                 if newly.any():
-                    scores       -= self.M[:, newly].sum(axis=1)
-                    scores        = np.maximum(scores, 0.0)
-                    covered_mask |= self.M[best]
+                    scores    -= self.M[:, newly].sum(axis=1)
+                    scores     = np.maximum(scores, 0.0)
+                    covered   |= self.M[best]
 
-            # ── Phase 2: fill remaining slots ─────────────────────────────
-            if len(batch) < self.batch_size:
+            # Phase 2: fill còn lại cho đủ eff_bs
+            if len(all_imgs) < eff_bs:
                 perm = rng.permutation(N)
                 for idx in perm:
-                    if len(batch) >= self.batch_size:
+                    if len(all_imgs) >= eff_bs:
                         break
-                    if not in_batch[idx]:
-                        batch.append(int(idx))
-                        in_batch[idx] = True
+                    if not in_set[idx]:
+                        all_imgs.append(int(idx))
+                        in_set[idx] = True
 
-            rng.shuffle(batch)
-            yield batch[:self.batch_size]
+            # Shuffle rồi chia thành accum mini-batches, yield từng cái
+            rng.shuffle(all_imgs)
+            bs = self.batch_size
+            for a in range(accum):
+                yield all_imgs[a * bs : (a + 1) * bs]
 
 
 def build_class_aware_sampler(dataset: ADE20KDataset,
                                num_classes: int = 151,
                                cache_path: Path | None = None,
-                               batch_size: int = 32) -> AllClassBatchSampler:
+                               batch_size: int = 14,
+                               accum_steps: int = 3) -> AllClassBatchSampler:
     """Build AllClassBatchSampler from cached class index."""
     c2i, img_cls = _build_class_index(dataset, num_classes, cache_path)
-    return AllClassBatchSampler(c2i, img_cls, len(dataset), batch_size)
+    return AllClassBatchSampler(c2i, img_cls, len(dataset), batch_size, accum_steps)
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -350,10 +365,11 @@ def train(args):
     # Class-aware batch sampler: every batch guaranteed to contain all 151
     # classes via greedy set cover (needs batch_size ≥ 29; min cover = 29 imgs).
     use_cas = getattr(args, 'class_aware_sampler', True)
+    accum_steps = getattr(args, 'accum_steps', 1)
     if use_cas:
         cache_p  = Path(args.log_dir) / 'class_index.pt'
         _sampler = build_class_aware_sampler(
-            train_ds, args.num_classes, cache_p, args.batch_size)
+            train_ds, args.num_classes, cache_p, args.batch_size, accum_steps)
         # batch_sampler takes over — cannot combine with batch_size/shuffle
         train_loader = DataLoader(train_ds, batch_sampler=_sampler, **kw)
     else:
@@ -505,7 +521,13 @@ def train(args):
         seen = 0
         conf_tr = torch.zeros(args.num_classes, args.num_classes, dtype=torch.long, device=device)
 
-        bar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
+        bar        = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
+        step_loss  = 0.0   # accumulated loss for display
+        step_parts: dict = {}
+        micro_step = 0     # counts mini-batches within current optimizer step
+
+        optimizer.zero_grad(set_to_none=True)
+
         for imgs, masks in bar:
             imgs  = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
@@ -530,16 +552,15 @@ def train(args):
                     parts['aux'] = logits.new_tensor(0.)
 
             if not torch.isfinite(loss):
+                micro_step = 0
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            # Scale loss for accumulation so sum ≡ mean over accum_steps
+            scaler.scale(loss / accum_steps).backward()
+            micro_step += 1
 
+            # Metrics — track every mini-batch regardless of accumulation
             b = imgs.size(0)
             with torch.no_grad():
                 pred     = logits.argmax(dim=1)
@@ -547,12 +568,34 @@ def train(args):
                 acc      = ((pred[valid_px] == masks[valid_px]).float().mean().item()
                             if valid_px.any() else 0.0)
                 update_confusion(conf_tr, pred, masks)
-            for k in ('loss', 'seg', 'div', 'edge', 'aux'):
-                tr[k] += (loss if k == 'loss' else parts[k]).item() * b
+            step_loss += loss.item()
+            for k, v in parts.items():
+                step_parts[k] = step_parts.get(k, 0.0) + v.item()
             tr['acc'] += acc * b
             seen      += b
-            bar.set_postfix(loss=f"{loss.item():.4f}", seg=f"{parts['seg'].item():.4f}",
-                            aux=f"{parts['aux'].item():.4f}", acc=f"{acc:.4f}")
+
+            # ── Optimizer step every accum_steps mini-batches ──────────────
+            if micro_step == accum_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+                # Log averaged over the accumulated steps
+                disp_loss = step_loss / accum_steps
+                disp_seg  = step_parts.get('seg', 0.0) / accum_steps
+                disp_aux  = step_parts.get('aux', 0.0) / accum_steps
+                bar.set_postfix(loss=f"{disp_loss:.4f}", seg=f"{disp_seg:.4f}",
+                                aux=f"{disp_aux:.4f}", acc=f"{acc:.4f}")
+
+                tr['loss'] += step_loss * b
+                for k in ('seg', 'div', 'edge', 'aux'):
+                    tr[k] += step_parts.get(k, 0.0) * b
+
+                step_loss  = 0.0
+                step_parts = {}
+                micro_step = 0
 
         tr = {k: v / seen for k, v in tr.items()}
         tr_miou, _ = miou_from_confusion(conf_tr.cpu())
@@ -691,6 +734,7 @@ def parse_args():
     p.add_argument("--data-root",            default=None)
     p.add_argument("--epochs",               type=int,   default=None)
     p.add_argument("--batch-size",           type=int,   default=None)
+    p.add_argument("--accum-steps",          type=int,   default=None)
     p.add_argument("--lr",                   type=float, default=None)
     p.add_argument("--num-workers",          type=int,   default=None)
     p.add_argument("--num-channels",         type=int,   default=None)
@@ -749,6 +793,7 @@ def merge_config(args):
         vis_interval=5, vis_samples=6,
         model_type='v1', backbone_variant='micro', dw_kernel=3,
         class_aware_sampler=True,
+        accum_steps=1,
     )
     for key, default in defaults.items():
         cli = getattr(args, key, None)

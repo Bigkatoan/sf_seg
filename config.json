@@ -10,6 +10,7 @@
   "data_root": "data",
   "image_size": 512,
   "batch_size": 14,
+  "accum_steps": 3,
   "epochs": 200,
   "num_workers": 4,
 
