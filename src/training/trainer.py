@@ -26,7 +26,6 @@ try:
 except ImportError:
     _TB = False
 
-from torch.utils.data import WeightedRandomSampler
 from src.losses import sf_loss, SFLossConfig
 from src.training.visualize import save_epoch_outputs
 
@@ -122,69 +121,142 @@ class ADE20KDataset(Dataset):
 
 # ── Class-aware sampler ───────────────────────────────────────────────────────
 
-def build_class_aware_sampler(dataset: ADE20KDataset,
-                               num_classes: int = 151,
-                               cache_path: Path | None = None) -> WeightedRandomSampler:
-    """WeightedRandomSampler that upsamples images containing rare classes.
-
-    Each image is scored by Σ(1/class_freq) over all classes present in it.
-    Images containing rare classes get a high weight and are sampled more often.
-    The weights are cached to disk so the scan only runs once.
-
-    Effect: a batch of 16 images covers ~82 unique classes on average vs ~58
-    with plain random shuffling — substantially more gradient signal per step
-    for the long tail of rare classes.
-    """
+def _build_class_index(dataset: ADE20KDataset,
+                        num_classes: int,
+                        cache_path: Path | None) -> tuple[dict, dict]:
+    """Return (class_to_images, img_classes). Scans masks once, then caches."""
     if cache_path is not None and cache_path.exists():
-        weights = torch.load(cache_path, weights_only=True)
-        logging.info(f"Class-aware sampler: loaded weights from {cache_path}  "
-                     f"(n={len(weights)}, mean={weights.mean():.2f})")
-        return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        d = torch.load(cache_path, weights_only=False)
+        logging.info(f"Class index loaded from {cache_path}  "
+                     f"({len(d['img_classes'])} images, {num_classes} classes)")
+        return d['class_to_images'], d['img_classes']
 
-    logging.info(f"Class-aware sampler: scanning {len(dataset.pairs)} masks "
-                 f"(runs once, cached afterwards)...")
+    logging.info(f"Building class index — scanning {len(dataset.pairs)} masks "
+                 f"(runs once, result cached)...")
+    class_to_images: dict[int, list[int]] = {c: [] for c in range(num_classes)}
+    img_classes:     dict[int, set[int]]  = {}
 
-    # ── Pass 1: pixel count per class across entire training set ──────────────
-    class_pixel_count = np.zeros(num_classes, dtype=np.int64)
-    image_class_sets: list[set[int]] = []
-
-    for _, mask_path in tqdm(dataset.pairs, desc="Scanning masks", leave=False):
-        mask = np.array(Image.open(mask_path))
+    for idx, (_, mask_path) in enumerate(
+            tqdm(dataset.pairs, desc="Scanning masks", leave=False)):
+        mask  = np.array(Image.open(mask_path))
         valid = mask.ravel()
-        valid = valid[(valid != 255) & (valid < num_classes)]
-        classes, counts = np.unique(valid, return_counts=True)
-        for c, n in zip(classes, counts):
-            class_pixel_count[c] += n
-        image_class_sets.append(set(int(c) for c in classes))
+        classes = np.unique(valid[(valid != 255) & (valid < num_classes)])
+        for c in classes:
+            class_to_images[c].append(idx)
+        img_classes[idx] = set(int(c) for c in classes)
 
-    # ── Per-class inverse frequency ────────────────────────────────────────────
-    total = max(class_pixel_count.sum(), 1)
-    class_freq    = class_pixel_count / total
-    inv_freq      = np.where(class_freq > 0, 1.0 / np.maximum(class_freq, 1e-9), 0.0)
-
-    # Log frequency info
-    nonzero_freq = class_freq[class_freq > 0]
-    logging.info(f"  pixel freq skew: {nonzero_freq.max()/nonzero_freq.min():.0f}x  "
-                 f"  classes with >1% pixels: {(class_freq > 0.01).sum()}")
-
-    # ── Per-image weight = Σ inv_freq over classes present ────────────────────
-    raw_w = np.array(
-        [sum(inv_freq[c] for c in s) for s in image_class_sets],
-        dtype=np.float32,
-    )
-    # Clip extreme outliers (images with a single ultra-rare class) to 20×mean
-    # so they don't dominate every batch.
-    clip_val = raw_w.mean() * 20.0
-    weights  = np.clip(raw_w, 0, clip_val).astype(np.float32)
-    weights /= weights.mean()   # normalize so mean weight ≈ 1
-
-    weights_t = torch.from_numpy(weights)
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(weights_t, cache_path)
+        torch.save({'class_to_images': class_to_images, 'img_classes': img_classes},
+                   cache_path)
         logging.info(f"  saved to {cache_path}")
 
-    return WeightedRandomSampler(weights_t, num_samples=len(weights_t), replacement=True)
+    return class_to_images, img_classes
+
+
+class AllClassBatchSampler(torch.utils.data.Sampler):
+    """Builds every batch so that ALL num_classes appear at least once.
+
+    Đúng như ý tưởng: mỗi class có dict chứa ảnh, build batch bằng cách
+    load ảnh từ dict ra. Trick: thay vì random pick 1 ảnh/class (cần ~64
+    ảnh cho 151 class vì overlap kém), dùng GREEDY SET COVER — mỗi bước
+    pick ảnh cover NHIỀU class nhất trong số chưa cover. Optimal cover chỉ
+    cần ~29 ảnh, đủ với batch_size ≥ 29.
+
+    Algorithm
+    ---------
+    Phase 1 — stochastic greedy set cover:
+      Duy trì score[i] = số class chưa cover mà ảnh i có. Mỗi bước pick
+      ảnh score cao nhất (+ noise nhỏ để diversify), cập nhật score bằng
+      cách trừ các class vừa cover. Dừng khi hết uncovered class.
+      ~29 bước → tất cả 151 class covered với batch_size ≥ 29.
+
+    Phase 2 — fill:
+      Thêm random ảnh cho đủ batch_size.
+    """
+
+    def __init__(self, class_to_images: dict[int, list[int]],
+                 img_classes: dict[int, set[int]],
+                 dataset_size: int, batch_size: int, seed: int = 42):
+        self.n           = dataset_size
+        self.batch_size  = batch_size
+        self.seed        = seed
+        self.epoch       = 0
+        self.num_batches = max(1, dataset_size // batch_size)
+        self.all_classes = sorted(c for c, imgs in class_to_images.items() if imgs)
+        C = len(self.all_classes)
+
+        # M[i, c] = True nếu image i chứa class c  (N×C bool, ~3 MB)
+        self.M = np.zeros((dataset_size, C), dtype=bool)
+        for c, imgs in class_to_images.items():
+            if imgs:
+                self.M[imgs, c] = True
+
+        # base_scores[i] = tổng số class trong image i
+        self.base_scores = self.M.sum(axis=1).astype(np.float32)
+
+        min_imgs = min(len(v) for v in class_to_images.values() if v)
+        logging.info(
+            f"AllClassBatchSampler: {C} classes  batch_size={batch_size}  "
+            f"num_batches={self.num_batches}  rarest_class={min_imgs} imgs  "
+            f"{'✓ all classes per batch' if batch_size >= 29 else '⚠ batch_size<29'}"
+        )
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        N   = self.n
+
+        for _ in range(self.num_batches):
+            batch    = []
+            in_batch = np.zeros(N, dtype=bool)
+
+            # score[i] = số class CHƯA COVER mà ảnh i có — cập nhật dần
+            scores       = self.base_scores.copy()
+            covered_mask = np.zeros(len(self.all_classes), dtype=bool)
+
+            # ── Phase 1: greedy set cover ─────────────────────────────────
+            while not covered_mask.all() and len(batch) < self.batch_size:
+                noisy           = scores + rng.uniform(0.0, 0.5, N)
+                noisy[in_batch] = -1.0
+                best            = int(noisy.argmax())
+
+                batch.append(best)
+                in_batch[best] = True
+
+                # Chỉ tính class THỰC SỰ MỚI được cover (tránh double-subtract)
+                newly = self.M[best] & ~covered_mask
+                if newly.any():
+                    scores       -= self.M[:, newly].sum(axis=1)
+                    scores        = np.maximum(scores, 0.0)
+                    covered_mask |= self.M[best]
+
+            # ── Phase 2: fill remaining slots ─────────────────────────────
+            if len(batch) < self.batch_size:
+                perm = rng.permutation(N)
+                for idx in perm:
+                    if len(batch) >= self.batch_size:
+                        break
+                    if not in_batch[idx]:
+                        batch.append(int(idx))
+                        in_batch[idx] = True
+
+            rng.shuffle(batch)
+            yield batch[:self.batch_size]
+
+
+def build_class_aware_sampler(dataset: ADE20KDataset,
+                               num_classes: int = 151,
+                               cache_path: Path | None = None,
+                               batch_size: int = 32) -> AllClassBatchSampler:
+    """Build AllClassBatchSampler from cached class index."""
+    c2i, img_cls = _build_class_index(dataset, num_classes, cache_path)
+    return AllClassBatchSampler(c2i, img_cls, len(dataset), batch_size)
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -275,14 +347,15 @@ def train(args):
               prefetch_factor=2 if args.num_workers > 0 else None,
               persistent_workers=args.num_workers > 0)
 
-    # Class-aware sampler: upsample images with rare classes so each batch
-    # covers ~82 unique classes instead of ~58 (random baseline).
+    # Class-aware batch sampler: every batch guaranteed to contain all 151
+    # classes via greedy set cover (needs batch_size ≥ 29; min cover = 29 imgs).
     use_cas = getattr(args, 'class_aware_sampler', True)
     if use_cas:
-        cache_p = Path(args.log_dir) / 'sampler_weights.pt'
-        sampler = build_class_aware_sampler(train_ds, args.num_classes, cache_p)
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  sampler=sampler, **kw)
+        cache_p  = Path(args.log_dir) / 'class_index.pt'
+        _sampler = build_class_aware_sampler(
+            train_ds, args.num_classes, cache_p, args.batch_size)
+        # batch_sampler takes over — cannot combine with batch_size/shuffle
+        train_loader = DataLoader(train_ds, batch_sampler=_sampler, **kw)
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   shuffle=True, **kw)
@@ -410,8 +483,7 @@ def train(args):
             if train_ds.image_size != cur_res:
                 train_ds.image_size = cur_res
                 if use_cas:
-                    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                              sampler=sampler, **kw)
+                    train_loader = DataLoader(train_ds, batch_sampler=_sampler, **kw)
                 else:
                     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                               shuffle=True, **kw)
@@ -426,6 +498,8 @@ def train(args):
             sf_cfg = SFLossConfig.from_args(args)
 
         # ── Train ─────────────────────────────────────────────────────────────
+        if use_cas:
+            _sampler.set_epoch(epoch)   # re-seed so class order differs each epoch
         model.train()
         tr   = dict(loss=0., seg=0., div=0., edge=0., aux=0., acc=0.)
         seen = 0

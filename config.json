@@ -9,7 +9,7 @@
 
   "data_root": "data",
   "image_size": 512,
-  "batch_size": 16,
+  "batch_size": 32,
   "epochs": 200,
   "num_workers": 4,
 
