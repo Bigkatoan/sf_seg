@@ -1,8 +1,7 @@
 torch
 torchvision
-pycocotools
 Pillow
 numpy
 requests
 tqdm
-matplotlib
+tensorboard

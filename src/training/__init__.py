@@ -1,4 +1,3 @@
-"""Training utilities and dataset loading."""
-from .trainer import SegmentationDataset
+from .trainer import ADE20KDataset
 
-__all__ = ["SegmentationDataset"]
+__all__ = ["ADE20KDataset"]

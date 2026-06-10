@@ -1,328 +1,232 @@
-# sf_seg — Multi-scale Sparse-Focus Segmentation
+# SF-Seg V2 — Sparse-Focus Semantic Segmentation
 
-Lightweight semantic segmentation built around **budget-constrained spatial attention via clamped softmax**. A shared custom backbone extracts multi-scale features; three lightweight attention heads apply sparse spatial selection at each scale; outputs are fused bottom-up in a UNet-style decoder.
-
-Dataset: **ADE20K-150** (150 semantic categories + background = 151 classes).
-
----
-
-## Architecture
-
-```
-Input x (B, 3, 224, 224)
-  │
-  └─ Backbone
-       stem   Conv(3→64, 3×3, s=2) + GELU          →  (64,  H/2)
-       stage1 BasicBlock(64→128, s=2) + BasicBlock  →  (128, H/4)  ─► head_large
-       stage2 BasicBlock(128→128, s=2) + BasicBlock →  (128, H/8)  ─► head_medium
-       stage3 BasicBlock(128→128, s=2) + BasicBlock →  (128, H/16) ─► head_small
-  │
-  ├─ Attention heads (on backbone features, not raw RGB)
-  │    head_large  → a_large  (B, 128, H/4,  W/4 )   fine detail     25% coverage
-  │    head_medium → a_medium (B, 128, H/8,  W/8 )   mid-range       25% coverage
-  │    head_small  → a_small  (B, 128, H/16, W/16)   global context   5% coverage
-  │
-  └─ Decoder (bottom-up UNet)
-       a_small → upsample → blend_up_sm → cat(a_medium) → fuse_sm_med → d_med  (128, H/8)
-       d_med   → upsample → blend_up_med → cat(a_large) → fuse_med_lg → d_lg   ( 64, H/4)
-       d_lg    → upsample → pre_masks → masks → logits                          (151, H, W)
-
-  Returns:
-       logits     (B, 151, 224, 224)   segmentation logits
-       attn_guide (B,   1, 224, 224)   amax(attn_l) upsampled — visualisation
-       attn_l     (B, 128,  56,  56)   raw head_large attention — used for loss
-```
-
-### BasicBlock
-
-No normalization — GELU activation, `bias=True` on all convolutions.
-
-```
-x ──┬── Conv(3×3) + GELU ── Conv(3×3) ──┬── GELU ──►
-    └──── shortcut (1×1 conv if shape changes) ┘
-```
-
-### Attention Head
-
-```
-x  (B, C, H, W)   ← backbone feature at this scale
-  DWConv(3×3) → Conv(1×1, out=2C)   # spatial context + score|features split
-  chunk(2) ──► score    (B, C, H×W)
-             → features (B, C, H×W)
-
-  attn     = clamped_softmax(score, k)    # sparse ∈ [0,1], Σ=k per channel
-  attended = channel_mix(attn × features) # 1×1 conv + GELU
-```
-
-### Clamped Softmax (Budget Attention)
-
-Each channel attends to **exactly k locations**, each weight in **[0, 1]**, closed-form via topk — no Python loop:
-
-```
-k = min(focus_size², H×W − 1)
-p = softmax(score) × k          # Σ=k, values may exceed 1
-attn = clamp(p − λ*, 0, 1)      # Σ=k, each value ∈ [0, 1]
-```
-
-### Scale Table (`image_size=512`, `focus_size=64`, `C=128`)
-
-| Head | Feature level | Grid | k | L | Coverage |
-|:---|:---:|:---:|---:|---:|:---:|
-| `head_large` | H/4 | 128×128 | 4096 | 16384 | 25% |
-| `head_medium` | H/8 | 64×64 | 1024 | 4096 | 25% |
-| `head_small` | H/16 | 32×32 | 64 | 1024 | 6.3% |
+Semantic segmentation with **budget-constrained sparse attention** (`clamped_softmax`).  
+Custom ConvNeXt-style backbone trained from scratch. Dataset: ADE20K-150 (151 classes).
 
 ---
 
-## Two Model Variants
+## Architecture diagrams
 
-### A — Custom Backbone (`sf_seg.py`)
+**End-to-end forward pass** (backbone → heads → decoder → logits):
 
-ResNet-style backbone built from scratch. **No normalization** (GroupNorm removed), GELU throughout. Pretrain on ImageNet via `pretrain_encoder.py` or train from scratch.
+![End-to-end](docs/tfm_03_endtoend.png)
 
-| Module | Detail |
-|---|---|
-| Backbone | stem + 3 stages of 2× BasicBlock |
-| Normalization | None |
-| Activation | GELU |
-| Pretrained | No (or via `pretrain_encoder.py`) |
+**Building blocks** — ConvNeXtBlock and clamped_softmax:
 
-### B — ResNet-18 Backbone (`sf_seg_r18.py`)
+![Blocks](docs/tfm_01_convnext_softmax.png)
 
-torchvision ResNet-18 with **ImageNet-1K pretrained weights** loaded automatically. Adapter 1×1 convs project non-uniform ResNet channels (64/128/256) to C before the attention heads.
+**SparseAttnHead** — Q/K/V budget attention:
 
-```
-stem: Conv(7×7, s=2) + BN + ReLU + MaxPool → H/4
-layer1 (64ch)  → Adapter(64→C,  GN+GELU) → head_large
-layer2 (128ch) → Adapter(128→C, GN+GELU) → head_medium
-layer3 (256ch) → Adapter(256→C, GN+GELU) → head_small
-```
+![Attention](docs/tfm_02_sparse_attn_head.png)
 
-| Module | Detail |
-|---|---|
-| Backbone | torchvision ResNet-18 layer1–3 |
-| Normalization | BatchNorm (backbone), GroupNorm (adapters/decoder) |
-| Activation | ReLU (backbone), GELU (adapters/decoder) |
-| Pretrained | ImageNet-1K out of the box |
+**Decoder fusion and training loss**:
 
-### Choosing
-
-| | Custom | ResNet-18 |
-|--|--|--|
-| Backbone weights | Random init or custom ImageNet pretrain | ImageNet-1K automatic |
-| Param count | ~2.5M | ~4.0M |
-| Config | `"backbone": "custom"` | `"backbone": "resnet18"` |
-| Use when | Want full control / lighter model | Want strong pretrained features fast |
+![Decoder & Loss](docs/tfm_04_decoder_loss.png)
 
 ---
 
-## Loss (`sf_loss`)
+## Model overview
 
 ```
-L = L_seg  +  diversity_weight × L_div
+Input (B, 3, H, W)
+       │
+       ▼  SFBackbone (ConvNeXt-micro, 2.55M)
+       ├─ stem        → (B,  32, H/2,  W/2)   f_detail ─────────────────────────┐
+       ├─ stage1      → (B,  32, H/4,  W/4)   f1 ──→ head_large  (AttentionHead)  │
+       ├─ stage2      → (B,  64, H/8,  W/8)   f2 ──→ head_medium (SparseAttnHead) │
+       ├─ stage3      → (B, 128, H/16, W/16)  f3 ──→ head_small  (SparseAttnHead) │
+       └─ stage4      → (B, 256, H/32, W/32)  f4 ──→ head_tiny   (SparseAttnHead) │
+                                                              │                    │
+                                               cross-attn ◄──┘ (head_medium)      │
+                                                                                   │
+                              Decoder: bottom-up fusion (fuse_ts → fuse_tsm → fuse_tsml)
+                                                              │                    │
+                                              hr_fuse at H/2 ◄────────────────────┘
+                                                              │
+                                              Classifier → bilinear ↑
+                                                              │
+                                         Logits (B, 151, H, W)
 ```
 
-`attn_guide_weight` and `attn_exclusive_weight` exist but are set to 0 by default — empirical results showed they converge to a fixed equilibrium without improving mIoU while consuming gradient budget.
+### Attention heads
 
-### `L_seg` — Focal CE + Soft IoU
+| Head | Scale | Mechanism | num_heads | Role |
+|---|:---:|---|:---:|---|
+| `head_tiny`   | H/32 | SparseAttnHead (self) | 8 | Global semantic context |
+| `head_small`  | H/16 | SparseAttnHead (self) | 4 | Mid-scale features |
+| `head_medium` | H/8  | SparseAttnHead (cross ← head_tiny) | 4 | Global context, cheap |
+| `head_large`  | H/4  | AttentionHead (spatial gating) | — | Sharp boundary detail |
 
-```
-L_seg = focal_w × focal_CE  +  iou_w × soft_IoU
-```
+**Sparsity curriculum**: at 512px, `head_tiny` attends to 64/256 ≈ 25% of tokens.
+At 256px (early training), budget covers 100% → naturally dense → sparse as resolution grows.
 
-Focal CE uses full-resolution per-pixel CE (`BxHxW`, cheap). Soft IoU downsamples logits to 56×56 before softmax — reduces peak memory from ~2 GB to ~120 MB at B=32, C=151.
-
-Default: `focal_w=0.6`, `iou_w=0.5`. Absent classes weighted by `no_obj_weight=0.1` in IoU.
-
-### `L_div` — Attention Diversity
-
-Penalises cosine similarity between attention channels via Gram matrix off-diagonal:
+### Clamped Softmax — budget attention
 
 ```
-G = normalize(attn) @ normalize(attn)ᵀ    # (B, C, C)
-L_div = mean(off_diagonal(G)²) / C(C−1)
+Input : score ∈ ℝᴺ  (N = sequence length)
+        k            (budget: total attention mass = k)
+Output: attn ∈ [0,1]ᴺ  with Σ attnᵢ = k exactly
+
+Step 1:  p = softmax(score) × k          (Σp = k, some pᵢ > 1)
+Step 2:  find λ* s.t. Σ clamp(p−λ*, 0,1) = k   (bisection, ~30 iters, CUDA kernel)
+Step 3:  attn = clamp(p − λ*, 0, 1)
+Bwd:     analytical gradient (λ* saved from CUDA forward) — 27ms vs 62ms topk
 ```
+
+Properties: hard zeros (sparse), bounded per-token weight, exactly k total mass, differentiable.
 
 ---
 
-## Quick Start
+## Model size (V2-micro, num_channels=32)
 
-### Install
+| Component | Params |
+|---|---:|
+| SFBackbone (ConvNeXt-micro) | 2,553,120 |
+| head_tiny (8 heads) | 262,656 |
+| head_small (4 heads) | 65,792 |
+| head_medium (4 heads) | 49,280 |
+| head_large | 3,488 |
+| Decoder + classifier | 339,324 |
+| **Total** | **3,273,660 (3.27M)** |
+
+Comparable to SegFormer-B0 (3.7M). No pretrained weights.
+
+---
+
+## Quick start
+
+### Setup
 
 ```bash
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Prepare Data
+### Build CUDA op (clamped_softmax)
 
 ```bash
-# Download and prepare ADE20K-150 (~922 MB)
+python -c "from src.ops import clamped_softmax; print('CUDA op ready')"
+```
+
+### Prepare ADE20K data
+
+```bash
 python -m src.dataloaders.ade20k --download
 ```
 
-### Training
+### Train
 
 ```bash
-# Train — reads config.json automatically
 ./train.sh
-
-# Select backbone explicitly
-python -m src.training.trainer --backbone custom    # custom GELU (default)
-python -m src.training.trainer --backbone resnet18  # ImageNet pretrained ResNet-18
-
-# Freeze ResNet-18 backbone — train only adapters + heads + decoder (~1.2M params)
-python -m src.training.trainer --backbone resnet18 --freeze-backbone
-
-# Override config values via CLI
-python -m src.training.trainer --epochs 200 --batch-size 16 --lr 3e-4
-
-# Resume from last checkpoint (preserves optimizer + scheduler state)
-python -m src.training.trainer --resume last
-
-# Cosine restart — loads weights only, resets optimizer + scheduler
-# Set restart: true and new lr in config.json, then:
-python -m src.training.trainer --resume last --restart
+# Resume:
+./train.sh --resume last
 ```
-
-### ImageNet Pretraining (custom backbone only)
-
-Trains the full sf_seg feature pipeline (backbone + attention heads + decoder) as an ImageNet classifier. The classification head is discarded after training; backbone weights are saved for fine-tuning.
-
-Supports both ImageFolder and WebDataset formats.
-
-```bash
-python scripts/pretrain_encoder.py \
-  --data /path/to/imagenet_wds \   # WebDataset shards (train-*.tar) or ImageFolder root
-  --num-channels 128 \             # must match config.json
-  --focus-size 28 \                # must match config.json
-  --image-size 224 \
-  --batch-size 256 \
-  --epochs 50
-
-# After pretraining, add to config.json:
-# "encoder_pretrained": "checkpoints/pretrain/enc_best.pt"
-```
-
-### Multi-GPU (2× T4, Kaggle)
-
-```bash
-git checkout feat/multi-gpu
-# config.json on this branch: batch_size=32, lr=4e-4
-./train.sh
-```
-
-Uses `nn.DataParallel` — no code changes needed, auto-detects GPU count.
-
-### TensorBoard
-
-```bash
-tensorboard --logdir logs/tensorboard
-# → http://localhost:6006
-```
-
-Logged per epoch: `Loss/train`, `Loss/val`, `mIoU/train`, `mIoU/val`, `Accuracy`, `LR`, `SegLoss`, `DivLoss`, sample images + attention maps (every 5 epochs).
 
 ---
 
-## Configuration (`config.json`)
+## Config (`config.json`)
+
+Current optimal settings for RTX 3090 / 512×512 / ADE20K-150:
 
 ```json
 {
-  "data_root":             "data",
-  "epochs":                400,
-  "batch_size":            16,
-  "lr":                    1e-4,
-  "num_workers":           4,
-  "image_size":            512,
-  "num_channels":          128,
-  "focus_size":            64,
-  "encoder_stride":        1,
-  "num_classes":           151,
-  "backbone":              "resnet18",
-  "freeze_backbone":       true,
-  "encoder_pretrained":    null,
-  "loss_type":             "focal_iou",
-  "iou_w":                 0.5,
-  "diversity_weight":      0.1,
-  "absent_weight":         0.2,
-  "attn_guide_weight":     0.0,
-  "attn_exclusive_weight": 0.0,
-  "decoder_type":          "dense",
-  "resume":                false,
-  "restart":               false,
-  "aug_hflip":             true,
-  "aug_resized_crop":      true,
-  "aug_color_jitter":      true,
-  "aug_gaussian_noise":    false,
-  "aug_cutout":            true,
-  "aug_shift":             true
+  "model_type":        "v2",
+  "backbone_variant":  "micro",
+  "num_channels":      32,
+  "dw_kernel":         3,
+  "focus_size":        64,
+  "num_classes":       151,
+  "image_size":        512,
+  "batch_size":        16,
+  "epochs":            200,
+  "num_workers":       4,
+
+  "lr":                2e-4,
+  "backbone_lr_factor":0.1,
+  "grad_clip":         5.0,
+
+  "iou_w":             0.5,
+  "iou_downsample":    4,
+  "iou_warm_epochs":   10,
+  "boundary_weight":   3.0,
+  "diversity_weight":  0.3,
+  "aux_weight":        0.4,
+  "edge_weight":       0.0,
+
+  "aug_hflip": true, "aug_resized_crop": true,
+  "aug_color_jitter": true, "aug_hue": false,
+  "aug_cutout": true, "aug_shift": true
 }
 ```
 
-All fields are overridable via CLI `--arg value`.
-
-| Key | Values | Notes |
-|---|---|---|
-| `backbone` | `custom` / `resnet18` | custom = GELU no-norm; resnet18 = ImageNet pretrained |
-| `freeze_backbone` | `false` / `true` | only applies to `resnet18`; freezes stem+layer1-3 |
-| `encoder_pretrained` | path or `null` | path to `enc_best.pt` from `pretrain_encoder.py` (custom only) |
-| `loss_type` | `focal_iou` / `focal` / `ce_iou` / `ce` | affects val loss only; train always uses `sf_loss` |
-| `iou_w` | float | soft-IoU weight in `L_seg`; `0` = pure focal CE |
-| `resume` | `false` / `"last"` / path | continue from checkpoint |
-| `restart` | `false` / `true` | load weights only, reset optimizer + scheduler |
-
----
-
-## Training Pipeline
-
-| Component | Detail |
+| Key | Description |
 |---|---|
-| Optimiser | Adam (`weight_decay=1e-4`), only trainable params |
-| LR schedule | 5-epoch linear warmup → CosineAnnealingLR (`η_min = lr × 0.05`) |
-| Cosine restart | `restart: true` — loads weights only, resets optimiser + scheduler |
-| Freeze backbone | `freeze_backbone: true` — ResNet-18 stem+layer1-3 frozen; ~40-50% faster per step |
-| Gradient clipping | `clip_grad_norm(max_norm=1.0)` |
-| Mixed precision | AMP (`autocast` + `GradScaler`) |
-| Augmentation | hflip, resized-crop (scale 0.7–1.4), color jitter, cutout, shift (±10%) |
-| Checkpoints | `sf_seg_best.pt` (best val loss) + `sf_seg_last.pt`; CSV log appends across restarts |
+| `num_channels` | Base width C → pyramid C / 2C / 4C / 8C = 32/64/128/256 |
+| `focus_size` | Attention budget k = focus_size². 64 → max 4096 tokens attended |
+| `dw_kernel` | DWConv kernel in ConvNeXtBlock. 3 is 45% faster than 7, same quality |
+| `iou_downsample` | Downsample factor for soft-IoU computation (4 = H/4, 16× faster) |
+| `boundary_weight` | Upweight class-boundary pixels in focal CE (morphological dilation) |
+| `diversity_weight` | Gram-matrix penalty to diversify attention channels |
+| `iou_warm_epochs` | Delay soft-IoU for this many epochs (CE warms up first) |
+| `aug_hue` | **Keep false** — PIL hue is 7.4ms/image and bottlenecks DataLoader |
 
 ---
 
-## File Structure
+## Loss
+
+```
+L = seg  +  diversity_w × L_div  +  (guide_w × L_guide + excl_w × L_excl)
+```
+
+- **seg** = `focal_w × focal_CE` + `iou_w × soft_IoU`
+  - Focal CE with class-boundary upweighting (`boundary_weight=3.0`)
+  - Soft IoU computed at H/4 resolution (`iou_downsample=4`) — 16× cheaper
+- **diversity** — Gram-matrix cosine penalty on `head_large` maps
+- **guide / excl** — disabled by default (`=0.0`), enable once training is stable
+- **aux** — deep supervision at head_tiny / head_small / head_medium scales
+
+---
+
+## Training performance (RTX 3090, batch=16, 512×512)
+
+| Config | Speed |
+|---|:---:|
+| CE only (no IoU, no edge) | 5.67 it/s |
+| CE + soft IoU full-res (iou_downsample=1) | 3.93 it/s |
+| **CE + soft IoU ds=4 (current)** | **~4.2 it/s** |
+| + Sobel edge (disabled) | 3.14 it/s |
+
+DataLoader throughput: 172 samples/s with `aug_hue=false`, 95 samples/s with hue — GPU is bottleneck, not DataLoader.
+
+---
+
+## File structure
 
 ```
 sf_seg/
 ├── src/
 │   ├── models/
-│   │   ├── sf_seg.py            # custom backbone (GELU, no norm) + attention + decoder
-│   │   └── sf_seg_r18.py        # ResNet-18 backbone (ImageNet pretrained)
+│   │   ├── sf_seg_v2.py          # V2: SFBackbone + heads + decoder (default)
+│   │   └── sf_seg_r18.py         # V1: ResNet-18 backbone (legacy)
 │   ├── losses/
-│   │   ├── sf_loss.py           # unified loss: focal_CE + soft_IoU + diversity
-│   │   └── losses.py            # standalone loss functions
+│   │   └── sf_loss.py            # focal CE + soft IoU + diversity + boundary
+│   ├── ops/
+│   │   ├── clamped_softmax_cuda.cu   # CUDA bisection kernel + λ* output
+│   │   └── __init__.py               # analytical backward (saves 35ms/iter)
 │   ├── dataloaders/
-│   │   ├── ade20k.py            # download + prepare ADE20K-150
-│   │   ├── sampler.py           # distributed / weighted sampler
-│   │   └── utils.py             # dataloader utilities
+│   │   └── ade20k.py             # ADE20K dataset
 │   └── training/
-│       └── trainer.py           # AMP, warmup, grad clip, mIoU, TensorBoard
-│
-├── scripts/
-│   ├── pretrain_encoder.py      # ImageNet backbone pretraining (custom backbone)
-│   ├── download_imagenet.py     # download ImageNet-1K via HuggingFace
-│   ├── pack_webdataset.py       # convert ImageFolder → WebDataset tar shards
-│   ├── noise_aug.py             # augmentation visualisation
-│   ├── benchmark.py             # latency benchmark (CUDA)
-│   ├── attention.py             # attention map visualisation
-│   ├── architecture.py          # architecture diagram
-│   └── evaluation.py            # evaluation utilities
-│
+│       ├── trainer.py            # Training loop
+│       └── visualize.py          # Epoch output visualisation
 ├── docs/
-│   ├── architecture.png
-│   ├── architecture.svg
-│   └── sf_seg_methods.txt
-│
-├── config.json                  # default hyperparameters
-├── train.sh                     # launcher script
-├── setup.sh                     # venv setup
-└── requirements.txt
+│   ├── arch_01_overview.png      # Full architecture overview
+│   ├── arch_02_backbone.png      # SFBackbone detail
+│   ├── arch_03_blocks.png        # ConvNeXtBlock + SparseAttnHead
+│   ├── arch_04_decoder.png       # Decoder fusion
+│   └── arch_05_loss_probe.png    # Loss components + probing stats
+├── scripts/
+│   └── attention.py              # Visualise attention maps
+├── config.json
+├── requirements.txt
+└── train.sh
 ```
