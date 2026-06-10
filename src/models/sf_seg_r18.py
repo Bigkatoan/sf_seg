@@ -17,13 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _gn(C: int) -> nn.GroupNorm:
-    for g in [8, 4, 2, 1]:
-        if C % g == 0:
-            return nn.GroupNorm(g, C)
+from src.models.common import _gn  # noqa: F401 — re-exported for callers
 
 
 try:
@@ -93,18 +87,22 @@ class SparseAttnHead(nn.Module):
                  cross_kv_feat_dim: int | None = None):
         super().__init__()
         assert C % num_heads == 0, f"C={C} not divisible by num_heads={num_heads}"
-        self.C         = C
-        self.num_heads = num_heads
-        self.d         = C // num_heads
-        self.scale     = self.d ** -0.5
+        self.C          = C
+        self.num_heads  = num_heads
+        self.d          = C // num_heads
+        self.scale      = self.d ** -0.5
         self.focus_size = focus_size
+        self._is_cross  = cross_kv_feat_dim is not None
 
-        self.qkv = nn.Conv2d(C, 3 * C, 1, bias=False)
-
-        if cross_kv_feat_dim is not None:
+        if self._is_cross:
+            # Cross-attention: only Q from x; K,V from global_feat — saves 2C params
+            self.q_proj       = nn.Conv2d(C, C, 1, bias=False)
             self.cross_proj_k = nn.Conv2d(cross_kv_feat_dim, C, 1, bias=False)
             self.cross_proj_v = nn.Conv2d(cross_kv_feat_dim, C, 1, bias=False)
+            self.qkv          = None
         else:
+            # Self-attention: full QKV projection
+            self.qkv          = nn.Conv2d(C, 3 * C, 1, bias=False)
             self.cross_proj_k = None
             self.cross_proj_v = None
 
@@ -122,26 +120,29 @@ class SparseAttnHead(nn.Module):
         H_ = self.num_heads
         d  = self.d
 
-        qkv = self.qkv(x).view(B, 3, H_, d, N)
-        Q, K_self, V_self = qkv.unbind(dim=1)   # each: (B, H_, d, N)
-        Q      = Q.permute(0, 1, 3, 2)           # (B, H_, N, d)
-        K_self = K_self.permute(0, 1, 3, 2)      # (B, H_, N, d)
-        V_self = V_self.permute(0, 1, 3, 2)      # (B, H_, N, d)
-
-        if global_feat is not None and self.cross_proj_k is not None:
-            K_ext = self.cross_proj_k(global_feat)  # (B, C, H_g, W_g)
+        if self._is_cross and global_feat is not None:
+            # Cross-attention: Q from x only; K,V from global_feat
+            # Saves 2C params vs computing a full QKV on x
+            Q     = self.q_proj(x).view(B, H_, d, N).permute(0, 1, 3, 2)  # (B,H_,N,d)
+            K_ext = self.cross_proj_k(global_feat)   # (B, C, H_k, W_k)
             V_ext = self.cross_proj_v(global_feat)
-            N_g   = K_ext.shape[2] * K_ext.shape[3]
-            K_use = K_ext.view(B, H_, d, N_g).permute(0, 1, 3, 2)  # (B, H_, N_g, d)
-            V_use = V_ext.view(B, H_, d, N_g).permute(0, 1, 3, 2)
+            H_k, W_k = K_ext.shape[2], K_ext.shape[3]  # actual K spatial dims
+            N_k   = H_k * W_k
+            K_use = K_ext.view(B, H_, d, N_k).permute(0, 1, 3, 2)  # (B,H_,N_k,d)
+            V_use = V_ext.view(B, H_, d, N_k).permute(0, 1, 3, 2)
         else:
-            K_use, V_use = K_self, V_self
+            # Self-attention: Q, K, V all from x
+            qkv   = self.qkv(x).view(B, 3, H_, d, N)
+            Q_raw, K_raw, V_raw = qkv.unbind(dim=1)
+            Q     = Q_raw.permute(0, 1, 3, 2)   # (B,H_,N,d)
+            K_use = K_raw.permute(0, 1, 3, 2)
+            V_use = V_raw.permute(0, 1, 3, 2)
+            H_k, W_k = H, W
+            N_k   = N
 
-        N_k = K_use.shape[2]
         sim = torch.matmul(Q, K_use.transpose(-2, -1)) * self.scale  # (B, H_, N, N_k)
 
         # Budget: cap at 25% of N_k so sparsity is resolution-independent.
-        # focus_size² sets the upper bound (coarse scale = small focus).
         k_budget = min(self.focus_size ** 2, max(1, N_k // 4))
         attn     = _clamped_softmax(sim.reshape(B * H_ * N, N_k),
                                     float(k_budget)).view(B, H_, N, N_k)
@@ -150,14 +151,9 @@ class SparseAttnHead(nn.Module):
         out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)  # (B, C, H, W)
         out = self.out_proj(out)
 
-        # Spatial saliency: received attention per KEY position (column mean).
-        # This answers "which positions are being looked at?" rather than
-        # "how much does each query send?" (row mean — always constant = k/N_k).
-        # For self-attn: shape (B, H_, N_k) → view as (B, H_, H, W).
-        # For cross-attn: shape (B, H_, N_k=global) → view as (B, H_, H_k, W_k).
+        # Saliency: received attention per KEY position (column mean).
+        # H_k, W_k tracked from actual feature map — safe for non-square inputs.
         with torch.no_grad():
-            H_k = round(N_k ** 0.5)
-            W_k = N_k // H_k
             saliency = attn.detach().mean(dim=-2).view(B, H_, H_k, W_k)
         return out, saliency
 
@@ -306,24 +302,24 @@ class sf_seg(nn.Module):
     # ── Encode ────────────────────────────────────────────────────────────────────
 
     def _encode(self, x: torch.Tensor):
-        """Return adapted features at H/4, H/8, H/16, H/32."""
-        f_hr   = self.r18_stem_conv(x)     # (64,  H/2)
-        self._stem_hr = f_hr               # cache H/2 skip for hr_fuse in forward()
-        f      = self.r18_stem_pool(f_hr)  # (64,  H/4)
-        raw_l  = self.r18_layer1(f)        # (64,  H/4)
-        raw_m  = self.r18_layer2(raw_l)    # (128, H/8)
-        raw_s  = self.r18_layer3(raw_m)    # (256, H/16)
-        raw_t  = self.r18_layer4(raw_s)    # (512, H/32)
-        return (self.adapt_large(raw_l),   # (C1, H/4)
-                self.adapt_medium(raw_m),  # (C2, H/8)
-                self.adapt_small(raw_s),   # (C3, H/16)
-                self.adapt_tiny(raw_t))    # (C4, H/32)
+        """Return (f_detail, f1, f2, f3, f4) — f_detail is the H/2 stem skip."""
+        f_hr  = self.r18_stem_conv(x)     # (64,  H/2)
+        f     = self.r18_stem_pool(f_hr)  # (64,  H/4)
+        raw_l = self.r18_layer1(f)        # (64,  H/4)
+        raw_m = self.r18_layer2(raw_l)    # (128, H/8)
+        raw_s = self.r18_layer3(raw_m)    # (256, H/16)
+        raw_t = self.r18_layer4(raw_s)    # (512, H/32)
+        return (f_hr,
+                self.adapt_large(raw_l),
+                self.adapt_medium(raw_m),
+                self.adapt_small(raw_s),
+                self.adapt_tiny(raw_t))
 
     # ── Forward ───────────────────────────────────────────────────────────────────
 
     def extract_features(self, x: torch.Tensor, full_res: bool = True):
         H, W = x.shape[2], x.shape[3]
-        f1, f2, f3, f4 = self._encode(x)
+        f_detail, f1, f2, f3, f4 = self._encode(x)
 
         # head_tiny: sparse self-attention — global semantic context at H/32
         a_tiny,   sal_tiny   = self.head_tiny(f4)
@@ -369,18 +365,18 @@ class sf_seg(nn.Module):
         d_lg  = self.fuse_med_lg(torch.cat([m_up, a_large], dim=1))
 
         if not full_res:
-            return d_lg, attn_l
+            return d_lg, attn_l, f_detail
 
         # pre_masks at H/4 — classification happens at low res, upsample in forward()
-        return self.pre_masks(d_lg), attn_l
+        return self.pre_masks(d_lg), attn_l, f_detail
 
     def forward(self, x: torch.Tensor):
         H, W = x.shape[2], x.shape[3]
-        d_up, attn_l = self.extract_features(x)   # d_up = pre_masks(d_lg) at H/4
+        d_up, attn_l, f_detail = self.extract_features(x)
 
         # Detail refinement at H/2: fuse decoder with stem skip
         d_half = F.interpolate(d_up, (H // 2, W // 2), mode='bilinear', align_corners=False)
-        hr     = self.hr_adapt(self._stem_hr)                   # (B, _hr, H/2)
+        hr     = self.hr_adapt(f_detail)                        # (B, _hr, H/2)
         d_half = self.hr_fuse(torch.cat([d_half, hr], dim=1))  # (B, D//2, H/2)
 
         # Classify at H/2, then 2× upsample — halves minimum boundary width vs H/4

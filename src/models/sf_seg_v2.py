@@ -17,7 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.sf_seg_r18 import SparseAttnHead, AttentionHead, _gn
+from src.models.common import _gn
+from src.models.sf_seg_r18 import SparseAttnHead, AttentionHead
 
 
 # ── Backbone blocks ───────────────────────────────────────────────────────────
@@ -196,12 +197,10 @@ class sf_seg_v2(nn.Module):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _encode(self, x: torch.Tensor):
-        f_detail, f1, f2, f3, f4 = self.backbone(x)
-        self._stem_hr = f_detail
-        return f1, f2, f3, f4
+        return self.backbone(x)   # (f_detail, f1, f2, f3, f4)
 
     def extract_features(self, x: torch.Tensor, full_res: bool = True):
-        f1, f2, f3, f4 = self._encode(x)
+        f_detail, f1, f2, f3, f4 = self._encode(x)
 
         a_tiny,   sal_tiny   = self.head_tiny(f4)
         a_small,  sal_small  = self.head_small(f3)
@@ -237,18 +236,18 @@ class sf_seg_v2(nn.Module):
         d3    = self.fuse_tsml(torch.cat([d2_up, a_large], dim=1))   # (B, D//2, H/4)
 
         if not full_res:
-            return d3, attn_l
-        return self.pre_masks(d3), attn_l
+            return d3, attn_l, f_detail
+        return self.pre_masks(d3), attn_l, f_detail
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor):
-        H, W         = x.shape[2], x.shape[3]
-        d_up, attn_l = self.extract_features(x)              # (B, D//2, H/4)
+        H, W                    = x.shape[2], x.shape[3]
+        d_up, attn_l, f_detail  = self.extract_features(x)   # (B, D//2, H/4)
 
         # Detail refinement at H/2
         d_half = F.interpolate(d_up, (H // 2, W // 2), mode='bilinear', align_corners=False)
-        hr     = self.hr_adapt(self._stem_hr)
+        hr     = self.hr_adapt(f_detail)
         d_half = self.hr_fuse(torch.cat([d_half, hr], dim=1))
 
         # Classify at H/2 → upsample to full res

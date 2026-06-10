@@ -110,7 +110,9 @@ class ADE20KDataset(Dataset):
                 _, H, W = img_t.shape
                 rh = random.randint(H // 10, H // 6)
                 rw = random.randint(W // 10, W // 6)
-                img_t[:, random.randint(0, H-rh):, random.randint(0, W-rw):] = 0.0
+                y0 = random.randint(0, H - rh)
+                x0 = random.randint(0, W - rw)
+                img_t[:, y0:y0+rh, x0:x0+rw] = 0.0
 
             return img_t, torch.from_numpy(np.array(mask)).long()
 
@@ -121,8 +123,11 @@ class ADE20KDataset(Dataset):
 
 def update_confusion(conf: torch.Tensor, pred: torch.Tensor, target: torch.Tensor):
     C = conf.shape[0]
-    p = pred.view(-1).long().clamp(0, C - 1)
-    t = target.view(-1).long().clamp(0, C - 1)
+    p = pred.view(-1).long()
+    t = target.view(-1).long()
+    valid = (t >= 0) & (t < C)   # excludes ignore pixels (e.g. 255)
+    p = p[valid]
+    t = t[valid]
     conf += torch.bincount(t * C + p, minlength=C * C).view(C, C)
 
 
@@ -259,7 +264,8 @@ def train(args):
 
     cat_names = None
     if (data_root / "cat_to_idx.json").exists():
-        cat_names = json.load(open(data_root / "cat_to_idx.json")).get("idx_to_name", {})
+        with open(data_root / "cat_to_idx.json") as _f:
+            cat_names = json.load(_f).get("idx_to_name", {})
 
     csv_path = log_dir / 'train_log.csv'
     csv_new  = not csv_path.exists()
@@ -271,7 +277,7 @@ def train(args):
                         'train_acc','train_miou',
                         'val_loss','val_seg','val_acc','val_miou'])
 
-    best_val  = float('inf')
+    best_miou = 0.0
     best_path = ckpt_dir / 'sf_seg_best.pt'
     last_path = ckpt_dir / 'sf_seg_last.pt'
 
@@ -300,7 +306,7 @@ def train(args):
                     try: scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                     except Exception: pass
                 start_epoch = ckpt.get('epoch', 0) + 1
-                best_val    = ckpt.get('best_val_loss', best_val)
+                best_miou   = ckpt.get('best_val_miou', best_miou)
                 mode = 'restarted' if args.restart else 'resumed'
                 logging.info(f"Weights {mode} from {fp}, epoch {start_epoch}")
             except Exception as e:
@@ -355,10 +361,10 @@ def train(args):
                 if aux:
                     aux_ce = logits.new_tensor(0.)
                     for ax in aux:
-                        H, W = ax.shape[2:]
-                        tgt  = F.interpolate(masks.float().unsqueeze(1), (H, W),
-                                             mode='nearest').squeeze(1).long().clamp(0, args.num_classes - 1)
-                        aux_ce = aux_ce + F.cross_entropy(ax.float(), tgt)
+                        H, W   = ax.shape[2:]
+                        tgt_ax = F.interpolate(masks.float().unsqueeze(1), (H, W),
+                                               mode='nearest').squeeze(1).long()
+                        aux_ce = aux_ce + F.cross_entropy(ax.float(), tgt_ax, ignore_index=255)
                     aux_ce = aux_ce / len(aux)
                     loss   = loss + args.aux_weight * aux_ce
                     parts['aux'] = (args.aux_weight * aux_ce).detach()
@@ -378,8 +384,10 @@ def train(args):
 
             b = imgs.size(0)
             with torch.no_grad():
-                pred = logits.argmax(dim=1)
-                acc  = (pred == masks).float().mean().item()
+                pred     = logits.argmax(dim=1)
+                valid_px = (masks != 255)
+                acc      = ((pred[valid_px] == masks[valid_px]).float().mean().item()
+                            if valid_px.any() else 0.0)
                 update_confusion(conf_tr, pred, masks)
             for k in ('loss', 'seg', 'div', 'edge', 'aux'):
                 tr[k] += (loss if k == 'loss' else parts[k]).item() * b
@@ -404,10 +412,11 @@ def train(args):
                 masks = masks.to(device, non_blocking=True)
                 with autocast('cuda', enabled=device.type == 'cuda'):
                     logits, _, _ = model(imgs)
-                    s = F.cross_entropy(logits.float(),
-                                        masks.clamp(0, args.num_classes - 1))
-                pred = logits.argmax(dim=1)
-                acc  = (pred == masks).float().mean().item()
+                    s = F.cross_entropy(logits.float(), masks.long(), ignore_index=255)
+                pred     = logits.argmax(dim=1)
+                valid_px = (masks != 255)
+                acc      = ((pred[valid_px] == masks[valid_px]).float().mean().item()
+                            if valid_px.any() else 0.0)
                 update_confusion(conf_vl, pred, masks)
                 b = imgs.size(0)
                 vl['loss'] += s.item() * b
@@ -458,13 +467,13 @@ def train(args):
                 _tb_images(tb, model, _tb_imgs, _tb_masks, epoch, args.num_classes, device)
 
         # Checkpoint
-        improved = vl['loss'] < best_val
+        improved = vl_miou > best_miou
         if improved:
-            best_val = vl['loss']
+            best_miou = vl_miou
         ckpt = dict(epoch=epoch, model_state_dict=model.state_dict(),
                     optimizer_state_dict=optimizer.state_dict(),
                     scheduler_state_dict=scheduler.state_dict(),
-                    best_val_loss=best_val,
+                    best_val_miou=best_miou,
                     num_channels=args.num_channels, focus_size=args.focus_size,
                     num_classes=args.num_classes,
                     model_type=model_type,
@@ -473,7 +482,7 @@ def train(args):
         torch.save(ckpt, last_path)
         if improved:
             torch.save(ckpt, best_path)
-            logging.info(f"  ↳ best saved (val_loss={vl['loss']:.6f})")
+            logging.info(f"  ↳ best saved (val_miou={vl_miou:.4f})")
 
         if epoch % args.vis_interval == 0 or epoch == 1:
             try:
@@ -558,9 +567,11 @@ def parse_args():
 def merge_config(args):
     cfg = {}
     if args.config:
-        cfg = json.load(open(args.config))
+        with open(args.config) as _f:
+            cfg = json.load(_f)
     elif Path("config.json").exists():
-        cfg = json.load(open("config.json"))
+        with open("config.json") as _f:
+            cfg = json.load(_f)
 
     defaults = dict(
         data_root="data", epochs=500, batch_size=8, lr=1e-4, num_workers=8,
@@ -569,7 +580,7 @@ def merge_config(args):
         iou_w=0.5, iou_downsample=4, no_obj_weight=0.1,
         diversity_weight=0.3, edge_weight=0.0,
         attn_guide_weight=0.0, attn_exclusive_weight=0.0,
-        absent_weight=0.2, aux_weight=0.4,
+        aux_weight=0.4,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,

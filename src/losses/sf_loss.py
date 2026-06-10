@@ -79,17 +79,17 @@ def _boundary_mask(tgt: torch.Tensor) -> torch.Tensor:
 
 def _seg_term(target: torch.Tensor, logits: torch.Tensor,
               ce_raw: torch.Tensor, cfg: SFLossConfig,
+              valid: torch.Tensor,
               eps: float = 1e-3) -> torch.Tensor:
     """focal_w * focal_CE  +  iou_w * soft_IoU.
 
-    CE is always at full resolution. IoU optionally uses cfg.iou_downsample to
-    reduce spatial resolution (4 = H/4: 16× fewer pixels → ~16× faster & less RAM).
-    IoU is a class-level statistic (sum over pixels per class) so downsampling
-    preserves the signal while making the 1.25 GB bfloat16 tensor → 78 MB.
+    target  : tgt_safe — already clamped to [0, C-1], 255 replaced with 0 for indexing
+    ce_raw  : 0.0 at ignore pixels (computed with ignore_index=255)
+    valid   : (B,H,W) bool — True where target != 255
     """
     B, C, H, W = logits.shape
 
-    # Focal CE — full resolution (ce_raw is BxHxW, already computed)
+    # Focal CE — average ONLY over valid pixels (ce_raw=0 at ignore positions)
     ce_c  = ce_raw.clamp(max=100.0)
     pt    = torch.exp(-ce_c)
     focal = (1.0 - pt) ** cfg.focal_gamma * ce_c
@@ -98,7 +98,8 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
         bw    = 1.0 + (cfg.boundary_weight - 1.0) * _boundary_mask(target)
         focal = focal * bw
 
-    f_ce = _safe(focal.mean())
+    n_valid = valid.float().sum().clamp(min=1.0)
+    f_ce    = _safe((focal * valid.float()).sum() / n_valid)
 
     if cfg.iou_w <= 0:
         return _safe(cfg.focal_w * f_ce)
@@ -110,30 +111,34 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
         iou_target = F.interpolate(
             target.unsqueeze(1).float(), (H // ds, W // ds), mode='nearest'
         ).squeeze(1).long().clamp(0, C - 1)
+        valid_iou  = F.interpolate(
+            valid.float().unsqueeze(1), (H // ds, W // ds), mode='nearest'
+        ).squeeze(1)
     else:
         iou_logits = logits
         iou_target = target
+        valid_iou  = valid.float()
 
     Bi, Ci, Hi, Wi = iou_logits.shape
 
     # Soft IoU — bfloat16 probs (fp32 exponent range, no overflow on spatial sums)
-    probs    = F.softmax(iou_logits.bfloat16(), dim=1)                # (B, C, Hi, Wi)
-    tgt_flat = iou_target.view(Bi, -1)                                # (B, N)
+    probs      = F.softmax(iou_logits.bfloat16(), dim=1)              # (B, C, Hi, Wi)
+    tgt_flat   = iou_target.view(Bi, -1)                              # (B, N)
+    valid_flat = valid_iou.view(Bi, -1)                               # (B, N) float
 
     pred_sum = probs.sum(dim=[2, 3]).float()                          # (B, C)
 
     inter_diag = (probs.view(Bi, Ci, -1)
                   .gather(1, tgt_flat.unsqueeze(1))
                   .squeeze(1))                                        # (B, N) bf16
+    # Weight by valid_flat: ignore pixels do not contribute to intersection
     inter = (torch.zeros(Bi, Ci, device=logits.device, dtype=torch.float32)
-             .scatter_add(1, tgt_flat, inter_diag.float()))           # (B, C)
+             .scatter_add(1, tgt_flat, inter_diag.float() * valid_flat))  # (B, C)
 
     with torch.no_grad():
+        # gt_sum: count only valid pixels per class
         gt_sum = (torch.zeros(Bi, Ci, device=logits.device, dtype=torch.float32)
-                  .scatter_add(1, tgt_flat,
-                               torch.ones(Bi, Hi * Wi,
-                                          device=logits.device,
-                                          dtype=torch.float32)))      # (B, C)
+                  .scatter_add(1, tgt_flat, valid_flat))              # (B, C)
 
     iou     = ((inter + eps)
                / (pred_sum + gt_sum - inter + eps).clamp(min=eps)).clamp(0., 1.)
@@ -292,43 +297,39 @@ def sf_loss(logits: torch.Tensor, attn: torch.Tensor,
     C    = cfg.num_classes
     zero = logits.new_tensor(0.0)
 
-    # Safety: clamp target before ALL indexing/CE — ADE20K has ignore pixels (255)
-    tgt = target.clamp(0, C - 1)
+    # Ignore pixels: ADE20K uses 255 for "no region" — must not be trained on.
+    valid    = (target != 255)                  # (B, H, W) bool
+    tgt_safe = target.clamp(0, C - 1)          # safe for indexing; 255→0 at ignore positions
 
     # ── Shared fp32 logits — created ONCE, reused by CE and edge terms ────────
-    # Avoids materialising two separate (B,C,H,W) fp32 tensors (would be ~5 GB
-    # for B=16, C=151, H=W=512 if CE and Sobel each cast independently).
     logits_f32 = logits.float()
 
-    # ── Shared: per-pixel CE (full resolution, float32) ──────────────────────
-    ce_raw = F.cross_entropy(logits_f32, tgt, reduction="none")
-
-    # ── Shared: attn + target downsampled to guide_size × guide_size ──────────
-    g      = cfg.guide_size
-    attn_s = F.adaptive_avg_pool2d(attn.float(), (g, g))
-    tgt_s  = F.interpolate(tgt.float().unsqueeze(1), (g, g),
-                           mode="nearest").squeeze(1).long()
-    L    = g * g
-    B, K = attn_s.shape[:2]
-    gt_f = (F.one_hot(tgt_s, C)
-              .permute(0, 3, 1, 2).float()
-              .view(B, C, L))
-    atn_f = attn_s.view(B, K, L)
-
-    # ── Shared: no-grad IoU matrix (explicit float32 — bmm is autocast-eligible)
-    with torch.no_grad():
-        gt_f32  = gt_f.float()
-        atn_f32 = atn_f.float()
-        inter_ng = torch.bmm(gt_f32, atn_f32.transpose(1, 2))
-        union_ng = (gt_f32.sum(-1, keepdim=True)
-                    + atn_f32.sum(-1).unsqueeze(1) - inter_ng)
-        iou_m_ng = ((inter_ng + 1e-3)
-                    / (union_ng + 1e-3).clamp(min=1e-3)).clamp(0.0, 1.0)
+    # ── Shared: per-pixel CE — ce_raw=0 at ignore pixels (ignore_index=255) ──
+    ce_raw = F.cross_entropy(logits_f32, target.long(), ignore_index=255, reduction="none")
 
     # ── Loss terms ─────────────────────────────────────────────────────────────
-    s = _seg_term(tgt, logits, ce_raw, cfg)   # full-resolution CE + IoU
+    s = _seg_term(tgt_safe, logits, ce_raw, cfg, valid)
 
+    # Guide/excl: only compute expensive attn↔GT precompute when needed
     if cfg.guide_weight > 0 or cfg.excl_weight > 0:
+        g      = cfg.guide_size
+        attn_s = F.adaptive_avg_pool2d(attn.float(), (g, g))
+        tgt_s  = F.interpolate(tgt_safe.float().unsqueeze(1), (g, g),
+                               mode="nearest").squeeze(1).long()
+        L    = g * g
+        B, K = attn_s.shape[:2]
+        gt_f  = (F.one_hot(tgt_s, C)
+                   .permute(0, 3, 1, 2).float()
+                   .view(B, C, L))
+        atn_f = attn_s.view(B, K, L)
+        with torch.no_grad():
+            gt_f32   = gt_f.float()
+            atn_f32  = atn_f.float()
+            inter_ng = torch.bmm(gt_f32, atn_f32.transpose(1, 2))
+            union_ng = (gt_f32.sum(-1, keepdim=True)
+                        + atn_f32.sum(-1).unsqueeze(1) - inter_ng)
+            iou_m_ng = ((inter_ng + 1e-3)
+                        / (union_ng + 1e-3).clamp(min=1e-3)).clamp(0.0, 1.0)
         g_raw, e_raw = _attn_term(attn_s, gt_f, atn_f, iou_m_ng, cfg)
         g_ = cfg.guide_weight * g_raw
         e_ = cfg.excl_weight  * e_raw
@@ -338,8 +339,8 @@ def sf_loss(logits: torch.Tensor, attn: torch.Tensor,
     d = (cfg.diversity_weight * _diversity_term(attn)
          if cfg.diversity_weight > 0 else zero)
 
-    ed = (cfg.edge_weight * _sobel_term(logits_f32, tgt, cfg)
-          if cfg.edge_weight > 0 else zero)   # reuse shared fp32 logits
+    ed = (cfg.edge_weight * _sobel_term(logits_f32, tgt_safe, cfg)
+          if cfg.edge_weight > 0 else zero)
 
     total = s + g_ + e_ + d + ed
 
