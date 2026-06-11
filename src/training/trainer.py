@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training script — sf_seg on ADE20K-150 (151 classes)."""
+"""Training script — sf_seg on ADE20K, standard 150-class protocol."""
 from __future__ import annotations
 
 import argparse
@@ -9,6 +9,7 @@ import csv
 import json
 import logging
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,12 @@ from src.training.visualize import save_epoch_outputs
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
+
+def _remap_ade_mask(mask_arr: np.ndarray) -> np.ndarray:
+    """Standard ADE20K protocol: label 0 (unlabeled 'other') → ignore 255,
+    classes 1..150 → 0..149. Padded pixels (already 255) stay ignored."""
+    return np.where((mask_arr == 0) | (mask_arr == 255), 255, mask_arr - 1)
+
 
 class ADE20KDataset(Dataset):
     def __init__(self, images_dir: Path, masks_dir: Path,
@@ -76,7 +83,7 @@ class ADE20KDataset(Dataset):
                 dy  = random.randint(-ms, ms)
                 pad = [max(0, dx), max(0, dy), max(0, -dx), max(0, -dy)]
                 img  = TF.pad(img,  pad, fill=0)
-                mask = TF.pad(mask, pad, fill=0)
+                mask = TF.pad(mask, pad, fill=255)   # padded pixels = ignore, not a class
                 img  = TF.crop(img,  max(0, -dy), max(0, -dx), sz, sz)
                 mask = TF.crop(mask, max(0, -dy), max(0, -dx), sz, sz)
 
@@ -86,7 +93,7 @@ class ADE20KDataset(Dataset):
                 pw, ph = max(0, cw - sz), max(0, ch - sz)
                 if pw > 0 or ph > 0:
                     img  = TF.pad(img,  [pw//2, ph//2, pw-pw//2, ph-ph//2], fill=0)
-                    mask = TF.pad(mask, [pw//2, ph//2, pw-pw//2, ph-ph//2], fill=0)
+                    mask = TF.pad(mask, [pw//2, ph//2, pw-pw//2, ph-ph//2], fill=255)
                 iw, ih = img.size
                 x0 = random.randint(0, max(0, iw - cw))
                 y0 = random.randint(0, max(0, ih - ch))
@@ -114,9 +121,11 @@ class ADE20KDataset(Dataset):
                 x0 = random.randint(0, W - rw)
                 img_t[:, y0:y0+rh, x0:x0+rw] = 0.0
 
-            return img_t, torch.from_numpy(np.array(mask)).long()
+            return img_t, torch.from_numpy(
+                _remap_ade_mask(np.array(mask, dtype=np.int64))).long()
 
-        return TF.to_tensor(img), torch.from_numpy(np.array(mask)).long()
+        return TF.to_tensor(img), torch.from_numpy(
+            _remap_ade_mask(np.array(mask, dtype=np.int64))).long()
 
 
 # ── Class-aware sampler ───────────────────────────────────────────────────────
@@ -138,7 +147,7 @@ def _build_class_index(dataset: ADE20KDataset,
 
     for idx, (_, mask_path) in enumerate(
             tqdm(dataset.pairs, desc="Scanning masks", leave=False)):
-        mask  = np.array(Image.open(mask_path))
+        mask  = _remap_ade_mask(np.array(Image.open(mask_path), dtype=np.int64))
         valid = mask.ravel()
         classes = np.unique(valid[(valid != 255) & (valid < num_classes)])
         for c in classes:
@@ -155,37 +164,45 @@ def _build_class_index(dataset: ADE20KDataset,
 
 
 class AllClassBatchSampler(torch.utils.data.Sampler):
-    """Builds every batch so that ALL num_classes appear at least once.
+    """Builds every optimizer step so that ALL num_classes appear at least once,
+    while spreading usage evenly across the dataset.
 
-    Đúng như ý tưởng: mỗi class có dict chứa ảnh, build batch bằng cách
-    load ảnh từ dict ra. Trick: thay vì random pick 1 ảnh/class (cần ~64
-    ảnh cho 151 class vì overlap kém), dùng GREEDY SET COVER — mỗi bước
-    pick ảnh cover NHIỀU class nhất trong số chưa cover. Optimal cover chỉ
-    cần ~29 ảnh, đủ với batch_size ≥ 29.
+    Vấn đề của greedy thuần: cùng ~29 hub images được chọn lại MỌI step
+    (max usage = 481/epoch, chỉ 34% dataset được dùng) → model overfit vào
+    hub images, val mIoU plateau trong khi train mIoU tăng.
 
-    Algorithm
-    ---------
-    Phase 1 — stochastic greedy set cover:
-      Duy trì score[i] = số class chưa cover mà ảnh i có. Mỗi bước pick
-      ảnh score cao nhất (+ noise nhỏ để diversify), cập nhật score bằng
-      cách trừ các class vừa cover. Dừng khi hết uncovered class.
-      ~29 bước → tất cả 151 class covered với batch_size ≥ 29.
+    Algorithm (per optimizer step = batch_size × accum_steps ảnh)
+    -------------------------------------------------------------
+    Phase A — rotation cho class hiếm (< rare_thresh ảnh):
+      Mỗi class hiếm round-robin qua danh sách ảnh đã shuffle của nó →
+      usage hoàn toàn đều (ảnh của class 41-img được dùng ~9 lần/epoch
+      thay vì 295). Duyệt từ hiếm nhất; class đã covered do co-occurrence
+      thì bỏ qua.
 
-    Phase 2 — fill:
-      Thêm random ảnh cho đủ batch_size.
+    Phase B — greedy set cover + usage tie-break cho class còn lại:
+      score[i] = số class chưa cover trong ảnh i. Trong các ảnh có score
+      >= max·(1-rel_margin) (floor: >= 1 class mới), chọn ảnh ÍT DÙNG nhất
+      → vẫn tối ưu cover, nhưng xoay vòng giữa các ảnh tương đương.
+
+    Phase C — fill từ global permutation stream:
+      Phần còn lại lấy tuần tự từ 1 permutation của toàn dataset (không
+      lặp trong epoch) → phần dataset không chứa class hiếm vẫn được train.
     """
 
     def __init__(self, class_to_images: dict[int, list[int]],
                  img_classes: dict[int, set[int]],
                  dataset_size: int, batch_size: int,
-                 accum_steps: int = 1, seed: int = 42):
+                 accum_steps: int = 1, seed: int = 42,
+                 rare_thresh: int = 200, rel_margin: float = 0.4):
         self.n           = dataset_size
         self.batch_size  = batch_size
         self.accum_steps = accum_steps
         self.seed        = seed
         self.epoch       = 0
+        self.rel_margin  = rel_margin
         self.all_classes = sorted(c for c, imgs in class_to_images.items() if imgs)
-        C = len(self.all_classes)
+        C    = len(self.all_classes)
+        cmap = {c: j for j, c in enumerate(self.all_classes)}
 
         # Mỗi optimizer step = accum_steps mini-batches = batch_size × accum_steps ảnh
         eff_bs           = batch_size * accum_steps
@@ -196,19 +213,22 @@ class AllClassBatchSampler(torch.utils.data.Sampler):
         self.M = np.zeros((dataset_size, C), dtype=bool)
         for c, imgs in class_to_images.items():
             if imgs:
-                self.M[imgs, c] = True
+                self.M[imgs, cmap[c]] = True
 
-        # base_scores[i] = tổng số class trong image i
-        self.base_scores = self.M.sum(axis=1).astype(np.float32)
+        # Class hiếm (ít ảnh) — sắp từ hiếm nhất, rotation riêng từng class
+        self.rare_classes = sorted(
+            (c for c in self.all_classes if len(class_to_images[c]) < rare_thresh),
+            key=lambda c: len(class_to_images[c]))
+        self.rare_col   = {c: cmap[c] for c in self.rare_classes}
+        self._rare_imgs = {c: np.asarray(class_to_images[c]) for c in self.rare_classes}
 
         min_imgs = min(len(v) for v in class_to_images.values() if v)
-        guaranteed = eff_bs >= 29
         logging.info(
             f"AllClassBatchSampler: {C} classes  "
             f"batch_size={batch_size}  accum_steps={accum_steps}  "
             f"effective_bs={eff_bs}  num_batches={self.num_batches}  "
-            f"rarest_class={min_imgs} imgs  "
-            f"{'✓ all 151 classes per optimizer step' if guaranteed else f'~{min(C, int(C*(1-(1-29/C)**accum_steps)))}/151 classes'}"
+            f"rare_classes={len(self.rare_classes)} (<{rare_thresh} imgs)  "
+            f"rarest_class={min_imgs} imgs"
         )
 
     def set_epoch(self, epoch: int):
@@ -225,37 +245,65 @@ class AllClassBatchSampler(torch.utils.data.Sampler):
         eff_bs  = self.batch_size * accum
         opt_steps = self.num_batches // accum
 
+        usage  = np.zeros(N, dtype=np.float32)            # số lần dùng trong epoch
+        rot    = {c: rng.permutation(v) for c, v in self._rare_imgs.items()}
+        ptr    = {c: 0 for c in self.rare_classes}
+        stream = rng.permutation(N)                       # fill stream toàn epoch
+        sp     = 0
+
         for _ in range(opt_steps):
-            # ── Build cover for eff_bs = batch_size × accum_steps images ──
-            # Greedy set cover đảm bảo tất cả C class có trong eff_bs ảnh,
-            # sau đó chia đều thành accum mini-batches.
             all_imgs = []
             in_set   = np.zeros(N, dtype=bool)
-            scores   = self.base_scores.copy()
             covered  = np.zeros(C, dtype=bool)
 
-            # Phase 1: greedy cho đến khi cover hết C class hoặc đủ eff_bs ảnh
-            while not covered.all() and len(all_imgs) < eff_bs:
-                noisy          = scores + rng.uniform(0.0, 0.5, N)
-                noisy[in_set]  = -1.0
-                best           = int(noisy.argmax())
-                all_imgs.append(best)
-                in_set[best]   = True
-                newly          = self.M[best] & ~covered
-                if newly.any():
-                    scores    -= self.M[:, newly].sum(axis=1)
-                    scores     = np.maximum(scores, 0.0)
-                    covered   |= self.M[best]
-
-            # Phase 2: fill còn lại cho đủ eff_bs
-            if len(all_imgs) < eff_bs:
-                perm = rng.permutation(N)
-                for idx in perm:
-                    if len(all_imgs) >= eff_bs:
+            # ── Phase A: rotation class hiếm — usage đều tuyệt đối ──────────
+            for c in self.rare_classes:
+                if covered[self.rare_col[c]] or len(all_imgs) >= eff_bs:
+                    continue
+                lst = rot[c]
+                pick = None
+                for _ in range(len(lst)):
+                    i = int(lst[ptr[c] % len(lst)])
+                    ptr[c] += 1
+                    if not in_set[i]:
+                        pick = i
                         break
-                    if not in_set[idx]:
-                        all_imgs.append(int(idx))
-                        in_set[idx] = True
+                if pick is None:
+                    continue
+                all_imgs.append(pick)
+                in_set[pick] = True
+                covered |= self.M[pick]
+
+            # ── Phase B: greedy + usage tie-break cho class còn lại ─────────
+            scores = self.M[:, ~covered].sum(axis=1).astype(np.float32)
+            while not covered.all() and len(all_imgs) < eff_bs:
+                s = scores.copy()
+                s[in_set] = -1.0
+                mx = s.max()
+                if mx < 1.0:
+                    break   # không còn ảnh nào cover class mới
+                # Trong các ảnh gần-tối-ưu (floor: cover >= 1 class mới),
+                # chọn ảnh ít dùng nhất trong epoch
+                cand = np.flatnonzero(s >= max(mx * (1.0 - self.rel_margin), 1.0))
+                u    = usage[cand] + rng.uniform(0.0, 1.0, len(cand))
+                best = int(cand[u.argmin()])
+                all_imgs.append(best)
+                in_set[best] = True
+                newly = self.M[best] & ~covered
+                if newly.any():
+                    scores -= self.M[:, newly].sum(axis=1)
+                    scores  = np.maximum(scores, 0.0)
+                    covered |= self.M[best]
+
+            # ── Phase C: fill từ stream — mỗi ảnh tối đa 1 lần fill/epoch ───
+            while len(all_imgs) < eff_bs:
+                i = int(stream[sp % N])
+                sp += 1
+                if not in_set[i]:
+                    all_imgs.append(i)
+                    in_set[i] = True
+
+            usage[all_imgs] += 1.0
 
             # Shuffle rồi chia thành accum mini-batches, yield từng cái
             rng.shuffle(all_imgs)
@@ -275,6 +323,31 @@ def build_class_aware_sampler(dataset: ADE20KDataset,
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
+
+def presence_target(masks: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """(B,H,W) labels → (B,C) multi-label 0/1: class c có mặt trong ảnh."""
+    B     = masks.shape[0]
+    valid = (masks != 255)
+    idx   = torch.where(valid, masks, torch.zeros_like(masks))
+    tgt   = torch.zeros(B, num_classes, device=masks.device)
+    tgt.scatter_add_(1, idx.view(B, -1), valid.view(B, -1).float())
+    return tgt.clamp_(max=1.0)
+
+
+def update_presence_counts(cnt: dict, pres_logits: torch.Tensor,
+                            tgt: torch.Tensor, thresh: float = 0.5):
+    """Accumulate micro tp/fp/fn của presence prediction (sigmoid > thresh)."""
+    with torch.no_grad():
+        pb = (pres_logits.sigmoid() > thresh).float()
+        cnt['tp'] += (pb * tgt).sum().item()
+        cnt['fp'] += (pb * (1.0 - tgt)).sum().item()
+        cnt['fn'] += ((1.0 - pb) * tgt).sum().item()
+
+
+def presence_f1(cnt: dict) -> float:
+    denom = 2 * cnt['tp'] + cnt['fp'] + cnt['fn']
+    return (2 * cnt['tp'] / denom) if denom > 0 else 0.0
+
 
 def update_confusion(conf: torch.Tensor, pred: torch.Tensor, target: torch.Tensor):
     C = conf.shape[0]
@@ -386,6 +459,9 @@ def train(args):
             num_classes=args.num_classes,
             backbone_variant=getattr(args, 'backbone_variant', 'micro'),
             dw_kernel=getattr(args, 'dw_kernel', 3),
+            decoder_dim=getattr(args, 'decoder_dim', 256),
+            hr_dim=getattr(args, 'hr_dim', 96),
+            grad_checkpoint=getattr(args, 'grad_checkpoint', True),
         ).to(device)
         _bb_ids = {id(p) for p in model.backbone.parameters()}
     else:
@@ -434,17 +510,30 @@ def train(args):
     cat_names = None
     if (data_root / "cat_to_idx.json").exists():
         with open(data_root / "cat_to_idx.json") as _f:
-            cat_names = json.load(_f).get("idx_to_name", {})
+            _raw = json.load(_f).get("idx_to_name", {})
+        # File indexes raw ADE labels (0=background, 1=wall...); model classes
+        # follow the 150-class protocol (0=wall) → shift by -1, drop background.
+        cat_names = {str(int(k) - 1): v for k, v in _raw.items() if int(k) >= 1}
 
+    CSV_HEADER = ['epoch',
+                  'train_loss','train_seg','train_div','train_edge','train_aux',
+                  'train_acc','train_miou','train_pres_f1',
+                  'val_loss','val_seg','val_acc','val_miou','val_pres_f1']
     csv_path = log_dir / 'train_log.csv'
+    # Header cũ khác (run đời trước) → rotate sang file backup, mở file mới
+    if csv_path.exists():
+        with open(csv_path) as _f:
+            _old_header = _f.readline().strip().split(',')
+        if _old_header != CSV_HEADER:
+            _bak = csv_path.with_name(
+                f"train_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+            csv_path.rename(_bak)
+            logging.info(f"CSV schema đổi — log cũ chuyển sang {_bak.name}")
     csv_new  = not csv_path.exists()
     csv_f    = open(csv_path, 'a', newline='')
     csv_w    = csv.writer(csv_f)
     if csv_new:
-        csv_w.writerow(['epoch',
-                        'train_loss','train_seg','train_div','train_edge','train_aux',
-                        'train_acc','train_miou',
-                        'val_loss','val_seg','val_acc','val_miou'])
+        csv_w.writerow(CSV_HEADER)
 
     best_miou = 0.0
     best_path = ckpt_dir / 'sf_seg_best.pt'
@@ -468,7 +557,12 @@ def train(args):
         if fp.exists():
             try:
                 ckpt = torch.load(fp, map_location=device)
-                model.load_state_dict(ckpt['model_state_dict'])
+                _missing, _unexpected = model.load_state_dict(
+                    ckpt['model_state_dict'], strict=False)
+                if _missing:
+                    logging.info(f"  new layers (fresh init): {_missing}")
+                if _unexpected:
+                    logging.warning(f"  unexpected keys ignored: {_unexpected}")
                 if not args.restart:
                     try: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                     except Exception: pass
@@ -520,6 +614,7 @@ def train(args):
         tr   = dict(loss=0., seg=0., div=0., edge=0., aux=0., acc=0.)
         seen = 0
         conf_tr = torch.zeros(args.num_classes, args.num_classes, dtype=torch.long, device=device)
+        pres_tr = dict(tp=0., fp=0., fn=0.)   # presence micro-F1 counters
 
         bar        = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         step_loss  = 0.0   # accumulated loss for display
@@ -533,7 +628,14 @@ def train(args):
             masks = masks.to(device, non_blocking=True)
 
             with autocast('cuda', enabled=device.type == 'cuda'):
-                logits, _, attn = model(imgs)
+                if model_type == 'v2':
+                    # Loss tại H/2: nhanh 1.5×, VRAM −7.7GB; upsample cuối là
+                    # bilinear không tham số nên không mất tín hiệu học
+                    logits, _, attn = model(imgs, upsample=False)
+                    masks = F.interpolate(masks.float().unsqueeze(1), logits.shape[2:],
+                                          mode='nearest').squeeze(1).long()
+                else:
+                    logits, _, attn = model(imgs)
                 loss, parts = sf_loss(logits, attn, masks, sf_cfg)
 
                 # Deep supervision: auxiliary CE at each head scale
@@ -550,6 +652,17 @@ def train(args):
                     parts['aux'] = (args.aux_weight * aux_ce).detach()
                 else:
                     parts['aux'] = logits.new_tensor(0.)
+
+                # Class-presence guide: BCE multi-label "class nào có trong ảnh"
+                # — supervise global vector g (label free từ mask). Logged in 'aux'.
+                pres = getattr(model, '_presence', None)
+                pw   = getattr(args, 'presence_weight', 0.0)
+                if pres is not None and pw > 0:
+                    pres_tgt = presence_target(masks, pres.shape[1])
+                    p_loss = F.binary_cross_entropy_with_logits(pres.float(), pres_tgt)
+                    loss   = loss + pw * p_loss
+                    parts['aux'] = parts['aux'] + (pw * p_loss).detach()
+                    update_presence_counts(pres_tr, pres, pres_tgt)
 
             if not torch.isfinite(loss):
                 micro_step = 0
@@ -605,6 +718,7 @@ def train(args):
         vl    = dict(loss=0., seg=0., acc=0.)
         vseen = 0
         conf_vl = torch.zeros(args.num_classes, args.num_classes, dtype=torch.long, device=device)
+        pres_vl = dict(tp=0., fp=0., fn=0.)
 
         with torch.inference_mode():
             for imgs, masks in tqdm(val_loader,
@@ -619,6 +733,10 @@ def train(args):
                 acc      = ((pred[valid_px] == masks[valid_px]).float().mean().item()
                             if valid_px.any() else 0.0)
                 update_confusion(conf_vl, pred, masks)
+                _pres = getattr(model, '_presence', None)
+                if _pres is not None:
+                    update_presence_counts(
+                        pres_vl, _pres, presence_target(masks, _pres.shape[1]))
                 b = imgs.size(0)
                 vl['loss'] += s.item() * b
                 vl['seg']  += s.item() * b
@@ -641,18 +759,22 @@ def train(args):
         lr = scheduler.get_last_lr()[0]
         scheduler.step()
 
+        tr_pf1 = presence_f1(pres_tr)
+        vl_pf1 = presence_f1(pres_vl)
+
         logging.info(
             f"Ep {epoch}/{args.epochs} | lr={lr:.2e} | "
             f"train loss={tr['loss']:.4f} seg={tr['seg']:.4f} "
             f"div={tr['div']:.4f} aux={tr['aux']:.4f} "
-            f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} | "
-            f"val loss={vl['loss']:.4f} acc={vl['acc']:.4f} mIoU={vl_miou:.4f}"
+            f"acc={tr['acc']:.4f} mIoU={tr_miou:.4f} presF1={tr_pf1:.3f} | "
+            f"val loss={vl['loss']:.4f} acc={vl['acc']:.4f} mIoU={vl_miou:.4f} "
+            f"presF1={vl_pf1:.3f}"
             + cls_info)
 
         csv_w.writerow([epoch,
                         tr['loss'], tr['seg'], tr['div'], tr['edge'], tr['aux'],
-                        tr['acc'], tr_miou,
-                        vl['loss'], vl['seg'], vl['acc'], vl_miou])
+                        tr['acc'], tr_miou, tr_pf1,
+                        vl['loss'], vl['seg'], vl['acc'], vl_miou, vl_pf1])
         csv_f.flush()
 
         # TensorBoard
@@ -662,6 +784,7 @@ def train(args):
                               ("Acc/train",  tr['acc']),  ("Acc/val",   vl['acc']),
                               ("Seg/train",  tr['seg']),  ("Div/train", tr['div']),
                               ("Edge/train", tr['edge']), ("Aux/train", tr['aux']),
+                              ("PresenceF1/train", tr_pf1), ("PresenceF1/val", vl_pf1),
                               ("LR", lr)]:
                 tb.add_scalar(tag, val, epoch)
             if epoch == 1 or epoch % 5 == 0:
@@ -782,7 +905,8 @@ def merge_config(args):
         iou_w=0.5, iou_downsample=4, no_obj_weight=0.1,
         diversity_weight=0.3, edge_weight=0.0,
         attn_guide_weight=0.0, attn_exclusive_weight=0.0,
-        aux_weight=0.4,
+        aux_weight=0.4, presence_weight=0.2,
+        decoder_dim=256, hr_dim=96, grad_checkpoint=True,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,

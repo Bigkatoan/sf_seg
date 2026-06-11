@@ -9,4 +9,7 @@
 #   ./train.sh --resume last
 
 source venv/bin/activate
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 python -m src.training.trainer "$@"

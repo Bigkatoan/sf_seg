@@ -104,13 +104,61 @@ def _vstack(images: list[np.ndarray], gap: int = 2,
     return out
 
 
+def _presence_panel(pres_prob: np.ndarray, gt_classes: set[int],
+                    cat_names: dict | None, width: int,
+                    font=None, thresh: float = 0.5) -> np.ndarray:
+    """Bảng kiểm presence: model nhìn tổng quan ảnh có đúng không.
+
+    ✓ xanh  — detect đúng (p>thresh, có trong GT)
+    ✗ đỏ    — báo nhầm   (p>thresh, không có trong GT)
+    ? cam   — bỏ sót     (GT có, p<thresh)
+    """
+    def name(c: int) -> str:
+        n = (cat_names or {}).get(str(c), f'cls{c}')
+        return n.split(',')[0][:18]
+
+    detected = [(float(pres_prob[c]), c) for c in range(len(pres_prob))
+                if pres_prob[c] > thresh]
+    detected.sort(reverse=True)
+    det_set = {c for _, c in detected}
+    missed  = sorted(gt_classes - det_set)
+
+    lines = []
+    for p, c in detected[:24]:
+        ok = c in gt_classes
+        lines.append(((' ✓' if ok else ' ✗') + f' {name(c)} {p:.2f}',
+                      (90, 220, 90) if ok else (240, 90, 90)))
+    for c in missed[:12]:
+        lines.append((f' ? {name(c)} (miss {float(pres_prob[c]):.2f})',
+                      (240, 170, 60)))
+
+    n_tp = sum(1 for _, c in detected if c in gt_classes)
+    hdr  = (f'Presence: {n_tp}/{len(gt_classes)} GT detected, '
+            f'{len(detected) - n_tp} false alarm')
+
+    COLS, LH = 3, 15
+    rows_per_col = max(1, (len(lines) + COLS - 1) // COLS)
+    h   = 22 + rows_per_col * LH + 6
+    img = Image.new('RGB', (width, h), (20, 20, 20))
+    d   = ImageDraw.Draw(img)
+    d.text((6, 4), hdr, fill=(255, 255, 255), font=font)
+    col_w = width // COLS
+    for i, (txt, color) in enumerate(lines):
+        cx = (i // rows_per_col) * col_w + 6
+        cy = 22 + (i % rows_per_col) * LH
+        d.text((cx, cy), txt, fill=color, font=font)
+    return np.array(img)
+
+
 # ── Semantic mask palette ─────────────────────────────────────────────────────
 
 def _palette(n: int) -> np.ndarray:
+    """n class colors + 1 extra row: index n = black for ignore (255) pixels.
+    Mọi class 0..n-1 đều có màu thật (150-class protocol: class 0 = wall)."""
     import colorsys
-    pal = np.zeros((n, 3), dtype=np.uint8)
-    for i in range(1, n):
-        h = (i * 0.618033988749895) % 1.0
+    pal = np.zeros((n + 1, 3), dtype=np.uint8)
+    for i in range(n):
+        h = ((i + 1) * 0.618033988749895) % 1.0
         r, g, b = colorsys.hsv_to_rgb(h, 0.75 + 0.10 * (i % 3), 0.85 + 0.05 * (i % 2))
         pal[i] = [int(r * 255), int(g * 255), int(b * 255)]
     return pal
@@ -127,6 +175,8 @@ def visualize_sample(
     idx:        int,
     num_classes: int,
     font=None,
+    presence:   torch.Tensor | None = None,   # (C,) sigmoid probs
+    cat_names:  dict | None = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     H, W  = img_t.shape[1], img_t.shape[2]
@@ -140,8 +190,9 @@ def visualize_sample(
     gt_np       = mask_t.cpu().numpy().astype(np.int32)
     conf_np     = _norm01(conf.cpu().numpy())
 
-    gt_rgb   = pal[gt_np]
-    pred_rgb = pal[pred_np]
+    # Ignore pixels (255) → last palette row (black); clip phòng giá trị lạ
+    gt_rgb   = pal[np.where(gt_np == 255, num_classes, gt_np).clip(0, num_classes)]
+    pred_rgb = pal[pred_np.clip(0, num_classes)]
     conf_rgb = _jet(conf_np)
 
     # ── masks/ ────────────────────────────────────────────────────────────────
@@ -172,14 +223,19 @@ def visualize_sample(
     # ── composite/ — one tall image with everything ───────────────────────────
     comp_dir = out_dir / 'composite'
     comp_dir.mkdir(exist_ok=True)
-    _save_composite(rgb, gt_rgb, pred_rgb, conf_rgb, attns, H, W, idx, comp_dir, font)
+    pres_np    = presence.cpu().numpy() if presence is not None else None
+    gt_classes = set(int(c) for c in np.unique(gt_np) if c != 255)
+    _save_composite(rgb, gt_rgb, pred_rgb, conf_rgb, attns, H, W, idx, comp_dir,
+                    font, pres_np, gt_classes, cat_names)
 
 
 def _save_composite(rgb, gt_rgb, pred_rgb, conf_rgb,
-                    attns, H, W, idx, comp_dir, font):
+                    attns, H, W, idx, comp_dir, font,
+                    pres_prob=None, gt_classes=None, cat_names=None):
     """
     Layout:
       Row 0: Input | GT | Prediction | Confidence
+      Row 1: presence panel (nếu model có presence head)
       Row N: [scale name] avg-overlay | head0-overlay | head1-overlay | ...
 
     Each cell is CELL×CELL pixels.
@@ -201,6 +257,11 @@ def _save_composite(rgb, gt_rgb, pred_rgb, conf_rgb,
         cell(conf_rgb, 'Confidence'),
     ])
     rows.append(row0)
+
+    # Presence panel: tổng quan ảnh model nhìn được gì
+    if pres_prob is not None:
+        rows.append(_presence_panel(pres_prob, gt_classes or set(),
+                                    cat_names, row0.shape[1], font))
 
     # One row per attention scale
     for name, sal in attns.items():
@@ -266,6 +327,8 @@ def save_epoch_outputs(
         logits, _, _  = model(img_t.unsqueeze(0).to(device))   # populates _attns
         logits        = logits[0].cpu()
         attns         = {k: v[0].cpu() for k, v in model._attns.items()}
+        _pres         = getattr(model, '_presence', None)
+        presence      = _pres[0].sigmoid().cpu() if _pres is not None else None
 
         visualize_sample(
             img_t       = img_t,
@@ -276,6 +339,8 @@ def save_epoch_outputs(
             idx         = si,
             num_classes = num_classes,
             font        = font,
+            presence    = presence,
+            cat_names   = cat_names,
         )
 
     return epoch_dir

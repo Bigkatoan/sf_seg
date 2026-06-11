@@ -1,7 +1,9 @@
 # SF-Seg V2 — Sparse-Focus Semantic Segmentation
 
-Semantic segmentation with **budget-constrained sparse attention** (`clamped_softmax`).  
-Custom ConvNeXt-style backbone trained from scratch. Dataset: ADE20K-150 (151 classes).
+Semantic segmentation with **budget-constrained sparse attention** (`clamped_softmax`)
+and **class-presence-guided global context**.
+Custom ConvNeXt-style backbone trained from scratch.
+Dataset: ADE20K, standard **150-class protocol** (label 0 "other" → ignore 255).
 
 ---
 
@@ -36,17 +38,36 @@ Input (B, 3, H, W)
        ├─ stage2      → (B,  64, H/8,  W/8)   f2 ──→ head_medium (SparseAttnHead) │
        ├─ stage3      → (B, 128, H/16, W/16)  f3 ──→ head_small  (SparseAttnHead) │
        └─ stage4      → (B, 256, H/32, W/32)  f4 ──→ head_tiny   (SparseAttnHead) │
+              │                                               │                    │
+              │ GAP                            cross-attn ◄──┘ (head_medium)      │
+              ▼                                                                    │
+       g (B, 256) ──► presence_head → (B, 150) ──► BCE "class nào có trong ảnh"  │
+              │                          │                                         │
+              │ ctx_proj (mid-fusion)    │ late_ctx (late-fusion, 150×150)        │
+              ▼                          ▼                                         │
+   Decoder: fuse_ts → fuse_tsm → fuse_tsml(256 @H/4) ⊕ ctx → ConvNeXt refine      │
                                                               │                    │
-                                               cross-attn ◄──┘ (head_medium)      │
-                                                                                   │
-                              Decoder: bottom-up fusion (fuse_ts → fuse_tsm → fuse_tsml)
-                                                              │                    │
-                                              hr_fuse at H/2 ◄────────────────────┘
+                                       proj_hr 256→96, hr_fuse at H/2 ◄───────────┘
                                                               │
-                                              Classifier → bilinear ↑
+                                       Classifier 96→256→150  ⊕  late_ctx(p)
                                                               │
-                                         Logits (B, 151, H, W)
+                              train: logits @ H/2  │  eval: bilinear ↑ full res
 ```
+
+### Global context (presence-guided)
+
+Lỗi phân loại chủ yếu là các cặp ngữ nghĩa cần scene context (door↔wall,
+house↔building 46%, plant↔tree — đo bằng `scripts/analyze_errors.py`).
+Ba cơ chế phối hợp:
+
+1. **Presence supervision** — `g = GAP(f4)` → linear → 150 logits, BCE multi-label
+   *"class nào có mặt trong ảnh"* (label lấy free từ mask). Ép `g` mang thông tin
+   tổng quan. Theo dõi qua metric `presF1` trong log.
+2. **Mid-fusion** — `ctx_proj(g)` cộng vào decoder @ H/4 (zero-init): từng pixel
+   được điều kiện hóa theo scene qua 3 lớp conv phi tuyến.
+3. **Late-fusion** — `S_final = S + late_ctx(p)`: prior per-class toàn ảnh cộng
+   thẳng vào logits (phân rã Bayes: log P(c|pixel) + log P(c|ảnh)). Ma trận
+   150×150 zero-init, đọc được trực tiếp ("có bed → đè building").
 
 ### Attention heads
 
@@ -56,9 +77,6 @@ Input (B, 3, H, W)
 | `head_small`  | H/16 | SparseAttnHead (self) | 4 | Mid-scale features |
 | `head_medium` | H/8  | SparseAttnHead (cross ← head_tiny) | 4 | Global context, cheap |
 | `head_large`  | H/4  | AttentionHead (spatial gating) | — | Sharp boundary detail |
-
-**Sparsity curriculum**: at 512px, `head_tiny` attends to 64/256 ≈ 25% of tokens.
-At 256px (early training), budget covers 100% → naturally dense → sparse as resolution grows.
 
 ### Clamped Softmax — budget attention
 
@@ -73,130 +91,133 @@ Step 3:  attn = clamp(p − λ*, 0, 1)
 Bwd:     analytical gradient (λ* saved from CUDA forward) — 27ms vs 62ms topk
 ```
 
-Properties: hard zeros (sparse), bounded per-token weight, exactly k total mass, differentiable.
-
 ---
 
-## Model size (V2-micro, num_channels=32)
+## Model size (V2-micro, num_channels=32, decoder_dim=256)
 
 | Component | Params |
 |---|---:|
-| SFBackbone (ConvNeXt-micro) | 2,553,120 |
-| head_tiny (8 heads) | 262,656 |
-| head_small (4 heads) | 65,792 |
-| head_medium (4 heads) | 49,280 |
-| head_large | 3,488 |
-| Decoder + classifier | 339,324 |
-| **Total** | **3,273,660 (3.27M)** |
+| SFBackbone (ConvNeXt-micro) | 2,553K |
+| Attention heads (tiny/small/medium/large) | 373K |
+| Decoder (fuse chain + ConvNeXt refine + proj_hr + hr) | 757K |
+| Classifier (96→256→150) | 63K |
+| Aux heads (deep supervision ×3) | 68K |
+| Presence head + ctx_proj (mid-fusion) | 104K |
+| late_ctx (late-fusion 150×150) | 23K |
+| **Total** | **3.977M** |
 
 Comparable to SegFormer-B0 (3.7M). No pretrained weights.
 
 ---
 
-## Quick start
+## Class-aware sampler (AllClassBatchSampler)
 
-### Setup
+Mỗi optimizer step (batch_size × accum_steps ảnh) chứa **đủ 150 class** —
+gradient luôn mang tín hiệu của mọi class, kể cả class hiếm nhất (41 ảnh).
+
+3 phases mỗi step: **(A)** rotation cho class hiếm (<200 ảnh) — usage đều tuyệt
+đối; **(B)** greedy set cover với usage tie-break trong margin 40%; **(C)** fill
+từ global permutation stream. Kết quả: full-cover 360/360 steps, 45.7% dataset
+unique mỗi epoch, max-usage 15 (greedy thuần: max-usage 481, 34% unique — gây
+val plateau). Index class→ảnh cache ở `logs/class_index.pt` (tự build lần đầu).
+
+---
+
+## Quick start
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+python -c "from src.ops import clamped_softmax; print('CUDA op ready')"   # build CUDA op
+python -m src.dataloaders.ade20k --download                                # data
+
+./train.sh                       # train from scratch
+./train.sh --resume last         # resume
+./train.sh --resume checkpoints/<init>.pt --restart --lr 5e-4   # warm-start
 ```
 
-### Build CUDA op (clamped_softmax)
+### Probe & analysis (chạy ngay khi có checkpoint)
 
 ```bash
-python -c "from src.ops import clamped_softmax; print('CUDA op ready')"
-```
-
-### Prepare ADE20K data
-
-```bash
-python -m src.dataloaders.ade20k --download
-```
-
-### Train
-
-```bash
-./train.sh
-# Resume:
-./train.sh --resume last
+python -m scripts.probe_ckpt          # per-class IoU, coverage, pred% vs gt%
+python -m scripts.analyze_errors      # confusion pairs, boundary vs interior, mIoU theo tần suất
+python -m scripts.extract_backbone    # cắt backbone+heads sang init cho arch mới
 ```
 
 ---
 
-## Config (`config.json`)
+## Config (`config.json`) — RTX 3090 / 512×512 / ADE20K-150
 
-Current optimal settings for RTX 3090 / 512×512 / ADE20K-150:
+| Key | Value | Description |
+|---|:---:|---|
+| `num_classes` | 150 | Standard protocol: raw label 0 → ignore 255, 1..150 → 0..149 |
+| `batch_size` / `accum_steps` | 14 / 4 | Effective batch 56; đủ ngân sách cover 150 class/step |
+| `decoder_dim` / `hr_dim` | 256 / 96 | Wide decoder @ H/4, project về 96 trước H/2 |
+| `grad_checkpoint` | false | Backbone nhỏ → checkpointing chỉ tiết kiệm 2%, tắt cho nhanh |
+| `lr` | 1e-3 | Poly decay theo `epochs`; warm-start dùng 5e-4 |
+| `iou_w` / `iou_warm_epochs` | 1.0 / 10 | Soft IoU (đã per-class balanced), ramp sau 10 epochs |
+| `presence_weight` | 0.2 | BCE multi-label supervise global vector |
+| `aux_weight` | 0.4 | Deep supervision tại 3 scale (log gộp cả presence) |
+| `focus_size` | 64 | Attention budget k = focus_size² |
+| `dw_kernel` | 3 | DWConv 3×3 nhanh hơn 45% so với 7×7, chất lượng tương đương |
+| `aug_hue` | false | **Giữ false** — PIL hue 7.4ms/ảnh, nghẽn DataLoader |
 
-```json
-{
-  "model_type":        "v2",
-  "backbone_variant":  "micro",
-  "num_channels":      32,
-  "dw_kernel":         3,
-  "focus_size":        64,
-  "num_classes":       151,
-  "image_size":        512,
-  "batch_size":        16,
-  "epochs":            200,
-  "num_workers":       4,
-
-  "lr":                2e-4,
-  "backbone_lr_factor":0.1,
-  "grad_clip":         5.0,
-
-  "iou_w":             0.5,
-  "iou_downsample":    4,
-  "iou_warm_epochs":   10,
-  "boundary_weight":   3.0,
-  "diversity_weight":  0.3,
-  "aux_weight":        0.4,
-  "edge_weight":       0.0,
-
-  "aug_hflip": true, "aug_resized_crop": true,
-  "aug_color_jitter": true, "aug_hue": false,
-  "aug_cutout": true, "aug_shift": true
-}
-```
-
-| Key | Description |
-|---|---|
-| `num_channels` | Base width C → pyramid C / 2C / 4C / 8C = 32/64/128/256 |
-| `focus_size` | Attention budget k = focus_size². 64 → max 4096 tokens attended |
-| `dw_kernel` | DWConv kernel in ConvNeXtBlock. 3 is 45% faster than 7, same quality |
-| `iou_downsample` | Downsample factor for soft-IoU computation (4 = H/4, 16× faster) |
-| `boundary_weight` | Upweight class-boundary pixels in focal CE (morphological dilation) |
-| `diversity_weight` | Gram-matrix penalty to diversify attention channels |
-| `iou_warm_epochs` | Delay soft-IoU for this many epochs (CE warms up first) |
-| `aug_hue` | **Keep false** — PIL hue is 7.4ms/image and bottlenecks DataLoader |
+Lưu ý: key mới trong `config.json` phải có mặt trong `defaults` dict của
+`merge_config` (trainer.py) mới có hiệu lực.
 
 ---
 
 ## Loss
 
 ```
-L = seg  +  diversity_w × L_div  +  (guide_w × L_guide + excl_w × L_excl)
+L = seg + diversity_w·L_div + aux_w·L_aux + presence_w·L_presence
+seg = focal_CE (sqrt-frequency per-class) + iou_w · soft_IoU
 ```
 
-- **seg** = `focal_w × focal_CE` + `iou_w × soft_IoU`
-  - Focal CE with class-boundary upweighting (`boundary_weight=3.0`)
-  - Soft IoU computed at H/4 resolution (`iou_downsample=4`) — 16× cheaper
-- **diversity** — Gram-matrix cosine penalty on `head_large` maps
-- **guide / excl** — disabled by default (`=0.0`), enable once training is stable
-- **aux** — deep supervision at head_tiny / head_small / head_medium scales
+- **focal CE, sqrt-frequency normalized** — mean trong từng class rồi weighted-mean
+  giữa các class với trọng số √n_c (per-pixel ∝ 1/√n_c). Cân bằng giữa pixel-mean
+  (class lớn nuốt gradient class hiếm) và pure class-mean (over-correct — wall bị
+  predict 6% vs 15.5% GT).
+- **soft IoU** tại H/4 (`iou_downsample=4`), per-class, ramp sau `iou_warm_epochs`.
+- **Training loss tính tại H/2** (target nearest-downsample): nhanh 1.5×, peak VRAM
+  17.7→10GB. Val luôn đánh giá tại full-res.
+- **presence BCE** — xem Global context ở trên.
+- **boundary upweight** trong focal CE; **diversity** Gram penalty trên head_large.
 
 ---
 
-## Training performance (RTX 3090, batch=16, 512×512)
+## Logging & visualization
 
-| Config | Speed |
-|---|:---:|
-| CE only (no IoU, no edge) | 5.67 it/s |
-| CE + soft IoU full-res (iou_downsample=1) | 3.93 it/s |
-| **CE + soft IoU ds=4 (current)** | **~4.2 it/s** |
-| + Sobel edge (disabled) | 3.14 it/s |
+`logs/train_log.csv` (schema đổi → file cũ tự rotate sang `train_log_<timestamp>.csv`):
 
-DataLoader throughput: 172 samples/s with `aug_hue=false`, 95 samples/s with hue — GPU is bottleneck, not DataLoader.
+```
+epoch, train_loss, train_seg, train_div, train_edge, train_aux,
+train_acc, train_miou, train_pres_f1,
+val_loss, val_seg, val_acc, val_miou, val_pres_f1
+```
+
+- **`pres_f1`** — micro-F1 của presence prediction (sigmoid > 0.5) vs class có thật
+  trong ảnh: đo trực tiếp *"model nhìn tổng quan ảnh có đúng không"*. Kỳ vọng
+  val_pres_f1 cao hơn và hội tụ sớm hơn val_miou (bài toán dễ hơn segment).
+- Log line mỗi epoch in thêm `presF1=` (train + val) và top-10 class IoU.
+- TensorBoard: thêm `PresenceF1/train`, `PresenceF1/val`.
+
+`outputs/epoch_NNNN/composite/` mỗi sample gồm: input/GT/pred/confidence,
+**presence panel** (✓ xanh = detect đúng, ✗ đỏ = báo nhầm, ? cam = bỏ sót —
+kèm xác suất), và attention overlays của 4 scale. GT mask: pixel ignore (255)
+tô đen; mọi class 0..149 đều có màu riêng.
+
+---
+
+## Training performance (RTX 3090, batch=14, 512×512)
+
+| Config | Speed | Peak VRAM |
+|---|:---:|:---:|
+| Loss @ full-res + grad checkpointing | 46 img/s | 16.6 GB |
+| **Loss @ H/2, no checkpointing (current)** | **68 img/s** | **10.0 GB** |
+
+Forward chỉ 72ms/step — nghẽn trước đây là CE full-res 512², không phải model.
+DataLoader 172 samples/s (`aug_hue=false`) — GPU vẫn là bottleneck. ~4 phút/epoch.
 
 ---
 
@@ -206,27 +227,26 @@ DataLoader throughput: 172 samples/s with `aug_hue=false`, 95 samples/s with hue
 sf_seg/
 ├── src/
 │   ├── models/
-│   │   ├── sf_seg_v2.py          # V2: SFBackbone + heads + decoder (default)
-│   │   └── sf_seg_r18.py         # V1: ResNet-18 backbone (legacy)
+│   │   ├── sf_seg_v2.py          # V2: SFBackbone + heads + wide decoder + presence ctx
+│   │   └── sf_seg_r18.py         # V1: ResNet-18 backbone (legacy) + SparseAttnHead
 │   ├── losses/
-│   │   └── sf_loss.py            # focal CE + soft IoU + diversity + boundary
+│   │   └── sf_loss.py            # sqrt-freq focal CE + soft IoU + diversity + boundary
 │   ├── ops/
 │   │   ├── clamped_softmax_cuda.cu   # CUDA bisection kernel + λ* output
-│   │   └── __init__.py               # analytical backward (saves 35ms/iter)
+│   │   └── __init__.py               # analytical backward
 │   ├── dataloaders/
-│   │   └── ade20k.py             # ADE20K dataset
+│   │   └── ade20k.py             # ADE20K dataset (download)
 │   └── training/
-│       ├── trainer.py            # Training loop
-│       └── visualize.py          # Epoch output visualisation
-├── docs/
-│   ├── arch_01_overview.png      # Full architecture overview
-│   ├── arch_02_backbone.png      # SFBackbone detail
-│   ├── arch_03_blocks.png        # ConvNeXtBlock + SparseAttnHead
-│   ├── arch_04_decoder.png       # Decoder fusion
-│   └── arch_05_loss_probe.png    # Loss components + probing stats
+│       ├── trainer.py            # train loop, AllClassBatchSampler, presence F1
+│       └── visualize.py          # composite + presence panel + attention overlays
 ├── scripts/
-│   └── attention.py              # Visualise attention maps
+│   ├── probe_ckpt.py             # per-class IoU / coverage probe
+│   ├── analyze_errors.py         # confusion pairs, boundary vs interior
+│   ├── extract_backbone.py       # transfer weights sang arch mới
+│   ├── convert_ckpt_150.py       # 151→150 class converter (one-off)
+│   └── attention.py              # attention map visualisation
+├── archive/                      # checkpoints + logs các run cũ (ablation)
+├── docs/                         # architecture diagrams
 ├── config.json
-├── requirements.txt
-└── train.sh
+└── train.sh                      # PYTORCH_CUDA_ALLOC_CONF + venv + trainer
 ```

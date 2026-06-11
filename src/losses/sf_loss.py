@@ -81,7 +81,11 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
               ce_raw: torch.Tensor, cfg: SFLossConfig,
               valid: torch.Tensor,
               eps: float = 1e-3) -> torch.Tensor:
-    """focal_w * focal_CE  +  iou_w * soft_IoU.
+    """focal_w * focal_CE (sqrt-frequency per-class normalized)  +  iou_w * soft_IoU.
+
+    CE is averaged within each present class then sqrt(n_c)-weighted across
+    classes — rare classes get boosted ~1/sqrt(freq) without fully muting
+    dominant ones.
 
     target  : tgt_safe — already clamped to [0, C-1], 255 replaced with 0 for indexing
     ce_raw  : 0.0 at ignore pixels (computed with ignore_index=255)
@@ -98,8 +102,19 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
         bw    = 1.0 + (cfg.boundary_weight - 1.0) * _boundary_mask(target)
         focal = focal * bw
 
-    n_valid = valid.float().sum().clamp(min=1.0)
-    f_ce    = _safe((focal * valid.float()).sum() / n_valid)
+    # Per-class CE normalization (sqrt-frequency): average focal loss within
+    # each class, then weighted-average across classes with weight sqrt(n_c).
+    # Effective per-pixel weight ∝ 1/sqrt(n_c) — between pixel-mean (dominant
+    # classes swamp rare) and pure class-mean (probe showed it over-corrects:
+    # wall predicted 6% of pixels vs 15.5% GT).
+    tgt_flat   = target.view(-1)                                   # (B*H*W)
+    focal_flat = focal.view(-1)
+    valid_flat = valid.float().view(-1)
+    cls_sum    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, focal_flat * valid_flat)
+    cls_cnt    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, valid_flat)
+    cls_w      = cls_cnt.sqrt()                                    # 0 for absent classes
+    cls_mean   = cls_sum / cls_cnt.clamp(min=1.0)
+    f_ce       = _safe((cls_mean * cls_w).sum() / cls_w.sum().clamp(min=1.0))
 
     if cfg.iou_w <= 0:
         return _safe(cfg.focal_w * f_ce)
@@ -160,8 +175,7 @@ def _attn_term(attn_s: torch.Tensor, gt_f: torch.Tensor,
     B, num_classes, L = gt_f.shape
     B, K, _           = atn_f.shape
 
-    present = (gt_f.sum(-1) > 0)
-    present[:, 0] = False   # skip background class
+    present = (gt_f.sum(-1) > 0)   # all 150 classes are real (label 0 = wall)
 
     if not present.any():
         zero = atn_f.new_tensor(0.0)

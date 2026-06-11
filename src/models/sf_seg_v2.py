@@ -8,8 +8,13 @@ So với V1 (sf_seg_r18.py):
   - LayerScale trong mỗi ConvNeXtBlock → stable training từ đầu
 
 Variants (backbone depth [s1, s2, s3, s4]):
-  'nano'  : [2, 3, 6, 2] → ~2.9M total
-  'micro' : [2, 3, 9, 2] → ~3.4M total  ← default (ngang SegFormer-B0 3.7M)
+  'nano'  : [2, 3, 6, 2] → ~3.3M total
+  'micro' : [2, 3, 9, 2] → ~3.85M total ← default (ngang SegFormer-B0 3.7M)
+
+Decoder cuối mở rộng (2026-06-11): fuse_tsml ra decoder_dim=256 @H/4 +
+ConvNeXt refine block, project về hr_dim=96 trước khi lên H/2. Bottleneck
+32-dim cũ là nguyên nhân confusion giữa class ngữ nghĩa gần nhau
+(door→wall 30%, plant→tree 30% trên val).
 """
 from __future__ import annotations
 
@@ -71,8 +76,9 @@ class SFBackbone(nn.Module):
     }
 
     def __init__(self, channels: tuple[int, int, int, int], variant: str = 'micro',
-                 dw_kernel: int = 3):
+                 dw_kernel: int = 3, grad_checkpoint: bool = True):
         super().__init__()
+        self.grad_checkpoint = grad_checkpoint
         C1, C2, C3, C4 = channels
         d1, d2, d3, d4  = self.DEPTHS[variant]
 
@@ -114,14 +120,19 @@ class SFBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor):
         f_detail = self.stem(x)
-        # Gradient checkpointing on the 4 stages: recompute activations in
-        # backward instead of storing them, cutting peak VRAM by ~35-40%
-        # and enabling batch_size to increase from 16 → 32 on a 24 GB GPU.
-        _ck = checkpoint
-        f1 = _ck(self.stage1, self.down1(f_detail), use_reentrant=False)
-        f2 = _ck(self.stage2, self.down2(f1),       use_reentrant=False)
-        f3 = _ck(self.stage3, self.down3(f2),       use_reentrant=False)
-        f4 = _ck(self.stage4, self.down4(f3),       use_reentrant=False)
+        if self.grad_checkpoint and self.training:
+            # Recompute stage activations in backward: −35-40% peak VRAM,
+            # nhưng backbone bị forward 2 lần → chậm ~25-35%/step.
+            _ck = checkpoint
+            f1 = _ck(self.stage1, self.down1(f_detail), use_reentrant=False)
+            f2 = _ck(self.stage2, self.down2(f1),       use_reentrant=False)
+            f3 = _ck(self.stage3, self.down3(f2),       use_reentrant=False)
+            f4 = _ck(self.stage4, self.down4(f3),       use_reentrant=False)
+        else:
+            f1 = self.stage1(self.down1(f_detail))
+            f2 = self.stage2(self.down2(f1))
+            f3 = self.stage3(self.down3(f2))
+            f4 = self.stage4(self.down4(f3))
         return f_detail, f1, f2, f3, f4
 
 
@@ -139,16 +150,18 @@ class sf_seg_v2(nn.Module):
 
     def __init__(self, num_channels: int = 32, focus_size: int = 64,
                  num_classes: int = 151, backbone_variant: str = 'micro',
-                 dw_kernel: int = 3):
+                 dw_kernel: int = 3, decoder_dim: int = 256, hr_dim: int = 96,
+                 grad_checkpoint: bool = True):
         super().__init__()
         self.num_classes = num_classes
         C = num_channels
         C1, C2, C3, C4 = C, 2 * C, 4 * C, 8 * C   # 32, 64, 128, 256 (với C=32)
         D = 2 * C                                    # decoder width = 64
+        Dd = decoder_dim                             # wide final decoder = 256
 
         # ── Backbone ──────────────────────────────────────────────────────────
         self.backbone = SFBackbone((C1, C2, C3, C4), variant=backbone_variant,
-                                   dw_kernel=dw_kernel)
+                                   dw_kernel=dw_kernel, grad_checkpoint=grad_checkpoint)
 
         # ── Attention heads (giống V1, channels nhỏ hơn) ─────────────────────
         self.head_tiny   = SparseAttnHead(C4, max(4, focus_size // 8), num_heads=8)
@@ -173,13 +186,19 @@ class sf_seg_v2(nn.Module):
 
         self.fuse_ts   = _fuse(D + D,     D)       # tiny+small   : 128 → 64
         self.fuse_tsm  = _fuse(D + C2,   D)        # +medium      : 128 → 64  (C2=D=64)
-        self.fuse_tsml = _fuse(D + C1,   D // 2)   # +large       :  96 → 32  (C1=32)
-        self.pre_masks = _fuse(D // 2,   D // 2)   # refine       :  32 → 32
+        # Wide final decoder @ H/4: 32-dim bottleneck cũ gộp các class ngữ
+        # nghĩa gần nhau (door→wall 30%, plant→tree 30% trên val) — 150-way
+        # classification cần nhiều chiều phân biệt hơn.
+        self.fuse_tsml = _fuse(D + C1,   Dd)       # +large       :  96 → 256 (C1=32)
+        self.pre_masks = ConvNeXtBlock(Dd, expand=2, kernel=7)   # refine @ H/4
+
+        # Project xuống hr_dim TRƯỚC khi upsample H/2 — giữ VRAM thấp
+        self.proj_hr = _proj(Dd, hr_dim)           # 256 → 96, 1×1
 
         # Classifier
         _cls_h = max(256, num_classes)
         self.masks = nn.Sequential(
-            nn.Conv2d(D // 2, _cls_h, 1),
+            nn.Conv2d(hr_dim, _cls_h, 1),
             nn.ReLU(inplace=True),
             nn.Conv2d(_cls_h, num_classes, 1),
         )
@@ -189,8 +208,29 @@ class sf_seg_v2(nn.Module):
         self.hr_adapt = nn.Sequential(
             nn.Conv2d(32, _hr, 1, bias=False), _gn(_hr), nn.ReLU(inplace=True))
         self.hr_fuse  = nn.Sequential(
-            nn.Conv2d(D // 2 + _hr, D // 2, 3, padding=1, bias=False),
-            _gn(D // 2), nn.ReLU(inplace=True))
+            nn.Conv2d(hr_dim + _hr, hr_dim, 3, padding=1, bias=False),
+            _gn(hr_dim), nn.ReLU(inplace=True))
+
+        # ── Class-presence-guided global context ─────────────────────────────
+        # g = GAP(f4): tóm tắt toàn ảnh. presence_head được supervise bằng BCE
+        # multi-label "class nào có mặt trong ảnh" (label free từ mask) → g buộc
+        # phải mang thông tin tổng quan. ctx_proj inject g (additive) vào decoder
+        # @H/4 — mỗi pixel thấy scene context khi phân loại (fix door↔wall,
+        # house↔building 46%: texture cục bộ giống hệt, chỉ scene phân biệt được).
+        self.presence_head = nn.Linear(C4, num_classes)
+        self.ctx_proj      = nn.Linear(C4, Dd)
+        # Zero-init: tại bước 0 decoder y hệt model không có context → warm-start
+        # từ checkpoint cũ không bị xáo trộn, context "mọc" dần theo gradient.
+        nn.init.zeros_(self.ctx_proj.weight)
+        nn.init.zeros_(self.ctx_proj.bias)
+
+        # Late fusion (logit prior): S_final = S + late_ctx(p) — presence logits
+        # chỉnh trực tiếp logits cuối, đồng nhất không gian. Phân rã Bayes:
+        # log P(c|pixel,ảnh) ≈ log P(c|pixel) + log P(c|ảnh). Bù cho mid-fusion:
+        # (a) ma trận 150×150 đọc được ("có bed → đè building"), (b) seg loss
+        # có đường gradient trực tiếp về presence_head. Zero-init như ctx_proj.
+        self.late_ctx = nn.Linear(num_classes, num_classes, bias=False)
+        nn.init.zeros_(self.late_ctx.weight)
 
         # ── Auxiliary classifiers (deep supervision) ──────────────────────────
         self.aux_cls_tiny   = nn.Conv2d(C4, num_classes, 1)
@@ -198,6 +238,7 @@ class sf_seg_v2(nn.Module):
         self.aux_cls_medium = nn.Conv2d(C2, num_classes, 1)
         self._aux: tuple | None   = None
         self._attns: dict         = {}
+        self._presence: torch.Tensor | None = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -238,26 +279,43 @@ class sf_seg_v2(nn.Module):
         d2    = self.fuse_tsm(torch.cat([d1_up, a_medium], dim=1))   # (B, D, H/8)
 
         d2_up = F.interpolate(d2, a_large.shape[2:], mode='bilinear', align_corners=False)
-        d3    = self.fuse_tsml(torch.cat([d2_up, a_large], dim=1))   # (B, D//2, H/4)
+        d3    = self.fuse_tsml(torch.cat([d2_up, a_large], dim=1))   # (B, Dd, H/4)
+
+        # Global context: GAP(f4) → presence supervision + additive inject @H/4
+        g = f4.mean(dim=(2, 3))                                      # (B, C4)
+        self._presence = self.presence_head(g)                       # (B, num_classes)
+        d3 = d3 + self.ctx_proj(g).unsqueeze(-1).unsqueeze(-1)       # broadcast add
 
         if not full_res:
             return d3, attn_l, f_detail
-        return self.pre_masks(d3), attn_l, f_detail
+        # Wide refine @ H/4, then project to hr_dim before H/2 upsample
+        return self.proj_hr(self.pre_masks(d3)), attn_l, f_detail
 
     # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, upsample: bool = True):
+        """upsample=False: trả logits tại H/2 (training loss tính tại H/2 với
+        target nearest-downsample — nhanh 1.5×, VRAM −7.7GB; upsample cuối là
+        bilinear không tham số nên không mất tín hiệu học). Val dùng full res."""
         H, W                    = x.shape[2], x.shape[3]
-        d_up, attn_l, f_detail  = self.extract_features(x)   # (B, D//2, H/4)
+        d_up, attn_l, f_detail  = self.extract_features(x)   # (B, hr_dim, H/4)
 
         # Detail refinement at H/2
         d_half = F.interpolate(d_up, (H // 2, W // 2), mode='bilinear', align_corners=False)
         hr     = self.hr_adapt(f_detail)
         d_half = self.hr_fuse(torch.cat([d_half, hr], dim=1))
 
+        logits = self.masks(d_half)                           # (B, C, H/2, W/2)
+
+        # Late fusion: cộng prior per-class từ presence (broadcast mọi pixel).
+        # KHÔNG detach p — seg loss sửa trực tiếp presence_head qua đường này.
+        logits = logits + self.late_ctx(self._presence).unsqueeze(-1).unsqueeze(-1)
+
+        if not upsample:
+            return logits, attn_l.amax(dim=1, keepdim=True), attn_l
+
         # Classify at H/2 → upsample to full res
-        logits     = F.interpolate(
-            self.masks(d_half), (H, W), mode='bilinear', align_corners=False)
+        logits     = F.interpolate(logits, (H, W), mode='bilinear', align_corners=False)
         attn_guide = F.interpolate(
             attn_l.amax(dim=1, keepdim=True), (H, W), mode='bilinear', align_corners=False)
         return logits, attn_guide, attn_l
