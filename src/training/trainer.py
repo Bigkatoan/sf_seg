@@ -88,7 +88,8 @@ class ADE20KDataset(Dataset):
                 mask = TF.crop(mask, max(0, -dy), max(0, -dx), sz, sz)
 
             if self.aug_resized_crop:
-                scale  = random.uniform(0.7, 1.4)
+                # Zoom-out (scale<1) pad viền ignore → giới hạn 0.75; zoom-in rộng hơn
+                scale  = random.uniform(0.75, 1.7)
                 cw, ch = int(sz / scale), int(sz / scale)
                 pw, ph = max(0, cw - sz), max(0, ch - sz)
                 if pw > 0 or ph > 0:
@@ -104,25 +105,32 @@ class ADE20KDataset(Dataset):
 
             if self.aug_color_jitter:
                 if random.random() > 0.5:
-                    img_t = TF.adjust_brightness(img_t, random.uniform(0.75, 1.25))
+                    img_t = TF.adjust_brightness(img_t, random.uniform(0.6, 1.4))
                 if random.random() > 0.5:
-                    img_t = TF.adjust_contrast(img_t, random.uniform(0.75, 1.25))
+                    img_t = TF.adjust_contrast(img_t, random.uniform(0.6, 1.4))
                 if random.random() > 0.5:
-                    img_t = TF.adjust_saturation(img_t, random.uniform(0.75, 1.25))
+                    img_t = TF.adjust_saturation(img_t, random.uniform(0.6, 1.4))
                 if self.aug_hue and random.random() > 0.5:
                     img_t = TF.adjust_hue(img_t, random.uniform(-0.05, 0.05))
                 img_t = img_t.clamp(0.0, 1.0)
 
-            if self.aug_cutout and random.random() > 0.5:
-                _, H, W = img_t.shape
-                rh = random.randint(H // 10, H // 6)
-                rw = random.randint(W // 10, W // 6)
-                y0 = random.randint(0, H - rh)
-                x0 = random.randint(0, W - rw)
-                img_t[:, y0:y0+rh, x0:x0+rw] = 0.0
+            mask_t = torch.from_numpy(_remap_ade_mask(np.array(mask, dtype=np.int64))).long()
 
-            return img_t, torch.from_numpy(
-                _remap_ade_mask(np.array(mask, dtype=np.int64))).long()
+            # Cutout MASK-AWARE: vùng cut → ignore 255 (không phạt presence/seg
+            # trên pixel đã bị che) → bật lại an toàn. 1-3 hố, to hơn cũ.
+            if self.aug_cutout:
+                _, H, W = img_t.shape
+                for _ in range(random.randint(1, 2)):
+                    if random.random() > 0.5:
+                        continue
+                    rh = random.randint(H // 8, H // 5)
+                    rw = random.randint(W // 8, W // 5)
+                    y0 = random.randint(0, H - rh)
+                    x0 = random.randint(0, W - rw)
+                    img_t[:, y0:y0+rh, x0:x0+rw] = 0.0
+                    mask_t[y0:y0+rh, x0:x0+rw]   = 255
+
+            return img_t, mask_t
 
         return TF.to_tensor(img), torch.from_numpy(
             _remap_ade_mask(np.array(mask, dtype=np.int64))).long()
@@ -465,6 +473,7 @@ def train(args):
             attn_masks=(tuple(args.attn_masks) if getattr(args, 'attn_masks', None) else None),
             budget_ladder=getattr(args, 'budget_ladder', False),
             pos_encode=getattr(args, 'pos_encode', False),
+            dropout=getattr(args, 'dropout', 0.0),
         ).to(device)
         _bb_ids = {id(p) for p in model.backbone.parameters()}
     else:
@@ -934,7 +943,7 @@ def merge_config(args):
         attn_guide_weight=0.0, attn_exclusive_weight=0.0,
         aux_weight=0.4, presence_weight=0.2, presence_pos_weight=4.0,
         decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
-        attn_masks=None, budget_ladder=False, pos_encode=False,
+        attn_masks=None, budget_ladder=False, pos_encode=False, dropout=0.0,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,

@@ -154,9 +154,11 @@ class sf_seg_v2(nn.Module):
                  dw_kernel: int = 3, decoder_dim: int = 256, hr_dim: int = 96,
                  grad_checkpoint: bool = True,
                  attn_masks: tuple[int, int, int] | None = None,
-                 budget_ladder: bool = False, pos_encode: bool = False):
+                 budget_ladder: bool = False, pos_encode: bool = False,
+                 dropout: float = 0.0):
         super().__init__()
         self.num_classes = num_classes
+        self.drop_p = dropout      # Dropout2d trước classifier (functional → key names ổn định)
         C = num_channels
         C1, C2, C3, C4 = C, 2 * C, 4 * C, 8 * C   # 32, 64, 128, 256 (với C=32)
         D = 2 * C                                    # decoder width = 64
@@ -326,6 +328,9 @@ class sf_seg_v2(nn.Module):
         hr     = self.hr_adapt(f_detail)
         d_half = self.hr_fuse(torch.cat([d_half, hr], dim=1))
 
+        # Channel dropout ngay trước classifier — chống overfit (train-val gap nở)
+        if self.training and self.drop_p > 0:
+            d_half = F.dropout2d(d_half, self.drop_p)
         logits = self.masks(d_half)                           # (B, C, H/2, W/2)
 
         # Late fusion: cộng prior per-class từ presence (broadcast mọi pixel).

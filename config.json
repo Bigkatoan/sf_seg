@@ -40,10 +40,11 @@
 
   "aug_hflip": true,
   "aug_resized_crop": true,
-  "aug_color_jitter": false,
+  "aug_color_jitter": true,
   "aug_hue": false,
-  "aug_cutout": false,
+  "aug_cutout": true,
   "aug_shift": true,
+  "dropout": 0.15,
 
   "class_aware_sampler": true,
 
