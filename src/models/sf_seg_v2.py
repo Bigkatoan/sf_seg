@@ -73,6 +73,7 @@ class SFBackbone(nn.Module):
     DEPTHS = {
         'nano':  [2, 3, 6, 2],
         'micro': [2, 3, 9, 2],
+        'small': [3, 4, 12, 3],   # với num_channels=64 → ~17M total
     }
 
     def __init__(self, channels: tuple[int, int, int, int], variant: str = 'micro',
@@ -151,7 +152,9 @@ class sf_seg_v2(nn.Module):
     def __init__(self, num_channels: int = 32, focus_size: int = 64,
                  num_classes: int = 151, backbone_variant: str = 'micro',
                  dw_kernel: int = 3, decoder_dim: int = 256, hr_dim: int = 96,
-                 grad_checkpoint: bool = True):
+                 grad_checkpoint: bool = True,
+                 attn_masks: tuple[int, int, int] | None = None,
+                 budget_ladder: bool = False, pos_encode: bool = False):
         super().__init__()
         self.num_classes = num_classes
         C = num_channels
@@ -163,11 +166,26 @@ class sf_seg_v2(nn.Module):
         self.backbone = SFBackbone((C1, C2, C3, C4), variant=backbone_variant,
                                    dw_kernel=dw_kernel, grad_checkpoint=grad_checkpoint)
 
-        # ── Attention heads (giống V1, channels nhỏ hơn) ─────────────────────
-        self.head_tiny   = SparseAttnHead(C4, max(4, focus_size // 8), num_heads=8)
-        self.head_small  = SparseAttnHead(C3, max(4, focus_size // 4), num_heads=4)
-        self.head_medium = SparseAttnHead(C2, max(4, focus_size // 8), num_heads=4,
-                                          cross_kv_feat_dim=C4)
+        # ── Attention heads ───────────────────────────────────────────────────
+        # attn_masks: số masks (tiny, small, medium) — mặc định 2× quy tắc cũ
+        # vì qk_dim=32 đã tách khỏi phép chia channel (nhiều masks không làm
+        # similarity dim co lại; chỉ value dim chia nhỏ).
+        # budget_ladder: budgets log-spaced k_max→4 — mask to làm stuff-detector,
+        # mask nhỏ cho object nhỏ sở hữu trọn mass (k là SÀN diện tích focus).
+        if attn_masks is None:
+            attn_masks = (max(16, C4 // 16), max(8, C3 // 16), max(8, C2 // 8))
+        nh_tiny, nh_small, nh_medium = attn_masks
+        _qk = 32
+        self.head_tiny   = SparseAttnHead(C4, max(4, focus_size // 8), num_heads=nh_tiny,
+                                          qk_dim=_qk, budget_ladder=budget_ladder,
+                                          pos_encode=pos_encode)
+        self.head_small  = SparseAttnHead(C3, max(4, focus_size // 4), num_heads=nh_small,
+                                          qk_dim=_qk, budget_ladder=budget_ladder,
+                                          pos_encode=pos_encode)
+        self.head_medium = SparseAttnHead(C2, max(4, focus_size // 8), num_heads=nh_medium,
+                                          cross_kv_feat_dim=C4,
+                                          qk_dim=_qk, budget_ladder=budget_ladder,
+                                          pos_encode=pos_encode)
         self.head_large  = AttentionHead(C1, focus_size, guided=False)
 
         # ── Decoder: lightweight single-conv fuse ────────────────────────────
@@ -281,8 +299,11 @@ class sf_seg_v2(nn.Module):
         d2_up = F.interpolate(d2, a_large.shape[2:], mode='bilinear', align_corners=False)
         d3    = self.fuse_tsml(torch.cat([d2_up, a_large], dim=1))   # (B, Dd, H/4)
 
-        # Global context: GAP(f4) → presence supervision + additive inject @H/4
-        g = f4.mean(dim=(2, 3))                                      # (B, C4)
+        # Global context: GAP + GMP. Mean-pool một mình rửa trôi object nhỏ
+        # (class chiếm 1/256 token → 0.4% của g; đo được: recall presence 4%
+        # với class <1% diện tích). Max-pool cho phép MỘT token mạnh kích hoạt
+        # class — sum giữ nguyên 256-d nên mọi layer phía sau không đổi shape.
+        g = f4.mean(dim=(2, 3)) + f4.amax(dim=(2, 3))                # (B, C4)
         self._presence = self.presence_head(g)                       # (B, num_classes)
         d3 = d3 + self.ctx_proj(g).unsqueeze(-1).unsqueeze(-1)       # broadcast add
 

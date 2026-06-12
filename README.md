@@ -69,14 +69,30 @@ Ba cơ chế phối hợp:
    thẳng vào logits (phân rã Bayes: log P(c|pixel) + log P(c|ảnh)). Ma trận
    150×150 zero-init, đọc được trực tiếp ("có bed → đè building").
 
-### Attention heads
+### Attention heads — 32 masks, budget ladder, positional encoding
 
-| Head | Scale | Mechanism | num_heads | Role |
+| Head | Scale | Mechanism | Masks | Budget ladder (tokens/mask) |
 |---|:---:|---|:---:|---|
-| `head_tiny`   | H/32 | SparseAttnHead (self) | 8 | Global semantic context |
-| `head_small`  | H/16 | SparseAttnHead (self) | 4 | Mid-scale features |
-| `head_medium` | H/8  | SparseAttnHead (cross ← head_tiny) | 4 | Global context, cheap |
-| `head_large`  | H/4  | AttentionHead (spatial gating) | — | Sharp boundary detail |
+| `head_tiny`   | H/32 | SparseAttnHead (self) | 16 | 64 / 25 / 10 / 4 (×4 masks mỗi mức) |
+| `head_small`  | H/16 | SparseAttnHead (self) | 8 | 256 / 64 / 16 / 4 (×2) |
+| `head_medium` | H/8  | SparseAttnHead (cross ← f4) | 8 | ladder trên 256 key tokens |
+| `head_large`  | H/4  | AttentionHead (spatial gating) | — | — |
+
+Ba cơ chế (đều là đóng góp đo được):
+
+- **Decoupled qk_dim=32**: Q,K chiếu riêng ra `M×32` chiều — tăng số masks
+  không làm similarity dim co lại (chỉ value dim chia C). Cho phép 2× masks
+  với +225K params.
+- **Budget ladder**: budget k của clamped_softmax là *sàn* diện tích focus
+  (mass k, cap 1/token). Uniform budget ép mọi mask ≥48% diện tích (đo từ
+  checkpoint) — object 4-token chỉ chiếm ≤6% mask k=64. Ladder log-spaced
+  k_max→4 cho mỗi cỡ object một nhóm masks chuyên biệt; đo sau fix: masks
+  trải 12%→93% diện tích (spread 80pt vs 37pt).
+- **Positional encoding**: sin-cos 2D theo tọa độ tuyệt đối chuẩn hóa [0,1],
+  cộng vào nhánh Q/K (V giữ sạch), không params. Absolute là đúng tín hiệu
+  cho cặp class định nghĩa bằng vị trí (ceiling↔wall↔floor — nhóm confusion
+  lớn nhất trong probe); tọa độ chuẩn hóa làm grid 16×16 và 64×64 chia sẻ
+  hệ quy chiếu trong cross-attention.
 
 ### Clamped Softmax — budget attention
 
@@ -93,20 +109,19 @@ Bwd:     analytical gradient (λ* saved from CUDA forward) — 27ms vs 62ms topk
 
 ---
 
-## Model size (V2-micro, num_channels=32, decoder_dim=256)
+## Model size
 
-| Component | Params |
-|---|---:|
-| SFBackbone (ConvNeXt-micro) | 2,553K |
-| Attention heads (tiny/small/medium/large) | 373K |
-| Decoder (fuse chain + ConvNeXt refine + proj_hr + hr) | 757K |
-| Classifier (96→256→150) | 63K |
-| Aux heads (deep supervision ×3) | 68K |
-| Presence head + ctx_proj (mid-fusion) | 104K |
-| late_ctx (late-fusion 150×150) | 23K |
-| **Total** | **3.977M** |
+| Variant | num_channels | Depths | Masks (t/s/m) | Total | So sánh |
+|---|:---:|:---:|:---:|---:|---|
+| **micro (C=32) ← default** | 32 | [2,3,9,2] | 16/8/8 | **4.20M** | SegFormer-B0 (3.7M) |
+| small (C=64) | 64 | [3,4,12,3] | 16/8/8+ | ~17.7M | SegFormer-B2 (24.7M) — scale-up ablation |
 
-Comparable to SegFormer-B0 (3.7M). No pretrained weights.
+Default là micro: với ImageNet-1k pretrain, positioning của paper là
+small-model efficiency (4.2M). Variant small giữ lại cho thí nghiệm scale.
+
+Số attention masks tự scale theo width: `nh_tiny = C4/32`, `nh_small = C3/32`,
+`nh_medium = C2/16` (head dim giữ nguyên 32/32/16). No pretrained weights —
+stage-1 presence pretraining dùng chính ADE20K (xem Two-stage training).
 
 ---
 
@@ -156,7 +171,11 @@ python -m scripts.extract_backbone    # cắt backbone+heads sang init cho arch 
 | `grad_checkpoint` | false | Backbone nhỏ → checkpointing chỉ tiết kiệm 2%, tắt cho nhanh |
 | `lr` | 1e-3 | Poly decay theo `epochs`; warm-start dùng 5e-4 |
 | `iou_w` / `iou_warm_epochs` | 1.0 / 10 | Soft IoU (đã per-class balanced), ramp sau 10 epochs |
-| `presence_weight` | 0.2 | BCE multi-label supervise global vector |
+| `attn_masks` | [16,8,8] | Số attention masks (tiny/small/medium) |
+| `budget_ladder` | true | Budget đa cỡ k_max→4 thay vì uniform 25% |
+| `pos_encode` | true | Sin-cos 2D tuyệt đối vào Q/K của attention |
+| `lr_schedule` | constant | `constant` (chỉ warmup) hoặc `cosine` |
+| `presence_weight` / `presence_pos_weight` | 0.4 / 4.0 | BCE multi-label supervise global vector |
 | `aux_weight` | 0.4 | Deep supervision tại 3 scale (log gộp cả presence) |
 | `focus_size` | 64 | Attention budget k = focus_size² |
 | `dw_kernel` | 3 | DWConv 3×3 nhanh hơn 45% so với 7×7, chất lượng tương đương |

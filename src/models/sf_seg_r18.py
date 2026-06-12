@@ -71,6 +71,37 @@ class AttentionHead(nn.Module):
         return self.channel_mix(attn * features), attn
 
 
+_PE_CACHE: dict = {}
+
+
+def _sincos_pe_2d(C: int, H: int, W: int, device, dtype) -> torch.Tensor:
+    """2D sin-cos positional encoding, tọa độ TUYỆT ĐỐI chuẩn hóa [0,1].
+
+    Chuẩn hóa theo H,W → grid 16×16 (tiny) và 64×64 (medium queries) chia sẻ
+    cùng hệ tọa độ — cross-attention so khớp vị trí đúng giữa hai scale.
+    Absolute (không phải relative) là đúng loại tín hiệu cho các cặp class
+    định nghĩa bằng vị trí: ceiling trên / floor dưới / wall giữa.
+    """
+    key = (C, H, W, str(device), str(dtype))
+    if key in _PE_CACHE:
+        return _PE_CACHE[key]
+    import math
+    c4   = C // 4
+    freq = torch.exp(torch.arange(c4, device=device, dtype=torch.float32)
+                     * (-math.log(10000.0) / max(c4 - 1, 1)))   # (c4,)
+    ys = torch.linspace(0.0, 1.0, H, device=device) * 32.0       # nominal scale
+    xs = torch.linspace(0.0, 1.0, W, device=device) * 32.0
+    ay = ys.view(H, 1, 1) * freq.view(1, 1, c4)                  # (H,1,c4)
+    ax = xs.view(1, W, 1) * freq.view(1, 1, c4)                  # (1,W,c4)
+    pe = torch.cat([
+        torch.sin(ay).expand(H, W, c4), torch.cos(ay).expand(H, W, c4),
+        torch.sin(ax).expand(H, W, c4), torch.cos(ax).expand(H, W, c4),
+    ], dim=-1).permute(2, 0, 1).unsqueeze(0)                     # (1, C, H, W)
+    pe = pe.to(dtype)
+    _PE_CACHE[key] = pe
+    return pe
+
+
 class SparseAttnHead(nn.Module):
     """True sparse attention head using clamped_softmax.
 
@@ -84,25 +115,42 @@ class SparseAttnHead(nn.Module):
     """
 
     def __init__(self, C: int, focus_size: int, num_heads: int = 4,
-                 cross_kv_feat_dim: int | None = None):
+                 cross_kv_feat_dim: int | None = None,
+                 qk_dim: int | None = None, budget_ladder: bool = False,
+                 pos_encode: bool = False):
         super().__init__()
         assert C % num_heads == 0, f"C={C} not divisible by num_heads={num_heads}"
         self.C          = C
         self.num_heads  = num_heads
-        self.d          = C // num_heads
-        self.scale      = self.d ** -0.5
+        self.dv         = C // num_heads          # value dim per head (chia C)
+        # qk_dim tách khỏi phép chia channel: nhiều masks (num_heads lớn) mà
+        # similarity vẫn tính ở dim đủ rộng (32) thay vì C/num_heads quá hẹp
+        self.dqk        = qk_dim if qk_dim is not None else C // num_heads
+        self.scale      = self.dqk ** -0.5
         self.focus_size = focus_size
+        self.budget_ladder = budget_ladder
+        self.pos_encode = pos_encode   # PE chỉ vào nhánh Q/K — V giữ sạch
         self._is_cross  = cross_kv_feat_dim is not None
+        # Fused qkv chỉ khi dqk == dv (giữ key names tương thích checkpoint cũ)
+        self._fused     = (not self._is_cross) and self.dqk == self.dv
 
         if self._is_cross:
-            # Cross-attention: only Q from x; K,V from global_feat — saves 2C params
-            self.q_proj       = nn.Conv2d(C, C, 1, bias=False)
-            self.cross_proj_k = nn.Conv2d(cross_kv_feat_dim, C, 1, bias=False)
+            # Cross-attention: Q from x; K,V from global_feat
+            self.q_proj       = nn.Conv2d(C, num_heads * self.dqk, 1, bias=False)
+            self.cross_proj_k = nn.Conv2d(cross_kv_feat_dim, num_heads * self.dqk, 1, bias=False)
             self.cross_proj_v = nn.Conv2d(cross_kv_feat_dim, C, 1, bias=False)
             self.qkv          = None
-        else:
-            # Self-attention: full QKV projection
+        elif self._fused:
+            # Self-attention, dqk == dv: full QKV projection (như cũ)
             self.qkv          = nn.Conv2d(C, 3 * C, 1, bias=False)
+            self.cross_proj_k = None
+            self.cross_proj_v = None
+        else:
+            # Self-attention, dqk decoupled: q,k chiếu riêng ra M·dqk; v giữ C
+            self.q_proj  = nn.Conv2d(C, num_heads * self.dqk, 1, bias=False)
+            self.k_proj  = nn.Conv2d(C, num_heads * self.dqk, 1, bias=False)
+            self.v_proj  = nn.Conv2d(C, C, 1, bias=False)
+            self.qkv     = None
             self.cross_proj_k = None
             self.cross_proj_v = None
 
@@ -112,40 +160,86 @@ class SparseAttnHead(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    def _head_budgets(self, N_k: int) -> list[int]:
+        """Budget mỗi head. Ladder: log-spaced từ k_max (≈25% N_k) xuống 4 —
+        mask budget lớn = stuff-detector, budget nhỏ = object nhỏ có thể sở
+        hữu toàn bộ mass của mask (cap 1/token nên k chính là SÀN diện tích)."""
+        k_max = min(self.focus_size ** 2, max(1, N_k // 4))
+        if not self.budget_ladder or self.num_heads == 1:
+            return [k_max] * self.num_heads
+        import math
+        k_min = min(4, k_max)
+        M = self.num_heads
+        # Lượng tử về G mức (log-spaced) — mỗi mức 1 nhóm heads → ít kernel
+        # calls (G thay vì M) mà vẫn phủ dải cỡ focus stuff→object nhỏ
+        G = min(4, M)
+        levels = [max(1, round(math.exp(
+            math.log(k_max) + (math.log(k_min) - math.log(k_max)) * g / (G - 1))))
+            for g in range(G)]
+        return [levels[m * G // M] for m in range(M)]
+
     def forward(self, x: torch.Tensor,
                 global_feat: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         B, C, H, W = x.shape
-        N  = H * W
-        H_ = self.num_heads
-        d  = self.d
+        N   = H * W
+        H_  = self.num_heads
+        dv  = self.dv
+        dqk = self.dqk
 
         if self._is_cross and global_feat is not None:
             # Cross-attention: Q from x only; K,V from global_feat
-            # Saves 2C params vs computing a full QKV on x
-            Q     = self.q_proj(x).view(B, H_, d, N).permute(0, 1, 3, 2)  # (B,H_,N,d)
-            K_ext = self.cross_proj_k(global_feat)   # (B, C, H_k, W_k)
-            V_ext = self.cross_proj_v(global_feat)
-            H_k, W_k = K_ext.shape[2], K_ext.shape[3]  # actual K spatial dims
+            x_qk = x + _sincos_pe_2d(C, H, W, x.device, x.dtype) if self.pos_encode else x
+            if self.pos_encode:
+                Cg = global_feat.shape[1]
+                g_qk = global_feat + _sincos_pe_2d(
+                    Cg, global_feat.shape[2], global_feat.shape[3],
+                    global_feat.device, global_feat.dtype)
+            else:
+                g_qk = global_feat
+            Q     = self.q_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)   # (B,H_,N,dqk)
+            K_ext = self.cross_proj_k(g_qk)          # (B, H_·dqk, H_k, W_k)
+            V_ext = self.cross_proj_v(global_feat)   # (B, C,      H_k, W_k) — V không PE
+            H_k, W_k = K_ext.shape[2], K_ext.shape[3]
             N_k   = H_k * W_k
-            K_use = K_ext.view(B, H_, d, N_k).permute(0, 1, 3, 2)  # (B,H_,N_k,d)
-            V_use = V_ext.view(B, H_, d, N_k).permute(0, 1, 3, 2)
-        else:
-            # Self-attention: Q, K, V all from x
-            qkv   = self.qkv(x).view(B, 3, H_, d, N)
+            K_use = K_ext.view(B, H_, dqk, N_k).permute(0, 1, 3, 2)
+            V_use = V_ext.view(B, H_, dv,  N_k).permute(0, 1, 3, 2)
+        elif self._fused:
+            # Self-attention, dqk == dv: fused QKV (key names như cũ, không PE)
+            qkv   = self.qkv(x).view(B, 3, H_, dv, N)
             Q_raw, K_raw, V_raw = qkv.unbind(dim=1)
-            Q     = Q_raw.permute(0, 1, 3, 2)   # (B,H_,N,d)
+            Q     = Q_raw.permute(0, 1, 3, 2)
             K_use = K_raw.permute(0, 1, 3, 2)
             V_use = V_raw.permute(0, 1, 3, 2)
+            H_k, W_k = H, W
+            N_k   = N
+        else:
+            # Self-attention, dqk decoupled (nhiều masks, similarity dim đủ rộng)
+            x_qk = x + _sincos_pe_2d(C, H, W, x.device, x.dtype) if self.pos_encode else x
+            Q     = self.q_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)
+            K_use = self.k_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)
+            V_use = self.v_proj(x).view(B, H_, dv,  N).permute(0, 1, 3, 2)
             H_k, W_k = H, W
             N_k   = N
 
         sim = torch.matmul(Q, K_use.transpose(-2, -1)) * self.scale  # (B, H_, N, N_k)
 
-        # Budget: cap at 25% of N_k so sparsity is resolution-independent.
-        k_budget = min(self.focus_size ** 2, max(1, N_k // 4))
-        attn     = _clamped_softmax(sim.reshape(B * H_ * N, N_k),
-                                    float(k_budget)).view(B, H_, N, N_k)
+        # Budget per head: ladder (đa cỡ focus) hoặc uniform 25% N_k
+        budgets = self._head_budgets(N_k)
+        if len(set(budgets)) == 1:
+            attn = _clamped_softmax(sim.reshape(B * H_ * N, N_k),
+                                    float(budgets[0])).view(B, H_, N, N_k)
+        else:
+            attn = torch.empty_like(sim)
+            done = 0
+            for kb in sorted(set(budgets), reverse=True):
+                idx = [m for m, b in enumerate(budgets) if b == kb]
+                sub = sim[:, idx]                                    # (B, |idx|, N, N_k)
+                attn[:, idx] = _clamped_softmax(
+                    sub.reshape(B * len(idx) * N, N_k), float(kb)
+                ).view(B, len(idx), N, N_k)
+                done += len(idx)
+            assert done == H_
 
         out = torch.matmul(attn, V_use)                     # (B, H_, N, d)
         out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)  # (B, C, H, W)

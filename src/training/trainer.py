@@ -462,6 +462,9 @@ def train(args):
             decoder_dim=getattr(args, 'decoder_dim', 256),
             hr_dim=getattr(args, 'hr_dim', 96),
             grad_checkpoint=getattr(args, 'grad_checkpoint', True),
+            attn_masks=(tuple(args.attn_masks) if getattr(args, 'attn_masks', None) else None),
+            budget_ladder=getattr(args, 'budget_ladder', False),
+            pos_encode=getattr(args, 'pos_encode', False),
         ).to(device)
         _bb_ids = {id(p) for p in model.backbone.parameters()}
     else:
@@ -479,21 +482,29 @@ def train(args):
     ]
 
     total_p = model.get_num_parameters()
-    print(f"Backbone: resnet18  |  params: {total_p:,}  |  num_classes={args.num_classes}"
+    _bb_name = 'SFBackbone-' + getattr(args, 'backbone_variant', 'micro') \
+               if model_type == 'v2' else 'resnet18'
+    print(f"Backbone: {_bb_name}  |  params: {total_p:,}  |  num_classes={args.num_classes}"
           f"  |  device={device}")
     if device.type == 'cuda':
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    optimizer    = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=1e-4)
-    warmup_ep    = min(5, args.epochs // 10)
-    cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.05)
-    scheduler    = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep),
-                    cosine_sched],
-        milestones=[warmup_ep])
+    optimizer = torch.optim.Adam(param_groups, lr=args.lr, weight_decay=1e-4)
+    warmup_ep = min(5, args.epochs // 10)
+    if getattr(args, 'lr_schedule', 'cosine') == 'constant':
+        # Constant lr (chỉ giữ warmup ngắn): không decay — backbone factor 0.1
+        # từng đóng băng backbone vì decay chồng lên factor
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep)
+    else:
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, args.epochs - warmup_ep), eta_min=args.lr * 0.05)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_ep),
+                        cosine_sched],
+            milestones=[warmup_ep])
     scaler = GradScaler('cuda', enabled=device.type == 'cuda')
 
     # ── Logging ───────────────────────────────────────────────────────────────
@@ -563,13 +574,17 @@ def train(args):
                     logging.info(f"  new layers (fresh init): {_missing}")
                 if _unexpected:
                     logging.warning(f"  unexpected keys ignored: {_unexpected}")
-                if not args.restart:
+                if args.restart:
+                    # Restart: chỉ lấy weights — epoch, optimizer, scheduler,
+                    # best_miou đều fresh (ckpt nguồn có thể từ pretrain stage-1)
+                    start_epoch = 1
+                else:
                     try: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                     except Exception: pass
                     try: scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                     except Exception: pass
-                start_epoch = ckpt.get('epoch', 0) + 1
-                best_miou   = ckpt.get('best_val_miou', best_miou)
+                    start_epoch = ckpt.get('epoch', 0) + 1
+                    best_miou   = ckpt.get('best_val_miou', best_miou)
                 mode = 'restarted' if args.restart else 'resumed'
                 logging.info(f"Weights {mode} from {fp}, epoch {start_epoch}")
             except Exception as e:
@@ -659,7 +674,12 @@ def train(args):
                 pw   = getattr(args, 'presence_weight', 0.0)
                 if pres is not None and pw > 0:
                     pres_tgt = presence_target(masks, pres.shape[1])
-                    p_loss = F.binary_cross_entropy_with_logits(pres.float(), pres_tgt)
+                    # pos_weight: ~10 class có mặt / 140 vắng — BCE thuần bias về
+                    # "vắng" (đo được: precision 0.67, recall 0.22). Đẩy recall lên.
+                    ppw = getattr(args, 'presence_pos_weight', 1.0)
+                    p_loss = F.binary_cross_entropy_with_logits(
+                        pres.float(), pres_tgt,
+                        pos_weight=pres.new_full((pres.shape[1],), ppw))
                     loss   = loss + pw * p_loss
                     parts['aux'] = parts['aux'] + (pw * p_loss).detach()
                     update_presence_counts(pres_tr, pres, pres_tgt)
@@ -905,8 +925,9 @@ def merge_config(args):
         iou_w=0.5, iou_downsample=4, no_obj_weight=0.1,
         diversity_weight=0.3, edge_weight=0.0,
         attn_guide_weight=0.0, attn_exclusive_weight=0.0,
-        aux_weight=0.4, presence_weight=0.2,
-        decoder_dim=256, hr_dim=96, grad_checkpoint=True,
+        aux_weight=0.4, presence_weight=0.2, presence_pos_weight=4.0,
+        decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
+        attn_masks=None, budget_ladder=False, pos_encode=False,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,
