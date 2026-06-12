@@ -62,9 +62,11 @@ def main():
     ap.add_argument('--epochs',     type=int,   default=100)
     ap.add_argument('--batch-size', type=int,   default=256)
     ap.add_argument('--lr',         type=float, default=1e-3)
-    ap.add_argument('--image-size', type=int,   default=224)
-    ap.add_argument('--workers',    type=int,   default=12)
+    ap.add_argument('--image-size', type=int,   default=176)   # 176 nhanh ~1.6× vs 224, transfer OK
+    ap.add_argument('--workers',    type=int,   default=16)
     ap.add_argument('--lr-schedule', choices=['cosine', 'constant'], default='cosine')
+    ap.add_argument('--compile', action='store_true', help='torch.compile backbone (~1.3-1.5×)')
+    ap.add_argument('--val-every', type=int, default=5, help='val mỗi N epoch (val 50K ảnh tốn ~30s)')
     ap.add_argument('--out',        default='checkpoints/backbone_in1k.pt')
     ap.add_argument('--resume',     default=None)
     args = ap.parse_args()
@@ -106,6 +108,9 @@ def main():
                         variant=cfg['backbone_variant'],
                         dw_kernel=cfg['dw_kernel']).to(device)
     model = model.to(memory_format=torch.channels_last)
+    if args.compile:
+        model = torch.compile(model)
+        logging.info("torch.compile bật — epoch đầu chậm (warmup compile)")
     n_params = sum(p.numel() for p in model.parameters())
     logging.info(f"ImageNetNet: {n_params/1e6:.2f}M  bs={args.batch_size}  "
                  f"lr={args.lr}  sched={args.lr_schedule}  epochs={args.epochs}")
@@ -174,6 +179,21 @@ def main():
         tr_top1  = tr_corr / max(seen, 1)
 
         model.eval()
+        # Val mỗi N epoch (và epoch cuối) — tiết kiệm ~30s/epoch bỏ qua
+        do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
+        if not do_val:
+            sched.step()
+            logging.info(f"IN1k {epoch}/{args.epochs} | "
+                         f"train loss={tr_loss:.4f} top1={tr_top1:.3f} | (skip val)")
+            csv_w.writerow([epoch, tr_loss, tr_top1, '', '', ''])
+            csv_f.flush()
+            torch.save(dict(model_state_dict=model.state_dict(), epoch=epoch,
+                            optimizer_state_dict=opt.state_dict(),
+                            scheduler_state_dict=sched.state_dict(),
+                            val_top1=best_top1, best_top1=best_top1),
+                       Path(args.out).with_suffix('.last.pt'))
+            continue
+
         vl_loss = vl_c1 = vl_c5 = vseen = 0
         with torch.inference_mode():
             for imgs, labels in val_loader:
