@@ -33,13 +33,21 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     C      = cfg['num_classes']
 
+    ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state = ckpt.get('model_state_dict', ckpt)
+    # Ưu tiên arch flags lưu trong checkpoint (config có thể đã đổi sau khi train)
+    def af(key, default):
+        return ckpt[key] if isinstance(ckpt, dict) and key in ckpt else cfg.get(key, default)
+    _am = af('attn_masks', cfg.get('attn_masks'))
     model = sf_seg_v2(
         num_channels=cfg['num_channels'], focus_size=cfg['focus_size'],
         num_classes=C, backbone_variant=cfg['backbone_variant'],
         dw_kernel=cfg['dw_kernel'],
+        decoder_dim=af('decoder_dim', 256), hr_dim=af('hr_dim', 96),
+        attn_masks=tuple(_am) if _am else None,
+        budget_ladder=af('budget_ladder', False),
+        pos_encode=af('pos_encode', False),
     ).to(device)
-    ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state = ckpt.get('model_state_dict', ckpt)
     model.load_state_dict(state)
     model.eval()
     print(f"Loaded {args.checkpoint}  (epoch={ckpt.get('epoch', '?')})")

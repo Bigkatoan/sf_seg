@@ -49,11 +49,18 @@ def main():
         raw = json.loads(p.read_text()).get('idx_to_name', {})
         names = {int(k) - 1: v.split(',')[0] for k, v in raw.items() if int(k) >= 1}
 
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    def af(key, default):
+        return ckpt[key] if isinstance(ckpt, dict) and key in ckpt else cfg.get(key, default)
+    _am = af('attn_masks', cfg.get('attn_masks'))
     model = sf_seg_v2(
         num_channels=cfg['num_channels'], focus_size=cfg['focus_size'],
         num_classes=C, backbone_variant=cfg['backbone_variant'],
-        dw_kernel=cfg['dw_kernel']).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        dw_kernel=cfg['dw_kernel'],
+        decoder_dim=af('decoder_dim', 256), hr_dim=af('hr_dim', 96),
+        attn_masks=tuple(_am) if _am else None,
+        budget_ladder=af('budget_ladder', False),
+        pos_encode=af('pos_encode', False)).to(device)
     model.load_state_dict(ckpt.get('model_state_dict', ckpt))
     model.eval()
     print(f"Loaded {args.checkpoint} (epoch={ckpt.get('epoch', '?')})")

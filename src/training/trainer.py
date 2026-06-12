@@ -822,7 +822,14 @@ def train(args):
                     num_classes=args.num_classes,
                     model_type=model_type,
                     backbone_variant=getattr(args, 'backbone_variant', 'micro'),
-                    dw_kernel=getattr(args, 'dw_kernel', 3))
+                    dw_kernel=getattr(args, 'dw_kernel', 3),
+                    # Runtime-behavior flags (không có params) — phải lưu để
+                    # probe/eval dựng lại đúng, nếu không model chạy sai lặng lẽ
+                    decoder_dim=getattr(args, 'decoder_dim', 256),
+                    hr_dim=getattr(args, 'hr_dim', 96),
+                    attn_masks=getattr(args, 'attn_masks', None),
+                    budget_ladder=getattr(args, 'budget_ladder', False),
+                    pos_encode=getattr(args, 'pos_encode', False))
         torch.save(ckpt, last_path)
         if improved:
             torch.save(ckpt, best_path)
