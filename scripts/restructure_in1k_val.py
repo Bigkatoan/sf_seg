@@ -31,6 +31,8 @@ def main():
     ap.add_argument('--out',      default='data/imagenet/val')
     ap.add_argument('--move', action='store_true',
                     help='move thay vì copy (tiết kiệm 6.7GB)')
+    ap.add_argument('--symlink', action='store_true',
+                    help='symlink thay vì copy (0 byte, nhanh nhất — giữ nguyên cache)')
     args = ap.parse_args()
 
     val_dir = Path(args.val_dir)
@@ -43,7 +45,12 @@ def main():
             mapping[row['ImageId']] = row['PredictionString'].split()[0]
 
     n_done = n_miss = 0
-    op = shutil.move if args.move else shutil.copy2
+    if args.symlink:
+        op = lambda s, d: Path(d).symlink_to(Path(s).resolve())
+    elif args.move:
+        op = shutil.move
+    else:
+        op = shutil.copy2
     for img_id, wnid in tqdm(mapping.items(), desc='restructure val'):
         src = val_dir / f'{img_id}.JPEG'
         if not src.exists():
@@ -51,7 +58,10 @@ def main():
             continue
         dst_dir = out / wnid
         dst_dir.mkdir(parents=True, exist_ok=True)
-        op(str(src), str(dst_dir / src.name))
+        dst = dst_dir / src.name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        op(str(src), str(dst))
         n_done += 1
 
     print(f'done: {n_done} images → {out}  (missing: {n_miss})')
