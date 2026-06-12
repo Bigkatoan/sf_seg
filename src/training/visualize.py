@@ -109,9 +109,9 @@ def _presence_panel(pres_prob: np.ndarray, gt_classes: set[int],
                     font=None, thresh: float = 0.5) -> np.ndarray:
     """Bảng kiểm presence: model nhìn tổng quan ảnh có đúng không.
 
-    ✓ xanh  — detect đúng (p>thresh, có trong GT)
-    ✗ đỏ    — báo nhầm   (p>thresh, không có trong GT)
-    ? cam   — bỏ sót     (GT có, p<thresh)
+    [+] xanh — detect đúng (p>thresh, có trong GT)
+    [x] đỏ   — báo nhầm   (p>thresh, không có trong GT)
+    [?] cam  — bỏ sót     (GT có, p<thresh)
     """
     def name(c: int) -> str:
         n = (cat_names or {}).get(str(c), f'cls{c}')
@@ -123,13 +123,14 @@ def _presence_panel(pres_prob: np.ndarray, gt_classes: set[int],
     det_set = {c for _, c in detected}
     missed  = sorted(gt_classes - det_set)
 
+    # Markers ASCII — font mặc định PIL chỉ hỗ trợ latin-1 (✓/✗ raise lỗi)
     lines = []
     for p, c in detected[:24]:
         ok = c in gt_classes
-        lines.append(((' ✓' if ok else ' ✗') + f' {name(c)} {p:.2f}',
+        lines.append((('[+]' if ok else '[x]') + f' {name(c)} {p:.2f}',
                       (90, 220, 90) if ok else (240, 90, 90)))
     for c in missed[:12]:
-        lines.append((f' ? {name(c)} (miss {float(pres_prob[c]):.2f})',
+        lines.append((f'[?] {name(c)} (miss {float(pres_prob[c]):.2f})',
                       (240, 170, 60)))
 
     n_tp = sum(1 for _, c in detected if c in gt_classes)
