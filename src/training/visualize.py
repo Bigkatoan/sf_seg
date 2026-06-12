@@ -53,12 +53,18 @@ def _overlay(rgb: np.ndarray, heat: np.ndarray, alpha: float = 0.55) -> np.ndarr
     ).astype(np.uint8)
 
 
+def _safe_text(s: str) -> str:
+    """Strip về latin-1 — font mặc định PIL chỉ encode được latin-1; mọi ký
+    tự ngoài range thay bằng '?' để draw.text không bao giờ raise UnicodeError."""
+    return s.encode('latin-1', 'replace').decode('latin-1')
+
+
 def _label(img: Image.Image, text: str, font=None) -> Image.Image:
     out = img.copy()
     draw = ImageDraw.Draw(out)
     tw = len(text) * 6 + 6
     draw.rectangle([0, 0, tw, 13], fill=(0, 0, 0, 200))
-    draw.text((3, 2), text, fill=(255, 255, 255), font=font)
+    draw.text((3, 2), _safe_text(text), fill=(255, 255, 255), font=font)
     return out
 
 
@@ -142,12 +148,12 @@ def _presence_panel(pres_prob: np.ndarray, gt_classes: set[int],
     h   = 22 + rows_per_col * LH + 6
     img = Image.new('RGB', (width, h), (20, 20, 20))
     d   = ImageDraw.Draw(img)
-    d.text((6, 4), hdr, fill=(255, 255, 255), font=font)
+    d.text((6, 4), _safe_text(hdr), fill=(255, 255, 255), font=font)
     col_w = width // COLS
     for i, (txt, color) in enumerate(lines):
         cx = (i // rows_per_col) * col_w + 6
         cy = 22 + (i % rows_per_col) * LH
-        d.text((cx, cy), txt, fill=color, font=font)
+        d.text((cx, cy), _safe_text(txt), fill=color, font=font)
     return np.array(img)
 
 
