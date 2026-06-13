@@ -9,7 +9,7 @@
   "decoder_dim": 256,
   "hr_dim": 96,
   "grad_checkpoint": false,
-  "attn_masks": [16, 8, 8],
+  "attn_masks": [16, 4, 4],
   "budget_ladder": true,
   "pos_encode": true,
   "attn_div_weight": 0.5,
