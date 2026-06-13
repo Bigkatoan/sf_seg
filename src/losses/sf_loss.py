@@ -49,6 +49,7 @@ class SFLossConfig:
             excl_weight=getattr(args, "attn_exclusive_weight", 0.2),
             edge_weight=getattr(args, "edge_weight", 0.3),
             focal_gamma=2.0,
+            focal_w=getattr(args, "focal_w", 1.0),
             iou_w=getattr(args, "iou_w", 0.5),
             iou_downsample=getattr(args, "iou_downsample", 4),
             no_obj_weight=getattr(args, "no_obj_weight", 0.1),
@@ -93,28 +94,28 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
     """
     B, C, H, W = logits.shape
 
-    # Focal CE — average ONLY over valid pixels (ce_raw=0 at ignore positions)
-    ce_c  = ce_raw.clamp(max=100.0)
-    pt    = torch.exp(-ce_c)
-    focal = (1.0 - pt) ** cfg.focal_gamma * ce_c
+    # Focal CE — bỏ qua hoàn toàn khi focal_w=0 (IoU-only) để khỏi tính thừa
+    if cfg.focal_w > 0:
+        ce_c  = ce_raw.clamp(max=100.0)
+        pt    = torch.exp(-ce_c)
+        focal = (1.0 - pt) ** cfg.focal_gamma * ce_c
 
-    if cfg.boundary_weight > 1.0:
-        bw    = 1.0 + (cfg.boundary_weight - 1.0) * _boundary_mask(target)
-        focal = focal * bw
+        if cfg.boundary_weight > 1.0:
+            bw    = 1.0 + (cfg.boundary_weight - 1.0) * _boundary_mask(target)
+            focal = focal * bw
 
-    # Per-class CE normalization (sqrt-frequency): average focal loss within
-    # each class, then weighted-average across classes with weight sqrt(n_c).
-    # Effective per-pixel weight ∝ 1/sqrt(n_c) — between pixel-mean (dominant
-    # classes swamp rare) and pure class-mean (probe showed it over-corrects:
-    # wall predicted 6% of pixels vs 15.5% GT).
-    tgt_flat   = target.view(-1)                                   # (B*H*W)
-    focal_flat = focal.view(-1)
-    valid_flat = valid.float().view(-1)
-    cls_sum    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, focal_flat * valid_flat)
-    cls_cnt    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, valid_flat)
-    cls_w      = cls_cnt.sqrt()                                    # 0 for absent classes
-    cls_mean   = cls_sum / cls_cnt.clamp(min=1.0)
-    f_ce       = _safe((cls_mean * cls_w).sum() / cls_w.sum().clamp(min=1.0))
+        # Per-class CE normalization (sqrt-frequency): average focal loss within
+        # each class, then weighted-average across classes with weight sqrt(n_c).
+        tgt_flat   = target.view(-1)                                   # (B*H*W)
+        focal_flat = focal.view(-1)
+        valid_flat = valid.float().view(-1)
+        cls_sum    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, focal_flat * valid_flat)
+        cls_cnt    = torch.zeros(C, device=logits.device).scatter_add(0, tgt_flat, valid_flat)
+        cls_w      = cls_cnt.sqrt()                                    # 0 for absent classes
+        cls_mean   = cls_sum / cls_cnt.clamp(min=1.0)
+        f_ce       = _safe((cls_mean * cls_w).sum() / cls_w.sum().clamp(min=1.0))
+    else:
+        f_ce = logits.new_tensor(0.0)
 
     if cfg.iou_w <= 0:
         return _safe(cfg.focal_w * f_ce)
