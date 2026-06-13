@@ -168,7 +168,10 @@ class SparseAttnHead(nn.Module):
         if not self.budget_ladder or self.num_heads == 1:
             return [k_max] * self.num_heads
         import math
-        k_min = min(4, k_max)
+        # Floor tỉ lệ N_k (≥ ~3% keys, tối thiểu 4): budget tuyệt đối quá nhỏ
+        # (k=4 trên 1024 keys) làm softmax không học được focus → mask collapse
+        # về uniform (đo được: 4/8 small, 5/8 medium chết với floor cũ k=4).
+        k_min = min(max(4, N_k // 32), k_max)
         M = self.num_heads
         # Lượng tử về G mức (log-spaced) — mỗi mức 1 nhóm heads → ít kernel
         # calls (G thay vì M) mà vẫn phủ dải cỡ focus stuff→object nhỏ
