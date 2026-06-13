@@ -262,10 +262,28 @@ sf_seg/
 │   ├── probe_ckpt.py             # per-class IoU / coverage probe
 │   ├── analyze_errors.py         # confusion pairs, boundary vs interior
 │   ├── extract_backbone.py       # transfer weights sang arch mới
-│   ├── convert_ckpt_150.py       # 151→150 class converter (one-off)
+│   ├── analyze_pretrain.py       # feature health + transfer check backbone
 │   └── attention.py              # attention map visualisation
 ├── archive/                      # checkpoints + logs các run cũ (ablation)
 ├── docs/                         # architecture diagrams
 ├── config.json
-└── train.sh                      # PYTORCH_CUDA_ALLOC_CONF + venv + trainer
+├── train.sh                      # seg training (venv + CUDA alloc + trainer)
+└── train_imagenet.sh             # ImageNet pretrain backbone
 ```
+
+## Training schedule (progressive resolution)
+
+```bash
+# Stage 0 (một lần): pretrain backbone trên ImageNet → checkpoints/backbone_in1k.pt
+./train_imagenet.sh
+
+# Stage 1: 200 epoch @ 384px, full loss, từ backbone pretrained
+./train.sh --resume checkpoints/backbone_in1k.pt --restart
+
+# Stage 2: tuning 50 epoch @ 512px, lr thấp hơn, từ best của stage 1
+cp checkpoints/sf_seg_best.pt checkpoints/sf_seg_384.pt
+./train.sh --resume checkpoints/sf_seg_384.pt --restart --image-size 512 --epochs 50 --lr 3e-4
+```
+
+Train phần lớn ở 384px (nhanh ~1.8× so với 512), rồi tuning ngắn ở 512px để model
+quen độ phân giải eval. Full loss xuyên suốt (CE + soft IoU + aux + presence + diversity).
