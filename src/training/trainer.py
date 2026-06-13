@@ -662,9 +662,9 @@ def train(args):
                     logits, _, attn = model(imgs)
                 loss, parts = sf_loss(logits, attn, masks, sf_cfg)
 
-                # Deep supervision: auxiliary CE at each head scale
+                # Deep supervision: auxiliary CE at each head scale (skip nếu weight=0)
                 aux = getattr(model, '_aux', None)
-                if aux:
+                if aux and args.aux_weight > 0:
                     aux_ce = logits.new_tensor(0.)
                     for ax in aux:
                         H, W   = ax.shape[2:]
