@@ -248,8 +248,20 @@ class SparseAttnHead(nn.Module):
         out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)  # (B, C, H, W)
         out = self.out_proj(out)
 
-        # Saliency: received attention per KEY position (column mean).
-        # H_k, W_k tracked from actual feature map — safe for non-square inputs.
+        # ── Anti-collapse diversity reg (grad-enabled) ────────────────────────
+        # received-attention per key, mỗi mask → distribution trên N_k. Mask
+        # collapse = uniform → các mask GIỐNG HỆT nhau → cosine sim cao → bị
+        # phạt → buộc phân hóa. Áp từ đầu thì mask không bao giờ collapse được.
+        if self.training and H_ > 1:
+            recv = attn.mean(dim=2)                          # (B, H_, N_k) — grad on
+            recv = F.normalize(recv - recv.mean(-1, keepdim=True), dim=-1, eps=1e-6)
+            gram = torch.bmm(recv, recv.transpose(1, 2))     # (B, H_, H_)
+            eye  = torch.eye(H_, device=gram.device, dtype=gram.dtype)
+            self._div_loss = (gram * (1 - eye)).pow(2).sum() / (B * H_ * (H_ - 1))
+        else:
+            self._div_loss = None
+
+        # Saliency (detached) cho visualize
         with torch.no_grad():
             saliency = attn.detach().mean(dim=-2).view(B, H_, H_k, W_k)
         return out, saliency

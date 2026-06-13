@@ -259,6 +259,7 @@ class sf_seg_v2(nn.Module):
         self._aux: tuple | None   = None
         self._attns: dict         = {}
         self._presence: torch.Tensor | None = None
+        self._attn_div: torch.Tensor | None = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -286,8 +287,13 @@ class sf_seg_v2(nn.Module):
                 self.aux_cls_small(a_small),
                 self.aux_cls_medium(a_medium),
             )
+            # Gom anti-collapse diversity loss từ 3 sparse heads (mean)
+            divs = [h._div_loss for h in (self.head_tiny, self.head_small, self.head_medium)
+                    if getattr(h, '_div_loss', None) is not None]
+            self._attn_div = sum(divs) / len(divs) if divs else None
         else:
             self._aux = None
+            self._attn_div = None
 
         # Bottom-up fusion
         t_up  = F.interpolate(self.proj_tiny(a_tiny),

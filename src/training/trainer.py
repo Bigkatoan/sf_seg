@@ -693,6 +693,13 @@ def train(args):
                     parts['aux'] = parts['aux'] + (pw * p_loss).detach()
                     update_presence_counts(pres_tr, pres, pres_tgt)
 
+                # Anti-collapse: diversity loss trên sparse attention heads
+                adiv = getattr(model, '_attn_div', None)
+                adw  = getattr(args, 'attn_div_weight', 0.0)
+                if adiv is not None and adw > 0:
+                    loss = loss + adw * adiv
+                    parts['div'] = parts['div'] + (adw * adiv).detach()
+
             if not torch.isfinite(loss):
                 micro_step = 0
                 optimizer.zero_grad(set_to_none=True)
@@ -944,6 +951,7 @@ def merge_config(args):
         aux_weight=0.4, presence_weight=0.2, presence_pos_weight=4.0,
         decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
         attn_masks=None, budget_ladder=False, pos_encode=False, dropout=0.0,
+        attn_div_weight=0.5,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,

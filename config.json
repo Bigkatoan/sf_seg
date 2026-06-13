@@ -12,6 +12,7 @@
   "attn_masks": [16, 8, 8],
   "budget_ladder": true,
   "pos_encode": true,
+  "attn_div_weight": 0.5,
 
   "data_root": "data",
   "image_size": 512,
