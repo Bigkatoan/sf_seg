@@ -160,7 +160,11 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
                / (pred_sum + gt_sum - inter + eps).clamp(min=eps)).clamp(0., 1.)
     present = (gt_sum > 0).float()
     weight  = present + cfg.no_obj_weight * (1.0 - present)
-    iou_l   = _safe(((1.0 - iou) * weight).sum() / weight.sum().clamp(min=eps))
+    # Chuẩn hóa theo SỐ CLASS TỒN TẠI, KHÔNG phải tổng weight: class vắng (140
+    # cái × no_obj 0.1 ≈ 58% tổng weight) sẽ pha loãng tín hiệu class tồn tại
+    # nếu nằm trong mẫu số. Giờ: mean sạch trên class tồn tại + no-obj là penalty
+    # cộng thêm (không làm phình mẫu số). Khớp mIoU (chỉ tính class tồn tại).
+    iou_l   = _safe(((1.0 - iou) * weight).sum() / present.sum().clamp(min=1.0))
 
     return _safe(cfg.focal_w * f_ce + cfg.iou_w * iou_l)
 
