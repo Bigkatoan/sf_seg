@@ -945,7 +945,7 @@ def merge_config(args):
         data_root="data", epochs=500, batch_size=8, lr=1e-4, num_workers=8,
         num_channels=64, focus_size=64, num_classes=151,
         image_size=512, decoder_type="dense",
-        focal_w=1.0, iou_w=0.5, iou_downsample=4, no_obj_weight=0.1,
+        focal_w=1.0, iou_w=0.5, iou_downsample=4, iou_form='linear', no_obj_weight=0.1,
         diversity_weight=0.3, edge_weight=0.0,
         attn_guide_weight=0.0, attn_exclusive_weight=0.0,
         aux_weight=0.4, presence_weight=0.2, presence_pos_weight=4.0,

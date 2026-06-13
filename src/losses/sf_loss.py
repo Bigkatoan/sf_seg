@@ -34,6 +34,7 @@ class SFLossConfig:
     focal_w:          float = 1.0
     iou_w:            float = 0.5
     iou_downsample:   int   = 4     # spatial downsample for IoU: 4 = H/4 (16× faster)
+    iou_form:         str   = 'linear'  # 'linear' = 1-IoU [1→0] | 'log' = -ln(IoU) [∞→0]
     no_obj_weight:    float = 0.1
     # Boundary — upweight pixels at class boundaries in focal CE
     boundary_weight:  float = 3.0   # 1.0 = disabled
@@ -52,6 +53,7 @@ class SFLossConfig:
             focal_w=getattr(args, "focal_w", 1.0),
             iou_w=getattr(args, "iou_w", 0.5),
             iou_downsample=getattr(args, "iou_downsample", 4),
+            iou_form=getattr(args, "iou_form", "linear"),
             no_obj_weight=getattr(args, "no_obj_weight", 0.1),
             boundary_weight=getattr(args, "boundary_weight", 3.0),
         )
@@ -160,11 +162,16 @@ def _seg_term(target: torch.Tensor, logits: torch.Tensor,
                / (pred_sum + gt_sum - inter + eps).clamp(min=eps)).clamp(0., 1.)
     present = (gt_sum > 0).float()
     weight  = present + cfg.no_obj_weight * (1.0 - present)
+    # Dạng loss: 'linear' = (1-IoU) ∈[0,1] (gradient bị chặn); 'log' = -ln(IoU)
+    # ∈[0,∞) — gradient -1/IoU rất mạnh khi IoU thấp (init) → hội tụ nhanh hơn.
+    if cfg.iou_form == 'log':
+        iou_term = -torch.log(iou.clamp(min=1e-3))   # ∞→0, clamp tránh nổ tại IoU=0
+    else:
+        iou_term = 1.0 - iou
     # Chuẩn hóa theo SỐ CLASS TỒN TẠI, KHÔNG phải tổng weight: class vắng (140
     # cái × no_obj 0.1 ≈ 58% tổng weight) sẽ pha loãng tín hiệu class tồn tại
-    # nếu nằm trong mẫu số. Giờ: mean sạch trên class tồn tại + no-obj là penalty
-    # cộng thêm (không làm phình mẫu số). Khớp mIoU (chỉ tính class tồn tại).
-    iou_l   = _safe(((1.0 - iou) * weight).sum() / present.sum().clamp(min=1.0))
+    # nếu nằm trong mẫu số. Giờ: mean sạch trên class tồn tại + no-obj penalty.
+    iou_l   = _safe((iou_term * weight).sum() / present.sum().clamp(min=1.0))
 
     return _safe(cfg.focal_w * f_ce + cfg.iou_w * iou_l)
 
