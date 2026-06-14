@@ -10,6 +10,12 @@ Input: `(B, 3, H, W)` ảnh RGB. Output: `(B, 150, H, W)` logits per-pixel.
 
 ## 0. Tổng quan luồng dữ liệu
 
+**Sơ đồ forward end-to-end** (input → backbone → heads → decoder base + ensemble → final):
+
+![Forward flow](saed_01_forward.png)
+
+Phiên bản text để scan nhanh:
+
 ```
 ảnh (B,3,H,W)
    │
@@ -65,6 +71,8 @@ stage3+stage4 ≈ 72% (capacity dồn về tầng sâu, semantic).
 3 head sparse (`head_tiny/small/medium`) + 1 head spatial-gating (`head_large`).
 **Ablation chứng minh**: bỏ attention selectivity → mIoU sập 0.24→0.07 (sparse
 attention đóng **+0.16 mIoU, ~69% performance**). head_large gần như vô dụng (+0.0006).
+
+![Sparse attention head](saed_02_sparse_head.png)
 
 ### 2.1 Cơ chế: budget attention (clamped_softmax)
 
@@ -128,6 +136,8 @@ global. Rẻ (ít key) mà mang context toàn cục.
 Bật qua `enable_ensemble`. Hiện thực hóa ý tưởng: **mỗi sparse mask là một weak
 predictor; budget giới hạn nên nó chỉ predict tốt ở vùng nó attend; gộp lại +
 sửa sai.** Đánh vào **đuôi dài** (class hiếm được nhiều mask "nhìn").
+
+![SAED ensemble branch](saed_03_ensemble.png)
 
 ### 3.1 Per-mask weak predictor (`_build_ensemble`)
 
