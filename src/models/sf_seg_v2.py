@@ -155,10 +155,12 @@ class sf_seg_v2(nn.Module):
                  grad_checkpoint: bool = True,
                  attn_masks: tuple[int, int, int] | None = None,
                  budget_ladder: bool = False, pos_encode: bool = False,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, enable_ensemble: bool = False,
+                 attn_temperature: float = 1.0):
         super().__init__()
         self.num_classes = num_classes
         self.drop_p = dropout      # Dropout2d trước classifier (functional → key names ổn định)
+        self.enable_ensemble = enable_ensemble
         C = num_channels
         C1, C2, C3, C4 = C, 2 * C, 4 * C, 8 * C   # 32, 64, 128, 256 (với C=32)
         D = 2 * C                                    # decoder width = 64
@@ -180,15 +182,38 @@ class sf_seg_v2(nn.Module):
         _qk = 32
         self.head_tiny   = SparseAttnHead(C4, max(4, focus_size // 8), num_heads=nh_tiny,
                                           qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode)
+                                          pos_encode=pos_encode, temperature=attn_temperature)
         self.head_small  = SparseAttnHead(C3, max(4, focus_size // 4), num_heads=nh_small,
                                           qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode)
+                                          pos_encode=pos_encode, temperature=attn_temperature)
         self.head_medium = SparseAttnHead(C2, max(4, focus_size // 8), num_heads=nh_medium,
                                           cross_kv_feat_dim=C4,
                                           qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode)
+                                          pos_encode=pos_encode, temperature=attn_temperature)
         self.head_large  = AttentionHead(C1, focus_size, guided=False)
+
+        # ── Sparse Ensemble branch (region-gated weak predictors) ─────────────
+        # Mỗi mask → classifier (dv→C) trên feature value-weighted, gated bởi
+        # vùng attend → một weak predictor. Gộp Σ (pred·gate) + correction head.
+        if enable_ensemble:
+            dv_t, dv_s, dv_m = C4 // nh_tiny, C3 // nh_small, C2 // nh_medium
+            def _mask_clf(dv):   # dv→hidden→C cho mask mỏng
+                h = max(32, dv)
+                return nn.Sequential(nn.Conv2d(dv, h, 1), nn.GELU(),
+                                     nn.Conv2d(h, num_classes, 1))
+            self.ens_clf_tiny   = _mask_clf(dv_t)
+            self.ens_clf_small  = _mask_clf(dv_s)
+            self.ens_clf_medium = _mask_clf(dv_m)
+            # Correction: [decoder_logit (C) + ensemble_logit (C)] → refine → final
+            _ec = max(256, num_classes)
+            self.ens_correct = nn.Sequential(
+                nn.Conv2d(2 * num_classes, _ec, 3, padding=1),
+                _gn(_ec), nn.GELU(),
+                nn.Conv2d(_ec, num_classes, 1))
+            nn.init.zeros_(self.ens_correct[-1].weight)   # zero-init → final≈decoder lúc đầu
+            nn.init.zeros_(self.ens_correct[-1].bias)
+        self._per_mask_preds: list | None = None
+        self._ensemble_logit: torch.Tensor | None = None
 
         # ── Decoder: lightweight single-conv fuse ────────────────────────────
         # Project C4→D và C3→D (C2=D và C1=D//2 đã match, không cần project)
@@ -266,12 +291,45 @@ class sf_seg_v2(nn.Module):
     def _encode(self, x: torch.Tensor):
         return self.backbone(x)   # (f_detail, f1, f2, f3, f4)
 
+    def _build_ensemble(self, scales: list):
+        """Mỗi mask → classifier(dv→C) gated bởi vùng attend → weak predictor.
+        Gộp Σ(pred·gate)/Σgate ở res chung. Lưu per-mask preds cho loss.
+        scales: list (classifier, per_mask_feat (B,M,dv,h,w), gate (B,M,h,w))."""
+        preds, num, den = [], None, None
+        ref_hw = scales[-1][1].shape[-2:]          # res chung = medium (H/8)
+        for clf, feat, gate in scales:
+            B, M, dv, h, w = feat.shape
+            p = clf(feat.reshape(B * M, dv, h, w)).view(B, M, -1, h, w)  # (B,M,C,h,w)
+            g = gate.unsqueeze(2)                                         # (B,M,1,h,w)
+            g = g / (g.amax(dim=(-1, -2), keepdim=True) + 1e-6)           # norm [0,1] mỗi mask
+            preds.append((p, gate))                                       # cho per-mask loss
+            pg = (p * g).flatten(1, 2)                                    # (B,M*C,h,w)
+            pg = F.interpolate(pg, ref_hw, mode='bilinear', align_corners=False)
+            gg = F.interpolate(g.flatten(1, 2), ref_hw, mode='bilinear', align_corners=False)
+            pg = pg.view(B, M, -1, *ref_hw); gg = gg.view(B, M, 1, *ref_hw)
+            num = pg.sum(1) if num is None else num + pg.sum(1)           # (B,C,h,w)
+            den = gg.sum(1) if den is None else den + gg.sum(1)
+        self._ensemble_logit = num / (den + 1e-6)
+        self._per_mask_preds = preds if self.training else None
+
     def extract_features(self, x: torch.Tensor, full_res: bool = True):
         f_detail, f1, f2, f3, f4 = self._encode(x)
 
-        a_tiny,   sal_tiny   = self.head_tiny(f4)
-        a_small,  sal_small  = self.head_small(f3)
-        a_medium, sal_medium = self.head_medium(f2, global_feat=a_tiny)
+        ens = self.enable_ensemble
+        if ens:
+            a_tiny,   sal_tiny,   pf_t, pg_t = self.head_tiny(f4, return_per_mask=True)
+            a_small,  sal_small,  pf_s, pg_s = self.head_small(f3, return_per_mask=True)
+            a_medium, sal_medium, pf_m, pg_m = self.head_medium(f2, global_feat=a_tiny,
+                                                                return_per_mask=True)
+            self._build_ensemble([(self.ens_clf_tiny,   pf_t, pg_t),
+                                  (self.ens_clf_small,  pf_s, pg_s),
+                                  (self.ens_clf_medium, pf_m, pg_m)])
+        else:
+            a_tiny,   sal_tiny   = self.head_tiny(f4)
+            a_small,  sal_small  = self.head_small(f3)
+            a_medium, sal_medium = self.head_medium(f2, global_feat=a_tiny)
+            self._per_mask_preds = None
+            self._ensemble_logit = None
         a_large,  attn_l     = self.head_large(f1)
 
         self._attns = {
@@ -342,6 +400,14 @@ class sf_seg_v2(nn.Module):
         # Late fusion: cộng prior per-class từ presence (broadcast mọi pixel).
         # KHÔNG detach p — seg loss sửa trực tiếp presence_head qua đường này.
         logits = logits + self.late_ctx(self._presence).unsqueeze(-1).unsqueeze(-1)
+
+        # Ensemble correction: final = decoder_logit + correct([decoder, ensemble]).
+        # Zero-init correct → lúc đầu final≈decoder (warm-start không xáo). Ensemble
+        # (pre-predict từ các weak mask) sửa lại vùng sai.
+        if self.enable_ensemble and self._ensemble_logit is not None:
+            ens = F.interpolate(self._ensemble_logit, logits.shape[2:],
+                                mode='bilinear', align_corners=False)
+            logits = logits + self.ens_correct(torch.cat([logits, ens], dim=1))
 
         if not upsample:
             return logits, attn_l.amax(dim=1, keepdim=True), attn_l

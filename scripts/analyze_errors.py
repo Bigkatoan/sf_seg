@@ -60,7 +60,9 @@ def main():
         decoder_dim=af('decoder_dim', 256), hr_dim=af('hr_dim', 96),
         attn_masks=tuple(_am) if _am else None,
         budget_ladder=af('budget_ladder', False),
-        pos_encode=af('pos_encode', False)).to(device)
+        pos_encode=af('pos_encode', False),
+        enable_ensemble=af('enable_ensemble', False),
+        attn_temperature=af('attn_temperature', 1.0)).to(device)
     model.load_state_dict(ckpt.get('model_state_dict', ckpt))
     model.eval()
     print(f"Loaded {args.checkpoint} (epoch={ckpt.get('epoch', '?')})")

@@ -117,12 +117,17 @@ class SparseAttnHead(nn.Module):
     def __init__(self, C: int, focus_size: int, num_heads: int = 4,
                  cross_kv_feat_dim: int | None = None,
                  qk_dim: int | None = None, budget_ladder: bool = False,
-                 pos_encode: bool = False):
+                 pos_encode: bool = False, temperature: float = 1.0):
         super().__init__()
         assert C % num_heads == 0, f"C={C} not divisible by num_heads={num_heads}"
         self.C          = C
         self.num_heads  = num_heads
         self.dv         = C // num_heads          # value dim per head (chia C)
+        # Temperature τ chia vào score trước clamp: τ<1 → score peaked → clamp
+        # tạo hard-zero → mask localized thật (hiện 0% zero ≈ softmax thường).
+        # Học được (log-param) để model tự chọn độ sắc, init ở τ given.
+        import math as _m
+        self.log_temp   = nn.Parameter(torch.tensor(_m.log(max(temperature, 1e-3))))
         # qk_dim tách khỏi phép chia channel: nhiều masks (num_heads lớn) mà
         # similarity vẫn tính ở dim đủ rộng (32) thay vì C/num_heads quá hẹp
         self.dqk        = qk_dim if qk_dim is not None else C // num_heads
@@ -182,8 +187,8 @@ class SparseAttnHead(nn.Module):
         return [levels[m * G // M] for m in range(M)]
 
     def forward(self, x: torch.Tensor,
-                global_feat: torch.Tensor | None = None
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                global_feat: torch.Tensor | None = None,
+                return_per_mask: bool = False):
         B, C, H, W = x.shape
         N   = H * W
         H_  = self.num_heads
@@ -225,7 +230,8 @@ class SparseAttnHead(nn.Module):
             H_k, W_k = H, W
             N_k   = N
 
-        sim = torch.matmul(Q, K_use.transpose(-2, -1)) * self.scale  # (B, H_, N, N_k)
+        temp = self.log_temp.exp().clamp(min=0.05)                   # τ học được
+        sim = torch.matmul(Q, K_use.transpose(-2, -1)) * self.scale / temp  # (B,H_,N,N_k)
 
         # Budget per head: ladder (đa cỡ focus) hoặc uniform 25% N_k
         budgets = self._head_budgets(N_k)
@@ -244,9 +250,17 @@ class SparseAttnHead(nn.Module):
                 done += len(idx)
             assert done == H_
 
-        out = torch.matmul(attn, V_use)                     # (B, H_, N, d)
-        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)  # (B, C, H, W)
+        out_pm = torch.matmul(attn, V_use)                  # (B, H_, N, dv)
+        out = out_pm.permute(0, 1, 3, 2).reshape(B, C, H, W)
         out = self.out_proj(out)
+
+        # Per-mask cho ensemble branch: feature value-weighted (B,H_,dv,H,W) +
+        # gate query-space (B,H_,H,W) = độ tự tin attention mỗi query (max attn).
+        if return_per_mask:
+            per_mask_feat = out_pm.permute(0, 1, 3, 2).reshape(B, H_, dv, H, W)
+            per_mask_gate = attn.max(dim=-1).values.view(B, H_, H, W)
+        else:
+            per_mask_feat = per_mask_gate = None
 
         # ── Anti-collapse diversity reg (grad-enabled) ────────────────────────
         # received-attention per key, mỗi mask → distribution trên N_k. Mask
@@ -264,6 +278,8 @@ class SparseAttnHead(nn.Module):
         # Saliency (detached) cho visualize
         with torch.no_grad():
             saliency = attn.detach().mean(dim=-2).view(B, H_, H_k, W_k)
+        if return_per_mask:
+            return out, saliency, per_mask_feat, per_mask_gate
         return out, saliency
 
 

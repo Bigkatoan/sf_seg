@@ -516,6 +516,8 @@ def train(args):
             budget_ladder=getattr(args, 'budget_ladder', False),
             pos_encode=getattr(args, 'pos_encode', False),
             dropout=getattr(args, 'dropout', 0.0),
+            enable_ensemble=getattr(args, 'enable_ensemble', False),
+            attn_temperature=getattr(args, 'attn_temperature', 1.0),
         ).to(device)
         _bb_ids = {id(p) for p in model.backbone.parameters()}
     else:
@@ -744,6 +746,27 @@ def train(args):
                     loss = loss + adw * adiv
                     parts['div'] = parts['div'] + (adw * adiv).detach()
 
+                # Per-mask region-gated CE: mỗi sparse mask là weak predictor,
+                # supervise CHỈ ở vùng nó attend (CE_pixel × gate / Σgate). Mask
+                # chuyên một vùng → ensemble. Logged in 'aux'.
+                pmp = getattr(model, '_per_mask_preds', None)
+                msw = getattr(args, 'mask_sup_weight', 0.0)
+                if pmp is not None and msw > 0:
+                    m_loss = logits.new_tensor(0.); nmask = 0
+                    for pred, gate in pmp:            # pred (B,M,C,h,w), gate (B,M,h,w)
+                        B_, M_, C_, h_, w_ = pred.shape
+                        tgt = F.interpolate(masks.float().unsqueeze(1), (h_, w_),
+                                            mode='nearest').squeeze(1).long()   # (B,h,w)
+                        tgt = tgt.unsqueeze(1).expand(B_, M_, h_, w_).reshape(-1, h_, w_)
+                        ce  = F.cross_entropy(pred.reshape(-1, C_, h_, w_).float(), tgt,
+                                              ignore_index=255, reduction='none')  # (B*M,h,w)
+                        g   = gate.reshape(-1, h_, w_).float()
+                        m_loss = m_loss + (ce * g).sum() / (g.sum().clamp(min=1.0))
+                        nmask += 1
+                    m_loss = m_loss / max(nmask, 1)
+                    loss = loss + msw * m_loss
+                    parts['aux'] = parts['aux'] + (msw * m_loss).detach()
+
             if not torch.isfinite(loss):
                 micro_step = 0
                 optimizer.zero_grad(set_to_none=True)
@@ -889,7 +912,9 @@ def train(args):
                     hr_dim=getattr(args, 'hr_dim', 96),
                     attn_masks=getattr(args, 'attn_masks', None),
                     budget_ladder=getattr(args, 'budget_ladder', False),
-                    pos_encode=getattr(args, 'pos_encode', False))
+                    pos_encode=getattr(args, 'pos_encode', False),
+                    enable_ensemble=getattr(args, 'enable_ensemble', False),
+                    attn_temperature=getattr(args, 'attn_temperature', 1.0))
         torch.save(ckpt, last_path)
         if improved:
             torch.save(ckpt, best_path)
@@ -1000,6 +1025,7 @@ def merge_config(args):
         decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
         attn_masks=None, budget_ladder=False, pos_encode=False, dropout=0.0,
         attn_div_weight=0.5, aug_copy_paste=False, cp_rare_thresh=300, cp_prob=0.5,
+        enable_ensemble=False, attn_temperature=1.0, mask_sup_weight=0.3,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,
