@@ -1,29 +1,27 @@
 # SF-Seg V2 — Sparse-Focus Semantic Segmentation
 
-Semantic segmentation with **budget-constrained sparse attention** (`clamped_softmax`)
-and **class-presence-guided global context**.
-Custom ConvNeXt-style backbone trained from scratch.
-Dataset: ADE20K, standard **150-class protocol** (label 0 "other" → ignore 255).
+Semantic segmentation with **top-k sparse attention** (4 sparse heads) +
+**Sparse-Attention Ensemble Decoder (SAED)** — mỗi mask là một region-gated weak
+predictor — và **class-presence-guided global context**. ConvNeXt-style backbone
+**ImageNet-1k pretrained**. Dataset: ADE20K, **150-class protocol** (label 0 → ignore 255).
+
+Chi tiết kiến trúc + lý do thiết kế: [docs/MODEL.md](docs/MODEL.md).
 
 ---
 
 ## Architecture diagrams
 
-**End-to-end forward pass** (backbone → heads → decoder → logits):
+**Forward flow end-to-end** (backbone → 4 sparse heads → decoder base + ensemble → final):
 
-![End-to-end](docs/tfm_03_endtoend.png)
+![Forward flow](docs/saed_01_forward.png)
 
-**Building blocks** — ConvNeXtBlock and clamped_softmax:
+**SparseAttnHead** — top-k sparse attention + per-mask weak predictor:
 
-![Blocks](docs/tfm_01_convnext_softmax.png)
+![Sparse head](docs/saed_02_sparse_head.png)
 
-**SparseAttnHead** — Q/K/V budget attention:
+**SAED ensemble** — region-gated weak predictors → gộp + correction:
 
-![Attention](docs/tfm_02_sparse_attn_head.png)
-
-**Decoder fusion and training loss**:
-
-![Decoder & Loss](docs/tfm_04_decoder_loss.png)
+![Ensemble](docs/saed_03_ensemble.png)
 
 ---
 
@@ -34,7 +32,7 @@ Input (B, 3, H, W)
        │
        ▼  SFBackbone (ConvNeXt-micro, 2.55M)
        ├─ stem        → (B,  32, H/2,  W/2)   f_detail ─────────────────────────┐
-       ├─ stage1      → (B,  32, H/4,  W/4)   f1 ──→ head_large  (AttentionHead)  │
+       ├─ stage1      → (B,  32, H/4,  W/4)   f1 ──→ head_large  (SparseAttnHead) │
        ├─ stage2      → (B,  64, H/8,  W/8)   f2 ──→ head_medium (SparseAttnHead) │
        ├─ stage3      → (B, 128, H/16, W/16)  f3 ──→ head_small  (SparseAttnHead) │
        └─ stage4      → (B, 256, H/32, W/32)  f4 ──→ head_tiny   (SparseAttnHead) │
@@ -71,41 +69,43 @@ Ba cơ chế phối hợp:
 
 ### Attention heads — 32 masks, budget ladder, positional encoding
 
-| Head | Scale | Mechanism | Masks | Budget ladder (tokens/mask) |
+| Head | Scale | Mechanism | Masks | k/mask (ladder) |
 |---|:---:|---|:---:|---|
-| `head_tiny`   | H/32 | SparseAttnHead (self) | 16 | 64 / 25 / 10 / 4 (×4 masks mỗi mức) |
-| `head_small`  | H/16 | SparseAttnHead (self) | 8 | 256 / 64 / 16 / 4 (×2) |
-| `head_medium` | H/8  | SparseAttnHead (cross ← f4) | 8 | ladder trên 256 key tokens |
-| `head_large`  | H/4  | AttentionHead (spatial gating) | — | — |
+| `head_tiny`   | H/32 | SparseAttnHead (self) | 16 | 64 / 25 / 10 / 4 |
+| `head_small`  | H/16 | SparseAttnHead (self) | 8 | 256 / 64 / 16 / 4 |
+| `head_medium` | H/8  | SparseAttnHead (cross ← f4) | 8 | ladder trên f4 key tokens |
+| `head_large`  | H/4  | SparseAttnHead (cross ← f4) | 4 | ladder (đã đổi từ spatial-gating) |
 
-Ba cơ chế (đều là đóng góp đo được):
+**Cả 4 head đều sparse**. Bốn cơ chế (đều đo được):
 
+- **top-k softmax** (`attn_op='topk'`): mỗi query giữ top-k score, softmax trên
+  chúng (Σ=1), còn lại = 0 → focus đúng k điểm (sparse THẬT, active=k). Thay
+  `clamped_softmax` cũ (budget k là *sàn* token, attention peaked bị spread →
+  100% active, không sparse). `attn_op='clamp'` giữ để A/B.
 - **Decoupled qk_dim=32**: Q,K chiếu riêng ra `M×32` chiều — tăng số masks
-  không làm similarity dim co lại (chỉ value dim chia C). Cho phép 2× masks
-  với +225K params.
-- **Budget ladder**: budget k của clamped_softmax là *sàn* diện tích focus
-  (mass k, cap 1/token). Uniform budget ép mọi mask ≥48% diện tích (đo từ
-  checkpoint) — object 4-token chỉ chiếm ≤6% mask k=64. Ladder log-spaced
-  k_max→4 cho mỗi cỡ object một nhóm masks chuyên biệt; đo sau fix: masks
-  trải 12%→93% diện tích (spread 80pt vs 37pt).
-- **Positional encoding**: sin-cos 2D theo tọa độ tuyệt đối chuẩn hóa [0,1],
-  cộng vào nhánh Q/K (V giữ sạch), không params. Absolute là đúng tín hiệu
-  cho cặp class định nghĩa bằng vị trí (ceiling↔wall↔floor — nhóm confusion
-  lớn nhất trong probe); tọa độ chuẩn hóa làm grid 16×16 và 64×64 chia sẻ
-  hệ quy chiếu trong cross-attention.
+  không làm similarity dim co lại (chỉ value dim chia C).
+- **Budget ladder**: k log-spaced (k_max→floor N_k//32) per mask — mask k lớn =
+  stuff-detector, k nhỏ = object nhỏ. Đa cỡ focus trong một head.
+- **Positional encoding** (`_apply_pe`): sin-cos 2D tuyệt đối, cộng vào Q/K, scale
+  theo magnitude feature × `pe_scale` (learnable) → PE không lấn át content ở
+  scale feature nhỏ (medium f2 std 0.06 — trước fix PE lấn 8× thành sin/cos).
 
-### Clamped Softmax — budget attention
+### Top-k sparse attention
 
 ```
-Input : score ∈ ℝᴺ  (N = sequence length)
-        k            (budget: total attention mass = k)
-Output: attn ∈ [0,1]ᴺ  with Σ attnᵢ = k exactly
+Input : score ∈ ℝᴺ  (N = sequence length),  k (số điểm focus)
+Output: attn ∈ [0,1]ᴺ,  đúng k phần tử > 0,  Σ attnᵢ = 1
 
-Step 1:  p = softmax(score) × k          (Σp = k, some pᵢ > 1)
-Step 2:  find λ* s.t. Σ clamp(p−λ*, 0,1) = k   (bisection, ~30 iters, CUDA kernel)
-Step 3:  attn = clamp(p − λ*, 0, 1)
-Bwd:     analytical gradient (λ* saved from CUDA forward) — 27ms vs 62ms topk
+giữ top-k(score) mỗi query → softmax trên k điểm đó → còn lại = 0 cứng
 ```
+
+→ mỗi query focus đúng **k điểm quan trọng nhất**, phần còn lại tắt hẳn (active=k).
+
+**Vì sao không dùng `clamped_softmax` (cũ):** budget-k clamp được thiết kế cho sparse
+nhưng đo được nó **không sparse** — k là *sàn* số token active (cap 1/token, Σ=k →
+cần ≥k token), và attention peaked bị *spread* (λ<0 cộng đều) → 100% token active.
+Top-k cho sparse thật. `clamped_softmax` (CUDA kernel `src/ops/`) giữ làm `attn_op='clamp'`
+để A/B.
 
 ---
 
@@ -161,7 +161,7 @@ python -m scripts.extract_backbone    # cắt backbone+heads sang init cho arch 
 
 ---
 
-## Config (`config.json`) — RTX 3090 / 512×512 / ADE20K-150
+## Config (`config.json`) — RTX 3090 / ADE20K-150 (image_size 384 train → 512 tune)
 
 | Key | Value | Description |
 |---|:---:|---|
@@ -171,9 +171,13 @@ python -m scripts.extract_backbone    # cắt backbone+heads sang init cho arch 
 | `grad_checkpoint` | false | Backbone nhỏ → checkpointing chỉ tiết kiệm 2%, tắt cho nhanh |
 | `lr` | 1e-3 | Poly decay theo `epochs`; warm-start dùng 5e-4 |
 | `iou_w` / `iou_warm_epochs` | 1.0 / 10 | Soft IoU (đã per-class balanced), ramp sau 10 epochs |
-| `attn_masks` | [16,8,8] | Số attention masks (tiny/small/medium) |
-| `budget_ladder` | true | Budget đa cỡ k_max→4 thay vì uniform 25% |
-| `pos_encode` | true | Sin-cos 2D tuyệt đối vào Q/K của attention |
+| `attn_masks` | [32,8,8] | Số masks (tiny/small/medium); head_large=4 cố định |
+| `attn_op` | topk | `topk` (sparse thật) hoặc `clamp` (budget, A/B) |
+| `budget_ladder` | true | k đa cỡ k_max→floor per mask |
+| `pos_encode` | true | Sin-cos 2D vào Q/K, scale theo magnitude (`_apply_pe`) |
+| `attn_temperature` | 0.5 | τ học được, làm score sắc hơn |
+| `enable_ensemble` | true | Bật SAED ensemble branch |
+| `mask_sup_weight` / `attn_div_weight` | 0.3 / 0.5 | per-mask region-gated CE / anti-collapse |
 | `lr_schedule` | constant | `constant` (chỉ warmup) hoặc `cosine` |
 | `presence_weight` / `presence_pos_weight` | 0.4 / 4.0 | BCE multi-label supervise global vector |
 | `aux_weight` | 0.4 | Deep supervision tại 3 scale (log gộp cả presence) |
@@ -189,8 +193,8 @@ Lưu ý: key mới trong `config.json` phải có mặt trong `defaults` dict c�
 ## Loss
 
 ```
-L = seg + diversity_w·L_div + aux_w·L_aux + presence_w·L_presence
-seg = focal_CE (sqrt-frequency per-class) + iou_w · soft_IoU
+L = seg + aux_w·L_aux + presence_w·L_presence + attn_div_w·L_div + mask_sup_w·L_mask
+seg = focal_w · focal_CE (sqrt-freq) + iou_w · soft_IoU(iou_form)   (trên final logit)
 ```
 
 - **focal CE, sqrt-frequency normalized** — mean trong từng class rồi weighted-mean
@@ -201,7 +205,11 @@ seg = focal_CE (sqrt-frequency per-class) + iou_w · soft_IoU
 - **Training loss tính tại H/2** (target nearest-downsample): nhanh 1.5×, peak VRAM
   17.7→10GB. Val luôn đánh giá tại full-res.
 - **presence BCE** — xem Global context ở trên.
-- **boundary upweight** trong focal CE; **diversity** Gram penalty trên head_large.
+- **L_mask** (`mask_sup_weight`) — per-mask region-gated CE: mỗi sparse mask là weak
+  predictor, supervise CHỈ ở vùng nó attend (CE×gate / Σgate). Deep supervision cho ensemble.
+- **L_div** (`attn_div_weight`) — anti-collapse: phạt masks giống nhau (cosine sim
+  received-attn) → mỗi mask attend vùng khác.
+- **boundary upweight** trong focal CE. `iou_form`: `linear` (1−IoU) hoặc `log` (−ln IoU).
 
 ---
 

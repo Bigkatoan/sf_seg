@@ -74,7 +74,7 @@ def forward_flow():
         ax.text(XBB, y-0.32, sh, ha='center', fontsize=5.6, color=SH, style='italic')
     # heads
     heads = [('head_tiny','32 masks · self',10.6,C_ATTN),('head_small','8 masks · self',9.0,C_ATTN),
-             ('head_medium','8 masks · cross←f4',7.4,C_ATTN),('head_large','spatial gating (thừa)',5.0,C_HEAD)]
+             ('head_medium','8 masks · cross←f4',7.4,C_ATTN),('head_large','4 masks · cross←f4',5.0,C_ATTN)]
     for nm, sub, y, col in heads:
         box(ax, XHD, y, 2.3, 1.05, col, nm, sub, tsz=7.5, ssz=5.6)
         arr(ax, XBB+0.95, y, XHD-1.15, y, lw=1.2)
@@ -122,8 +122,8 @@ def forward_flow():
 def sparse_head():
     FW, FH = 18, 10
     fig, ax = setup(FW, FH)
-    title(ax, FW, FH, 'SparseAttnHead  —  budget attention + per-mask weak predictor',
-          'decoupled qk_dim=32 · temperature τ học được · budget ladder · clamped_softmax')
+    title(ax, FW, FH, 'SparseAttnHead  —  top-k sparse attention + per-mask weak predictor',
+          'decoupled qk_dim=32 · temperature τ học được · budget ladder · top-k softmax (sparse thật)')
     box(ax, 1.6, 5.0, 1.7, 1.0, C_IN, 'feature', 'f (C,h,w)')
     # Q K V
     box(ax, 4.2, 7.5, 1.6, 0.8, C_HEAD, 'q_proj', 'M×32', tsz=7.5, ssz=5.8)
@@ -136,10 +136,10 @@ def sparse_head():
     box(ax, 6.9, 6.85, 1.8, 0.9, C_ATTN, 'Q·Kᵀ · scale / τ', 'sim (M,N,N_k)', tsz=7, ssz=5.6)
     arr(ax, 5.0,7.5, 6.1,7.0, lw=1.1); arr(ax, 5.0,6.2, 6.1,6.7, lw=1.1)
     # clamp
-    box(ax, 9.5, 6.85, 2.0, 1.0, C_ATTN, 'clamped_softmax', 'budget k/mask\n(ladder)', tsz=7.5, ssz=5.5)
+    box(ax, 9.5, 6.85, 2.0, 1.0, C_ATTN, 'top-k softmax', 'k/mask (ladder)', tsz=7.5, ssz=5.5)
     arr(ax, 7.8,6.85, 8.5,6.85, lw=1.3)
-    ax.text(9.5, 5.55, 'Σ attn = k · cap 1/token', ha='center', fontsize=5.8, color=LGRAY, style='italic')
-    ax.text(9.5, 5.2, '(hiện 0% hard-zero → soft)', ha='center', fontsize=5.8, color='#F87171', style='italic')
+    ax.text(9.5, 5.55, 'giữ top-k → softmax(Σ=1)', ha='center', fontsize=5.8, color=LGRAY, style='italic')
+    ax.text(9.5, 5.2, 'còn lại = 0 (focus đúng k điểm)', ha='center', fontsize=5.8, color='#34D399', style='italic')
     # attn @ V
     box(ax, 12.6, 5.6, 1.7, 0.9, C_DEC, 'attn @ V', 'out (M,dv,h,w)', tsz=7.5, ssz=5.6)
     arr(ax, 10.5,6.5, 11.75,5.9, lw=1.2)

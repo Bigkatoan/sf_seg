@@ -21,7 +21,7 @@ Phiên bản text để scan nhanh:
    │
    ▼ SFBackbone (ConvNeXt-style, IN-1k pretrained)
    ├─ f_detail (32, H/2)   ── nhánh detail (biên sắc)
-   ├─ f1 (C1, H/4)         → head_large   (spatial gating — gần như thừa)
+   ├─ f1 (C1, H/4)         → head_large   (sparse cross-attn ← f4, 4 masks)
    ├─ f2 (C2, H/8)         → head_medium  (sparse cross-attn ← f4)
    ├─ f3 (C3, H/16)        → head_small   (sparse self-attn)
    └─ f4 (C4, H/32)        → head_tiny    (sparse self-attn) + GAP/GMP → presence
@@ -68,32 +68,30 @@ stage3+stage4 ≈ 72% (capacity dồn về tầng sâu, semantic).
 
 ## 2. Sparse Attention Heads — `SparseAttnHead` (động cơ của model)
 
-3 head sparse (`head_tiny/small/medium`) + 1 head spatial-gating (`head_large`).
+**Cả 4 head đều sparse** (`head_tiny/small/medium/large`, đều `SparseAttnHead`).
 **Ablation chứng minh**: bỏ attention selectivity → mIoU sập 0.24→0.07 (sparse
-attention đóng **+0.16 mIoU, ~69% performance**). head_large gần như vô dụng (+0.0006).
+attention đóng **+0.16 mIoU, ~69% performance**) — đây là động cơ của model.
 
 ![Sparse attention head](saed_02_sparse_head.png)
 
-### 2.1 Cơ chế: budget attention (clamped_softmax)
+### 2.1 Cơ chế: sparse attention (top-k softmax)
 
-Attention thường: `softmax(Q·Kᵀ/√d)` → mọi key nhận mass. Ở đây thay bằng
-**clamped_softmax** (`src/ops/`):
+Attention thường: `softmax(Q·Kᵀ/√d)` → mọi key nhận mass. Ở đây dùng **top-k softmax**
+(`attn_op='topk'`): mỗi query giữ **top-k score**, softmax trên chúng (Σ=1), phần
+còn lại **= 0 cứng** → mỗi query focus **đúng k điểm quan trọng nhất**.
 
 ```
-p = softmax(score) × k          # tổng mass = k (budget)
-tìm λ: Σ clamp(p−λ, 0, 1) = k    # bisection 30 iter (CUDA kernel)
-attn = clamp(p − λ, 0, 1)
+giữ top-k(score) mỗi query → softmax trên k điểm đó (Σ=1) → còn lại = 0
 ```
 
-Ý đồ: mỗi query chỉ "tiêu" ngân sách k → tập trung vào thiểu số token quan trọng.
-**Budget `k = min(focus_size², N_k//4)`** ≈ 25% số token.
+`k` theo budget ladder per-mask. Verify: head_tiny k=12 → active = 12/49 đúng (sparse thật).
 
-> ⚠️ **Phát hiện thực nghiệm quan trọng:** với budget = N//4, clamped_softmax
-> hiện chạy ở chế độ **0% hard-zero** — token điểm cao chạm cap 1 nhưng token thấp
-> KHÔNG bị zero (λ ≤ p_min). Tức attention là **soft selective** (token cao trọng
-> số cao hơn) chứ chưa **hard-sparse** (thiểu số pixel sáng) như tên gọi. Hard-zero
-> chỉ xuất hiện khi budget nhỏ hơn nhiều hoặc dùng top-k. Selectivity vẫn quyết
-> định (+0.16) — chỉ là "sparse" đang ở dạng mềm.
+> **Lịch sử & bài học:** trước đây dùng `clamped_softmax` (budget k, `attn_op='clamp'`,
+> CUDA kernel ở `src/ops/`) — nhưng đo được nó **KHÔNG sparse**: budget k là *SÀN* số
+> token active (cap 1/token, Σ=k → cần ≥k token), và attention peaked bị **spread**
+> (λ<0 cộng đều) → 100% token active. Đã thay bằng top-k (sparse thật). `attn_op`
+> giữ cả hai để A/B. Nếu top-k "kẹt" (token bị zero không nhận gradient), cân nhắc
+> sparsemax/entmax (sparse + gradient đầy đủ).
 
 ### 2.2 Temperature τ (sharpening, learnable)
 
@@ -113,10 +111,19 @@ Các mask trong cùng head mang **budget khác nhau** (log-spaced từ `k_max` x
 floor `N_k//32`): mask budget lớn = stuff-detector (sky/wall), mask budget nhỏ =
 object nhỏ. Floor tỉ lệ N_k (không cố định 4) để mask budget nhỏ không collapse.
 
-### 2.5 Positional encoding
+### 2.5 Positional encoding (PE) + temperature τ
 
-sin-cos 2D **tuyệt đối** chuẩn hóa [0,1], cộng vào nhánh **Q/K** (V giữ sạch), 0
-params. Lý do absolute: cặp confusion ceiling↔wall↔floor định nghĩa bằng vị trí.
+sin-cos 2D **tuyệt đối** chuẩn hóa [0,1], cộng vào nhánh **Q/K** (V giữ sạch). Lý do
+absolute: cặp confusion ceiling↔wall↔floor định nghĩa bằng vị trí.
+
+> **Fix quan trọng (`_apply_pe`):** PE std cố định 0.57, nhưng feature các scale lệch
+> nhau cực mạnh (f4 std 1.67 vs f2 std 0.06). Cộng PE thẳng → ở medium PE **lấn át
+> content 8×** → attention thành sin/cos thuần vị trí (vô nghĩa). Fix: scale PE theo
+> magnitude feature × `pe_scale` (learnable, init 0.3) → `PE_std = pe_scale × feat_std`
+> mọi scale → PE luôn là tỉ lệ cố định, không nuốt content (medium ratio 8.28→0.12).
+
+**Temperature τ** (`log_temp`, learnable, config `attn_temperature`): `sim = Q·Kᵀ·scale/τ`
+→ τ<1 làm score sắc hơn (ảnh hưởng độ tập trung của top-k).
 
 ### 2.6 Anti-collapse diversity loss
 
@@ -124,10 +131,14 @@ Trong forward (grad-enabled): phạt cosine similarity giữa received-attention
 các mask → buộc chúng khác nhau. Lưu ý: ngăn collapse *giống hệt* nhưng có thể đẻ
 "pattern khác nhau bằng nhiễu" nếu feature scale đó không đủ giàu (small/medium).
 
-### 2.7 head_medium = cross-attention
+### 2.7 Cross-attention heads (medium + large)
 
-Q từ f2 (H/8), **K,V từ f4** (global, H/32) → mỗi query local nhìn toàn bộ token
-global. Rẻ (ít key) mà mang context toàn cục.
+- **head_medium**: Q từ f2 (H/8), K,V từ f4 (global, H/32) → query local nhìn token global.
+- **head_large**: Q từ f1 (H/4, high-res), K,V từ f4 (global), 4 masks. *Trước* là
+  spatial-gating dense (clamp k≥N → "đỏ hết", ablation +0.0006 vô dụng); đã **convert
+  sang SparseAttnHead cross-attn** → sparse + global context ở độ phân giải cao nhất.
+
+Cross-attn rẻ (ít key f4) mà mang context toàn cục.
 
 ---
 
@@ -249,11 +260,15 @@ L = L_seg(final, label)                         # focal CE (sqrt-freq) + soft Io
 | Phát hiện | Số liệu | Hệ quả |
 |---|---|---|
 | Sparse attention là engine | bỏ selectivity → mIoU 0.24→0.07 | kiến trúc attention đúng, giữ |
-| head_large thừa | tắt → +0.0006 | có thể cắt |
 | head_tiny quan trọng nhất | tắt → −0.055 | feature sâu (f4) gánh semantic |
-| clamp 0% hard-zero | đo trực tiếp | "sparse" đang soft, cần top-k/budget nhỏ nếu muốn hard |
+| clamp KHÔNG sparse | 100% token active, peaked→spread | **đã thay bằng top-k** (active=k đúng) |
+| PE lấn át content medium | ratio 8.28 (f2 std 0.06) | **đã fix** `_apply_pe` scale theo magnitude |
+| head_large spatial-gating thừa | tắt → +0.0006 | **đã convert** sang sparse cross-attn |
 | Trần là đuôi dài | top-30 mIoU ~0.30, 100+ class ~0.05 | SAED + copy-paste nhắm chỗ này |
 | Data-limited | train 0.50 vs val 0.29, gap 0.30 | IN-1k pretrain + augment là đòn chính |
+
+*(Các findings cũ — clamp soft, head_large thừa, PE sin/cos — đã được sửa bằng top-k,
+convert sparse cross-attn, và `_apply_pe`. Bảng ghi cả vấn đề lẫn fix để truy vết.)*
 
 **mIoU tốt nhất hiện tại**: ~0.286 @384px (`backups/sf_seg_384_miou2856.pt`).
 Mục tiêu cạnh tranh SegFormer-B0 (~0.374) cần: 512 tuning + phá trần data
@@ -265,9 +280,10 @@ Mục tiêu cạnh tranh SegFormer-B0 (~0.374) cần: 512 tuning + phá trần d
 
 - `src/models/sf_seg_v2.py` — model: `sf_seg_v2`, `SFBackbone`, `ConvNeXtBlock`,
   `_build_ensemble`, presence/ensemble heads.
-- `src/models/sf_seg_r18.py` — `SparseAttnHead` (budget attn, temperature, qk
-  decoupled, ladder, PE, per-mask output), `AttentionHead` (head_large), `_sincos_pe_2d`.
-- `src/ops/` — `clamped_softmax` (CUDA kernel + analytical backward).
+- `src/models/sf_seg_r18.py` — `SparseAttnHead` (top-k/clamp attn, temperature, qk
+  decoupled, ladder, PE `_apply_pe`, per-mask output), `_topk_softmax`, `_sincos_pe_2d`.
+  (`AttentionHead` còn nhưng không dùng — head_large đã chuyển sparse.)
+- `src/ops/` — `clamped_softmax` (CUDA kernel) — nay là tùy chọn `attn_op='clamp'`.
 - `src/losses/sf_loss.py` — `sf_loss`, `_seg_term` (focal CE + soft IoU).
 - `src/training/trainer.py` — train loop, `ADE20KDataset` (+copy-paste),
   `AllClassBatchSampler`, per-mask/presence/aux losses, config merge.
