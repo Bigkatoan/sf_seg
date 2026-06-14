@@ -9,19 +9,40 @@ Chi tiết kiến trúc + lý do thiết kế: [docs/MODEL.md](docs/MODEL.md).
 
 ---
 
-## Architecture diagrams
+## Architecture — forward flow
 
-**Forward flow end-to-end** (backbone → 4 sparse heads → decoder base + ensemble → final):
+```mermaid
+flowchart LR
+    IN["Input (B,3,H,W)"] --> BB["SFBackbone<br/>ConvNeXt · IN-1k"]
+    BB --> f4["f4 · H/32"]
+    BB --> f3["f3 · H/16"]
+    BB --> f2["f2 · H/8"]
+    BB --> f1["f1 · H/4"]
+    BB --> fd["f_detail · H/2"]
+    f4 --> HT["head_tiny<br/>32 · self"]
+    f3 --> HS["head_small<br/>8 · self"]
+    f2 --> HM["head_medium<br/>8 · cross←f4"]
+    f1 --> HL["head_large<br/>4 · cross←f4"]
+    f4 --> PR["GAP+GMP<br/>presence"]
+    HT --> DEC["DECODER BASE<br/>fuse + ctx · dim 256"]
+    HS --> DEC
+    HM --> DEC
+    HL --> DEC
+    fd --> DEC
+    HT --> ENS["ENSEMBLE<br/>weak predictors<br/>Σ(pred·gate)"]
+    HS --> ENS
+    HM --> ENS
+    PR -. ctx .-> DEC
+    DEC --> LG["logit @H/2"]
+    PR -. late .-> LG
+    LG --> COR["ens_correct<br/>zero-init"]
+    ENS --> COR
+    LG --> ADD(("+"))
+    COR --> ADD
+    ADD --> OUT["Output (B,150,H,W)"]
+```
 
-![Forward flow](docs/saed_01_forward.png)
-
-**SparseAttnHead** — top-k sparse attention + per-mask weak predictor:
-
-![Sparse head](docs/saed_02_sparse_head.png)
-
-**SAED ensemble** — region-gated weak predictors → gộp + correction:
-
-![Ensemble](docs/saed_03_ensemble.png)
+Sơ đồ chi tiết SparseAttnHead + SAED ensemble: **[docs/MODEL.md](docs/MODEL.md)**.
 
 ---
 

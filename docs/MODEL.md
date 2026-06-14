@@ -10,9 +10,38 @@ Input: `(B, 3, H, W)` ảnh RGB. Output: `(B, 150, H, W)` logits per-pixel.
 
 ## 0. Tổng quan luồng dữ liệu
 
-**Sơ đồ forward end-to-end** (input → backbone → heads → decoder base + ensemble → final):
+**Sơ đồ forward end-to-end** (input → backbone → 4 sparse heads → decoder base + ensemble → final):
 
-![Forward flow](saed_01_forward.png)
+```mermaid
+flowchart LR
+    IN["Input (B,3,H,W)"] --> BB["SFBackbone<br/>ConvNeXt · IN-1k"]
+    BB --> f4["f4 · C4,H/32"]
+    BB --> f3["f3 · C3,H/16"]
+    BB --> f2["f2 · C2,H/8"]
+    BB --> f1["f1 · C1,H/4"]
+    BB --> fd["f_detail · 32,H/2"]
+    f4 --> HT["head_tiny<br/>32 masks · self"]
+    f3 --> HS["head_small<br/>8 masks · self"]
+    f2 --> HM["head_medium<br/>8 masks · cross←f4"]
+    f1 --> HL["head_large<br/>4 masks · cross←f4"]
+    f4 --> PR["GAP+GMP<br/>presence (BCE)"]
+    HT --> DEC["DECODER BASE<br/>fuse + ctx · dim 256 @H/4"]
+    HS --> DEC
+    HM --> DEC
+    HL --> DEC
+    fd --> DEC
+    PR -. "ctx (mid)" .-> DEC
+    HT --> ENS["ENSEMBLE<br/>region-gated weak predictors<br/>Σ(pred·gate)"]
+    HS --> ENS
+    HM --> ENS
+    DEC --> LG["logit @H/2"]
+    PR -. "late_ctx" .-> LG
+    LG --> COR["ens_correct<br/>concat[dec,ens] · zero-init"]
+    ENS --> COR
+    LG --> ADD(("+"))
+    COR --> ADD
+    ADD --> OUT["Output<br/>bilinear↑ (B,150,H,W)"]
+```
 
 Phiên bản text để scan nhanh:
 
@@ -72,7 +101,23 @@ stage3+stage4 ≈ 72% (capacity dồn về tầng sâu, semantic).
 **Ablation chứng minh**: bỏ attention selectivity → mIoU sập 0.24→0.07 (sparse
 attention đóng **+0.16 mIoU, ~69% performance**) — đây là động cơ của model.
 
-![Sparse attention head](saed_02_sparse_head.png)
+```mermaid
+flowchart LR
+    F["feature f (C,h,w)"] --> Q["q_proj<br/>M×32"]
+    F --> K["k_proj<br/>M×32"]
+    F --> V["v_proj<br/>C (chia M)"]
+    PE["+ PE (sin-cos, scale theo magnitude)"] -. "vào Q/K" .-> Q
+    PE -. " " .-> K
+    Q --> SIM["Q·Kᵀ·scale / τ"]
+    K --> SIM
+    SIM --> TK["top-k softmax<br/>k/mask (ladder)<br/>còn lại = 0"]
+    TK --> AV["attn @ V"]
+    V --> AV
+    AV --> OP["out_proj → a (C,h,w)"]
+    AV --> PM["per_mask_feat + gate<br/>→ ENSEMBLE"]
+```
+
+> diversity loss phạt masks giống nhau → mỗi mask attend vùng khác.
 
 ### 2.1 Cơ chế: sparse attention (top-k softmax)
 
@@ -148,7 +193,24 @@ Bật qua `enable_ensemble`. Hiện thực hóa ý tưởng: **mỗi sparse mask
 predictor; budget giới hạn nên nó chỉ predict tốt ở vùng nó attend; gộp lại +
 sửa sai.** Đánh vào **đuôi dài** (class hiếm được nhiều mask "nhìn").
 
-![SAED ensemble branch](saed_03_ensemble.png)
+```mermaid
+flowchart LR
+    M1["mask A<br/>feat+gate"] --> C1["classifier dv→C"] --> P1["pred×gate<br/>(vùng attend)"]
+    M2["mask B"] --> C2["classifier"] --> P2["pred×gate"]
+    M3["… 48 masks"] --> C3["classifier"] --> P3["pred×gate"]
+    P1 --> COMB["Σ(pred·gate) / Σgate<br/>= ensemble_logit"]
+    P2 --> COMB
+    P3 --> COMB
+    P1 -. "CE gated = L_mask" .-> LOSS["per-mask deep supervision"]
+    COMB --> CORR["ens_correct (zero-init)"]
+    DECB["decoder_logit (base)"] --> CORR
+    DECB --> ADD(("+"))
+    CORR --> ADD
+    ADD --> FIN["final = dec + correct"]
+```
+
+> Class hiếm: nhiều mask attend cùng vùng → vote nhiều lần + decoder base +
+> correction → "tư duy ≥2 lần".
 
 ### 3.1 Per-mask weak predictor (`_build_ensemble`)
 
