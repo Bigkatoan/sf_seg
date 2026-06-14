@@ -665,9 +665,11 @@ def train(args):
                                               shuffle=True, **kw)
                 logging.info(f"[epoch {epoch}] resolution → {cur_res}×{cur_res}")
 
-        # Ramp IoU loss after warm-up epochs
+        # Ramp IoU loss after warm-up epochs — CHỈ khi có CE (focal_w>0) gánh
+        # segmentation lúc warmup. Nếu focal_w=0 (IoU-only tuning), tắt IoU sẽ
+        # để seg loss = 0 hoàn toàn → segmentation head không có gradient → sập.
         warm = getattr(args, 'iou_warm_epochs', 0)
-        if warm > 0 and epoch <= warm:
+        if warm > 0 and epoch <= warm and getattr(args, 'focal_w', 1.0) > 0:
             sf_cfg = copy.copy(SFLossConfig.from_args(args))
             sf_cfg.iou_w = 0.0
         else:
