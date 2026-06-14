@@ -45,6 +45,9 @@
   "aug_hue": false,
   "aug_cutout": true,
   "aug_shift": true,
+  "aug_copy_paste": true,
+  "cp_rare_thresh": 300,
+  "cp_prob": 0.5,
   "dropout": 0.15,
 
   "class_aware_sampler": true,

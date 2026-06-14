@@ -59,9 +59,43 @@ class ADE20KDataset(Dataset):
             if p.suffix.lower() in ('.jpg', '.jpeg', '.png')
             and (masks_dir / (p.stem + '.png')).exists()
         ]
+        self.aug_copy_paste = False   # bật qua configure_copy_paste()
+        self.cp_prob        = 0.5
+        self.cp_rare_classes: list = []
+
+    def configure_copy_paste(self, class_to_images: dict, rare_thresh: int = 300,
+                             prob: float = 0.5):
+        """Bật copy-paste: dán region class HIẾM (<rare_thresh ảnh) từ ảnh nguồn
+        vào ảnh đích → tăng pixel class hiếm, đánh vào đuôi dài kéo sập mIoU."""
+        self.cp_rare = {c: imgs for c, imgs in class_to_images.items()
+                        if imgs and len(imgs) < rare_thresh}
+        self.cp_rare_classes = list(self.cp_rare.keys())
+        self.cp_prob        = prob
+        self.aug_copy_paste = len(self.cp_rare_classes) > 0
+        logging.info(f"Copy-paste bật: {len(self.cp_rare_classes)} class hiếm "
+                     f"(<{rare_thresh} ảnh), prob={prob}")
 
     def __len__(self):
         return len(self.pairs)
+
+    def _copy_paste(self, img_t: torch.Tensor, mask_t: torch.Tensor):
+        """Dán 1-2 region class hiếm từ ảnh nguồn (chứa class đó) vào ảnh đích."""
+        sz = self.image_size
+        for _ in range(random.randint(1, 2)):
+            c       = random.choice(self.cp_rare_classes)
+            src_idx = random.choice(self.cp_rare[c])
+            sip, smp = self.pairs[src_idx]
+            si = Image.open(sip).convert('RGB').resize((sz, sz), Image.BILINEAR)
+            sm = Image.open(smp).convert('L').resize((sz, sz), Image.NEAREST)
+            si_t = TF.to_tensor(si)
+            sm_t = torch.from_numpy(_remap_ade_mask(np.array(sm, dtype=np.int64))).long()
+            if random.random() > 0.5:                 # hflip nguồn cho đa dạng
+                si_t = TF.hflip(si_t); sm_t = TF.hflip(sm_t)
+            region = (sm_t == c)                       # pixel của class hiếm
+            if region.any():
+                img_t[:, region] = si_t[:, region]
+                mask_t[region]   = c
+        return img_t, mask_t
 
     def __getitem__(self, idx):
         img_p, mask_p = self.pairs[idx]
@@ -115,6 +149,10 @@ class ADE20KDataset(Dataset):
                 img_t = img_t.clamp(0.0, 1.0)
 
             mask_t = torch.from_numpy(_remap_ade_mask(np.array(mask, dtype=np.int64))).long()
+
+            # Copy-paste class hiếm (trước cutout để cutout có thể che cả vùng dán)
+            if self.aug_copy_paste and random.random() < self.cp_prob:
+                img_t, mask_t = self._copy_paste(img_t, mask_t)
 
             # Cutout MASK-AWARE: vùng cut → ignore 255 (không phạt presence/seg
             # trên pixel đã bị che) → bật lại an toàn. 1-3 hố, to hơn cũ.
@@ -447,8 +485,12 @@ def train(args):
     # classes via greedy set cover (needs batch_size ≥ 29; min cover = 29 imgs).
     use_cas = getattr(args, 'class_aware_sampler', True)
     accum_steps = getattr(args, 'accum_steps', 1)
+    cache_p = Path(args.log_dir) / 'class_index.pt'
+    if getattr(args, 'aug_copy_paste', False):
+        _c2i, _ = _build_class_index(train_ds, args.num_classes, cache_p)
+        train_ds.configure_copy_paste(_c2i, getattr(args, 'cp_rare_thresh', 300),
+                                      getattr(args, 'cp_prob', 0.5))
     if use_cas:
-        cache_p  = Path(args.log_dir) / 'class_index.pt'
         _sampler = build_class_aware_sampler(
             train_ds, args.num_classes, cache_p, args.batch_size, accum_steps)
         # batch_sampler takes over — cannot combine with batch_size/shuffle
@@ -951,7 +993,7 @@ def merge_config(args):
         aux_weight=0.4, presence_weight=0.2, presence_pos_weight=4.0,
         decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
         attn_masks=None, budget_ladder=False, pos_encode=False, dropout=0.0,
-        attn_div_weight=0.5,
+        attn_div_weight=0.5, aug_copy_paste=False, cp_rare_thresh=300, cp_prob=0.5,
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,
