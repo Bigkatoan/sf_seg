@@ -128,6 +128,10 @@ class SparseAttnHead(nn.Module):
         # Học được (log-param) để model tự chọn độ sắc, init ở τ given.
         import math as _m
         self.log_temp   = nn.Parameter(torch.tensor(_m.log(max(temperature, 1e-3))))
+        # PE scale (learnable): PE được chuẩn theo magnitude feature × pe_scale →
+        # PE luôn là tỉ lệ cố định của content, KHÔNG nuốt khi feature std nhỏ
+        # (f2/f3 std 0.06/0.2 vs PE 0.57 → trước đây medium PE lấn 8× → sin/cos).
+        self.pe_scale   = nn.Parameter(torch.tensor(0.3))
         # qk_dim tách khỏi phép chia channel: nhiều masks (num_heads lớn) mà
         # similarity vẫn tính ở dim đủ rộng (32) thay vì C/num_heads quá hẹp
         self.dqk        = qk_dim if qk_dim is not None else C // num_heads
@@ -165,6 +169,12 @@ class SparseAttnHead(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    def _apply_pe(self, feat: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+        """Cộng PE đã chuẩn theo magnitude feature: PE_std = pe_scale × feat_std.
+        Tránh PE lấn át content ở scale có feature nhỏ (medium f2 std 0.06)."""
+        s = feat.detach().std() / (pe.std() + 1e-6)
+        return feat + pe * s * self.pe_scale.clamp(min=0.0)
+
     def _head_budgets(self, N_k: int) -> list[int]:
         """Budget mỗi head. Ladder: log-spaced từ k_max (≈25% N_k) xuống 4 —
         mask budget lớn = stuff-detector, budget nhỏ = object nhỏ có thể sở
@@ -197,14 +207,14 @@ class SparseAttnHead(nn.Module):
 
         if self._is_cross and global_feat is not None:
             # Cross-attention: Q from x only; K,V from global_feat
-            x_qk = x + _sincos_pe_2d(C, H, W, x.device, x.dtype) if self.pos_encode else x
             if self.pos_encode:
+                x_qk = self._apply_pe(x, _sincos_pe_2d(C, H, W, x.device, x.dtype))
                 Cg = global_feat.shape[1]
-                g_qk = global_feat + _sincos_pe_2d(
+                g_qk = self._apply_pe(global_feat, _sincos_pe_2d(
                     Cg, global_feat.shape[2], global_feat.shape[3],
-                    global_feat.device, global_feat.dtype)
+                    global_feat.device, global_feat.dtype))
             else:
-                g_qk = global_feat
+                x_qk, g_qk = x, global_feat
             Q     = self.q_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)   # (B,H_,N,dqk)
             K_ext = self.cross_proj_k(g_qk)          # (B, H_·dqk, H_k, W_k)
             V_ext = self.cross_proj_v(global_feat)   # (B, C,      H_k, W_k) — V không PE
@@ -223,7 +233,7 @@ class SparseAttnHead(nn.Module):
             N_k   = N
         else:
             # Self-attention, dqk decoupled (nhiều masks, similarity dim đủ rộng)
-            x_qk = x + _sincos_pe_2d(C, H, W, x.device, x.dtype) if self.pos_encode else x
+            x_qk = self._apply_pe(x, _sincos_pe_2d(C, H, W, x.device, x.dtype)) if self.pos_encode else x
             Q     = self.q_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)
             K_use = self.k_proj(x_qk).view(B, H_, dqk, N).permute(0, 1, 3, 2)
             V_use = self.v_proj(x).view(B, H_, dv,  N).permute(0, 1, 3, 2)
