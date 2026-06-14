@@ -19,7 +19,7 @@
   "attn_op": "topk",
 
   "data_root": "data",
-  "image_size": 224,
+  "image_size": 384,
   "batch_size": 14,
   "accum_steps": 4,
   "epochs": 200,
