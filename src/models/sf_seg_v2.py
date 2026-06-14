@@ -189,7 +189,12 @@ class sf_seg_v2(nn.Module):
         self.head_medium = SparseAttnHead(C2, max(4, focus_size // 8), num_heads=nh_medium,
                                           cross_kv_feat_dim=C4, qk_dim=_qk, budget_ladder=budget_ladder,
                                           pos_encode=pos_encode, temperature=attn_temperature, attn_op=attn_op)
-        self.head_large  = AttentionHead(C1, focus_size, guided=False)
+        # head_large: SparseAttnHead cross-attn (Q từ f1 @H/4, K/V từ f4 global).
+        # Trước là spatial-gating (clamp k≥N → dense 100% "đỏ hết", ablation +0.0006
+        # vô dụng). Giờ sparse + global context ở high-res → có cơ hội hữu ích.
+        self.head_large  = SparseAttnHead(C1, focus_size, num_heads=max(4, nh_medium // 2),
+                                          cross_kv_feat_dim=C4, qk_dim=_qk, budget_ladder=budget_ladder,
+                                          pos_encode=pos_encode, temperature=attn_temperature, attn_op=attn_op)
 
         # ── Sparse Ensemble branch (region-gated weak predictors) ─────────────
         # Mỗi mask → classifier (dv→C) trên feature value-weighted, gated bởi
@@ -329,7 +334,7 @@ class sf_seg_v2(nn.Module):
             a_medium, sal_medium = self.head_medium(f2, global_feat=a_tiny)
             self._per_mask_preds = None
             self._ensemble_logit = None
-        a_large,  attn_l     = self.head_large(f1)
+        a_large,  attn_l     = self.head_large(f1, global_feat=a_tiny)
 
         self._attns = {
             'tiny':   sal_tiny.detach(),    # (B, 8,  H/32, W/32) — received attn
