@@ -62,7 +62,8 @@ def main():
         budget_ladder=af('budget_ladder', False),
         pos_encode=af('pos_encode', False),
         enable_ensemble=af('enable_ensemble', False),
-        attn_temperature=af('attn_temperature', 1.0)).to(device)
+        attn_temperature=af('attn_temperature', 1.0),
+        attn_op=af('attn_op', 'topk')).to(device)
     model.load_state_dict(ckpt.get('model_state_dict', ckpt))
     model.eval()
     print(f"Loaded {args.checkpoint} (epoch={ckpt.get('epoch', '?')})")

@@ -20,6 +20,17 @@ import torch.nn.functional as F
 from src.models.common import _gn  # noqa: F401 — re-exported for callers
 
 
+def _topk_softmax(score: torch.Tensor, k: float) -> torch.Tensor:
+    """Sparse attention THẬT: giữ top-k score mỗi query, softmax trên chúng (Σ=1),
+    phần còn lại = 0 cứng. Khác clamp (spread ≥k token) — đây focus đúng k điểm."""
+    L = score.shape[-1]
+    k = max(1, min(int(k), L))
+    v, idx = score.topk(k, dim=-1)
+    out = torch.zeros_like(score)
+    out.scatter_(-1, idx, F.softmax(v.float(), dim=-1).to(score.dtype))
+    return out
+
+
 try:
     from src.ops import clamped_softmax as _clamped_softmax
 except Exception:
@@ -117,8 +128,10 @@ class SparseAttnHead(nn.Module):
     def __init__(self, C: int, focus_size: int, num_heads: int = 4,
                  cross_kv_feat_dim: int | None = None,
                  qk_dim: int | None = None, budget_ladder: bool = False,
-                 pos_encode: bool = False, temperature: float = 1.0):
+                 pos_encode: bool = False, temperature: float = 1.0,
+                 attn_op: str = 'topk'):
         super().__init__()
+        self.attn_op = attn_op   # 'topk' = sparse thật | 'clamp' = budget (spread)
         assert C % num_heads == 0, f"C={C} not divisible by num_heads={num_heads}"
         self.C          = C
         self.num_heads  = num_heads
@@ -243,18 +256,19 @@ class SparseAttnHead(nn.Module):
         temp = self.log_temp.exp().clamp(min=0.05)                   # τ học được
         sim = torch.matmul(Q, K_use.transpose(-2, -1)) * self.scale / temp  # (B,H_,N,N_k)
 
-        # Budget per head: ladder (đa cỡ focus) hoặc uniform 25% N_k
+        # Sparse op per head: 'topk' = focus đúng k điểm (sparse thật) | 'clamp'
+        # = budget (spread ≥k token). k theo ladder (đa cỡ focus) hoặc uniform.
+        op = _topk_softmax if self.attn_op == 'topk' else _clamped_softmax
         budgets = self._head_budgets(N_k)
         if len(set(budgets)) == 1:
-            attn = _clamped_softmax(sim.reshape(B * H_ * N, N_k),
-                                    float(budgets[0])).view(B, H_, N, N_k)
+            attn = op(sim.reshape(B * H_ * N, N_k), float(budgets[0])).view(B, H_, N, N_k)
         else:
             attn = torch.empty_like(sim)
             done = 0
             for kb in sorted(set(budgets), reverse=True):
                 idx = [m for m, b in enumerate(budgets) if b == kb]
                 sub = sim[:, idx]                                    # (B, |idx|, N, N_k)
-                attn[:, idx] = _clamped_softmax(
+                attn[:, idx] = op(
                     sub.reshape(B * len(idx) * N, N_k), float(kb)
                 ).view(B, len(idx), N, N_k)
                 done += len(idx)

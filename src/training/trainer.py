@@ -518,6 +518,7 @@ def train(args):
             dropout=getattr(args, 'dropout', 0.0),
             enable_ensemble=getattr(args, 'enable_ensemble', False),
             attn_temperature=getattr(args, 'attn_temperature', 1.0),
+            attn_op=getattr(args, 'attn_op', 'topk'),
         ).to(device)
         _bb_ids = {id(p) for p in model.backbone.parameters()}
     else:
@@ -914,7 +915,8 @@ def train(args):
                     budget_ladder=getattr(args, 'budget_ladder', False),
                     pos_encode=getattr(args, 'pos_encode', False),
                     enable_ensemble=getattr(args, 'enable_ensemble', False),
-                    attn_temperature=getattr(args, 'attn_temperature', 1.0))
+                    attn_temperature=getattr(args, 'attn_temperature', 1.0),
+                    attn_op=getattr(args, 'attn_op', 'topk'))
         torch.save(ckpt, last_path)
         if improved:
             torch.save(ckpt, best_path)
@@ -1025,7 +1027,7 @@ def merge_config(args):
         decoder_dim=256, hr_dim=96, grad_checkpoint=True, lr_schedule='cosine',
         attn_masks=None, budget_ladder=False, pos_encode=False, dropout=0.0,
         attn_div_weight=0.5, aug_copy_paste=False, cp_rare_thresh=300, cp_prob=0.5,
-        enable_ensemble=False, attn_temperature=1.0, mask_sup_weight=0.3,
+        enable_ensemble=False, attn_temperature=1.0, mask_sup_weight=0.3, attn_op='topk',
         grad_clip=5.0, iou_warm_epochs=20,
         backbone_lr_factor=0.1, boundary_weight=3.0,
         prog_res=None,

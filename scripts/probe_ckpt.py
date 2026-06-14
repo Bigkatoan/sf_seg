@@ -49,6 +49,7 @@ def main():
         pos_encode=af('pos_encode', False),
         enable_ensemble=af('enable_ensemble', False),
         attn_temperature=af('attn_temperature', 1.0),
+        attn_op=af('attn_op', 'topk'),
     ).to(device)
     model.load_state_dict(state)
     model.eval()

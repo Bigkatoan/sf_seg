@@ -156,7 +156,7 @@ class sf_seg_v2(nn.Module):
                  attn_masks: tuple[int, int, int] | None = None,
                  budget_ladder: bool = False, pos_encode: bool = False,
                  dropout: float = 0.0, enable_ensemble: bool = False,
-                 attn_temperature: float = 1.0):
+                 attn_temperature: float = 1.0, attn_op: str = 'topk'):
         super().__init__()
         self.num_classes = num_classes
         self.drop_p = dropout      # Dropout2d trước classifier (functional → key names ổn định)
@@ -181,15 +181,14 @@ class sf_seg_v2(nn.Module):
         nh_tiny, nh_small, nh_medium = attn_masks
         _qk = 32
         self.head_tiny   = SparseAttnHead(C4, max(4, focus_size // 8), num_heads=nh_tiny,
-                                          qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode, temperature=attn_temperature)
+                                          qk_dim=_qk, budget_ladder=budget_ladder, pos_encode=pos_encode,
+                                          temperature=attn_temperature, attn_op=attn_op)
         self.head_small  = SparseAttnHead(C3, max(4, focus_size // 4), num_heads=nh_small,
-                                          qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode, temperature=attn_temperature)
+                                          qk_dim=_qk, budget_ladder=budget_ladder, pos_encode=pos_encode,
+                                          temperature=attn_temperature, attn_op=attn_op)
         self.head_medium = SparseAttnHead(C2, max(4, focus_size // 8), num_heads=nh_medium,
-                                          cross_kv_feat_dim=C4,
-                                          qk_dim=_qk, budget_ladder=budget_ladder,
-                                          pos_encode=pos_encode, temperature=attn_temperature)
+                                          cross_kv_feat_dim=C4, qk_dim=_qk, budget_ladder=budget_ladder,
+                                          pos_encode=pos_encode, temperature=attn_temperature, attn_op=attn_op)
         self.head_large  = AttentionHead(C1, focus_size, guided=False)
 
         # ── Sparse Ensemble branch (region-gated weak predictors) ─────────────

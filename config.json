@@ -16,6 +16,7 @@
   "enable_ensemble": true,
   "attn_temperature": 0.5,
   "mask_sup_weight": 0.3,
+  "attn_op": "topk",
 
   "data_root": "data",
   "image_size": 224,
